@@ -1,9 +1,10 @@
 # Tunebox — Plan
 
 Home audio library built on top of yt-dlp.
-Goal: from a phone on the home Wi-Fi, search for a track, get audio into a personal
-library, and play it on the living-room LG SN9YG soundbar — by casting to it, with the phone
-acting as a remote rather than as the audio source.
+Goal: from a phone on the home Wi-Fi, search for a track and get it into a personal library;
+an always-on host plays it on the living-room LG SN9YG soundbar over Chromecast.
+The phone is a remote control and nothing more — it is never in the audio path, and music
+continues when it sleeps or leaves.
 
 Scope is deliberately small: **one household, one home network, listened to at home.**
 Nothing is reachable from the internet. This is not a product and is not intended to
@@ -12,8 +13,9 @@ become one.
 `tunebox` is a placeholder name. This document is a decision record, not a spec — it exists
 so we choose an architecture before writing code.
 
-Status: **draft, no code written yet.** Scope and architecture decided (Phase 0 mostly
-closed); two hardware questions remain open — see 7.
+Status: **draft, no project code written yet.** Scope and architecture decided. The soundbar,
+the Cast transport and the audio format are **verified working on hardware** (see Phase 0). One
+blocker remains: whether OwnTone can drive Cast well, or whether we drive it ourselves.
 
 ---
 
@@ -73,7 +75,8 @@ Any container image or host we build must include these, not just the Python pac
 
 Listening happens at home, on the home network. This removes work:
 
-- **No VPN needed for the core path.** Bind the API and Navidrome to the LAN interface only.
+- **No VPN needed for the core path.** Bind the API and the player daemon to the LAN interface
+  only.
   Tailscale drops from "required" (as it was in the first draft) to "optional convenience" —
   worth adding only if you want to queue a track while out and find it waiting when you're
   home. Ingest-from-anywhere is a nice-to-have; play-from-anywhere is explicitly not a goal.
@@ -126,6 +129,9 @@ Symfonium, substreamer, Amperfy, Tempo.
   phone (a PWA for "get this track", a native client for listening). Slightly less integrated.
 - **Mitigation for the two-app seam:** the ingest PWA can be a single screen — search box,
   results, one tap to queue. Ingest is occasional; playback is constant. Optimise for playback.
+- **Update:** the seam is gone entirely. Section 2 moves playback to the host, so there is no
+  native client and no second app — one web page does search, ingest, and transport. The
+  Subsonic-client ecosystem is retained only as a documented fallback.
 
 ### Alternative C — Native/React Native app with on-device extraction
 
@@ -167,9 +173,9 @@ mainstream music, integrate a licensed streaming SDK (Spotify/Apple Music) inste
 
 Rationale: the hardest part of this problem is not downloading — yt-dlp already solved that.
 It is owning a playback session that does not depend on a phone being present, awake, and in
-the room. So the host runs the player and drives the soundbar directly over Chromecast or
-AirPlay 2; the phone talks plain HTTP to the host and nothing else. We build search and
-ingest, plus a thin remote UI over an existing player daemon.
+the room. So the host runs the player and drives the soundbar directly over Chromecast — the
+only network audio transport this soundbar supports; the phone talks plain HTTP to the host and
+nothing else. We build search and ingest, plus a thin remote UI over an existing player daemon.
 
 **Superseded:** earlier drafts had the phone run a Subsonic client that casts to the soundbar.
 That was a holdover from assuming the phone was the audio source, and it carried two problems.
@@ -214,10 +220,10 @@ real, small, daily cost — accepted.
 │                                  └─────────────┬─────────────────┘   │
 │                                                │                     │
 │                                                │ Chromecast /        │
-│   ┌──────────────────┐                         │ AirPlay 2, over LAN │
-│   │ LG SN9YG         │◀────────────────────────┘                     │
-│   │ Chromecast /     │                                               │
-│   │ AirPlay 2 / BT   │   the phone is never in the audio path        │
+│   ┌──────────────────┐                         │ Chromecast, over LAN│
+│   │ LG SN9YG         │◀───── control 8009 ─────┘                     │
+│   │ Chromecast only  │────── pulls /media ────▶ (host HTTP)          │
+│   │ (no AirPlay)     │   the phone is never in the audio path        │
 │   └──────────────────┘                                               │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -239,15 +245,41 @@ A laptop is a poor fit despite being convenient: it sleeps, closes, and leaves t
 the host holds the playback session, a sleeping host means music stops mid-track. Fine for
 developing Phases 1–2, not for running the thing.
 
-**Playback.** The soundbar is an **LG SN9YG**, which is network-attached: Chromecast built-in,
-AirPlay 2, and Spotify Connect, plus Bluetooth, HDMI in, HDMI out (eARC) and optical.
-It is on the Wi-Fi already, so it is a first-class endpoint on the same network as the Pi —
-not a dumb speaker at the end of a cable. Consequences:
+**Playback.** The soundbar is an **LG SN9YG**, network-attached over Wi-Fi. **Chromecast is the
+only network audio path it offers — it does not support AirPlay.** An earlier draft of this
+document claimed AirPlay 2 support; that was wrong.
 
-- **No DAC, no HDMI cable, no purchase.** The wired plans in the previous draft are dropped.
-- **Bluetooth is demoted to a fallback.** It was only ever the plan because a Bluetooth sink
-  was assumed to be the sole input. Casting beats it on quality (no A2DP re-encode of
-  already-lossy audio) and on reliability.
+Verified on the live device, 2026-09-26:
+
+```
+mDNS  _googlecast._tcp   LG-SN-Series-ThinQ-S-8365057286ba1880f3bfb0c51901925c
+      _googlezone._tcp   present  → supports Cast speaker groups (multi-room later)
+      _airplay._tcp      ABSENT
+      _raop._tcp         ABSENT
+TXT   md=LG SN Series ThinQ Soundbar   fn=Living Room speaker
+      st=0               → idle, no receiver app running
+host  192.168.50.13      ports 8008, 8009, 8443 all open
+info  cast_build_revision 1.52.272222, release_track stable-channel
+      connected=true, ethernet_connected=false  (Wi-Fi)
+      uptime 63863 s ≈ 17.7 h with the bar not in use
+```
+
+Consequences:
+
+- **No DAC, no HDMI cable, no purchase.** The wired plans in an earlier draft are dropped.
+- **Cast is the only option, so its weaknesses are unmitigated.** There is no AirPlay path to
+  fall back to; below Cast there is only Bluetooth from a phone, which reintroduces the phone as
+  transport. This makes the Cast-related risks in section 5 sharper than they would otherwise be.
+- **Cast media delivery is pull-based, and that is now a hard constraint, not a maybe.** The
+  soundbar fetches the audio from the host over plain HTTP. It cannot send custom auth headers,
+  so any token must ride in the URL. See 3.2.
+- **Bluetooth stays as the last-resort fallback.** Cast beats it on quality (no A2DP re-encode of
+  already-lossy audio) and keeps the phone out of the audio path, but it needs the network and,
+  possibly, the internet.
+- **The Cast endpoint does not sleep.** ~18 hours of uptime with the bar unused, still answering
+  mDNS and accepting TCP on 8009. So no wake-on-LAN, IR blaster or HDMI-CEC trickery is needed:
+  a `LOAD` on the always-listening control channel is what powers up the audio path and switches
+  input. This is load-bearing for the whole design and it is now measured rather than assumed.
 - **The phone leaves the audio path entirely.** A Cast sender hands the receiver a URL and the
   *soundbar* fetches the stream itself over the LAN. Making the **host** that sender — rather
   than the phone — means the host also holds the session and the queue, so playback survives
@@ -256,18 +288,32 @@ not a dumb speaker at the end of a cable. Consequences:
 
 So playback is host-owned, with two fallbacks kept alive:
 
-1. **Primary — player daemon on the host, output to the soundbar over AirPlay 2 or Chromecast.**
-   The intended daemon is **OwnTone** (formerly forked-daapd): it scans a music folder, owns the
-   queue and the playback session, outputs to AirPlay 2 and Chromecast devices, ships a web UI,
-   exposes a JSON API for our own UI to drive, and additionally speaks the MPD protocol so
-   off-the-shelf MPD remotes work. *Not yet verified against this soundbar — see the Phase 0
-   spike. Its Cast/AirPlay output is the linchpin of this design, so it gets tested first.*
-2. **Fallback A — Subsonic client casting from the phone.** Symfonium on Android can cast; the
-   soundbar then pulls from Navidrome. Works with near-zero integration effort, which makes it a
-   useful early smoke test that the soundbar casts at all. Only partly phone-independent
-   (see section 2).
-3. **Fallback B — phone → Bluetooth → soundbar.** Needs no network and no cast stack. This is
-   the thing to compare against when the other two misbehave, so keep it working.
+1. **Primary — player daemon on the host, Chromecast output to the soundbar.** The intended
+   daemon is **OwnTone** (formerly forked-daapd): it scans a music folder, owns the queue and the
+   playback session, ships a web UI, exposes a JSON API for our own UI to drive, and additionally
+   speaks the MPD protocol so off-the-shelf MPD remotes work. **Caveat that matters more now:**
+   OwnTone began as an AirPlay server and AirPlay is its most mature output. With AirPlay off the
+   table we are relying on its *Chromecast* output, the less-travelled path. *Unverified — this is
+   the Phase 0 spike, and it is the single riskiest assumption in the document.*
+2. **Fallback A — drive Cast ourselves with `pychromecast`.** If OwnTone's Cast output
+   disappoints, we own the player: FastAPI serves `/media/{id}` and uses `pychromecast` (the
+   mature library behind Home Assistant's Cast integration, also wrapped by `catt`) to `LOAD`
+   that URL with metadata, then watches for `IDLE` to advance the queue. Costs us a queue
+   controller — on the order of a couple hundred lines — and we lose OwnTone's library
+   management, playlists and scrobbling. Buys us one less daemon and no dependence on OwnTone's
+   Cast quality. Given that Cast is now the *only* transport, being able to drive it directly is
+   a meaningful insurance policy.
+3. **Fallback B — Subsonic client casting from the phone.** Symfonium on Android can cast; the
+   soundbar then pulls from Navidrome. Near-zero integration effort, which makes it a useful
+   early smoke test that the soundbar casts at all. Only partly phone-independent (see section 2).
+4. **Fallback C — phone → Bluetooth → soundbar.** Needs no network, no cast stack and no
+   internet. Reintroduces the phone as transport, so it is a last resort — but it is the only
+   path that works when Wi-Fi or the WAN is down. Keep it working.
+
+**Known limitation of a Cast-only design: gapless playback is not realistically achievable.**
+Each track is a separate `LOAD`, so album transitions will have a short gap. The Cast media-queue
+API can preload the next item and narrow it, but do not promise true gapless. This is a real
+regression versus what a local-output player would give, and it is the price of having no cable.
 
 **Does Navidrome survive?** If OwnTone owns the library and playback, Navidrome is largely
 redundant — two daemons scanning one folder. Start with OwnTone alone. Add Navidrome later only
@@ -304,14 +350,30 @@ entirely: YouTube audio arrives lossy at 128–256 kbps and no container choice 
 
 **Metadata.** `--embed-metadata --embed-thumbnail`, `--parse-metadata` to split
 "Artist - Title" uploads into proper fields, `--sponsorblock-remove` to strip intros/outros.
-Good tags are what makes Navidrome's library usable and what the soundbar shows on its display —
-via the cast metadata on the primary path, or AVRCP on the Bluetooth fallback. Optional later: MusicBrainz lookup to correct tags.
+Good tags are what makes the library browsable. Optional later: MusicBrainz lookup to correct tags.
+
+**Tags are not enough for the display — verified 2026-09-26.** A Cast receiver never reads the
+tags inside the file; title, artist and artwork come from the `LOAD` payload the *sender*
+supplies. In the test cast, an embedded title of "Tunebox Test Tone" showed up as
+`tunebox_test` — the filename — because `catt` populates Cast metadata from the path. So
+whatever drives playback must explicitly map file tags into the LOAD message, or the soundbar
+and every cast UI will show filenames. Two consequences:
+
+- If OwnTone is the player, confirm it passes tags through to Cast metadata. Add it to the spike.
+- If we drive Cast ourselves (fallback A), populate `MusicTrackMediaMetadata` — title, artist,
+  albumName, images — from the tags we wrote at ingest. It is a small mapping, but nothing
+  supplies it for free.
+
+On the Bluetooth fallback the same information travels over AVRCP instead, which *is* driven by
+the playing app's own tag reading — so the two paths need metadata wired up separately.
 
 **Queue.** Start with SQLite-backed jobs (one table, a worker loop) — no Redis until there's
 a reason. Concurrency capped at 1–2. Per-job timeout. Retries with backoff, bounded.
 
-**Storage.** Plain files in Navidrome's music dir, `Artist/Album/Track.ext`. The filesystem
-is the database for audio; SQLite only tracks jobs and the ingest history needed for dedupe.
+**Storage.** Plain files under a single music root, `Artist/Album/Track.ext`, scanned by the
+player daemon. The filesystem is the database for audio; SQLite only tracks jobs and the ingest
+history needed for dedupe. Keeping the layout conventional is what lets the player be swapped
+— OwnTone, Navidrome, Jellyfin and MPD all read the same tree.
 
 ### 3.2 Security — decided up front, not bolted on
 
@@ -323,7 +385,14 @@ This service downloads arbitrary URLs and executes ffmpeg. It must never be an o
 - **The LAN is not a trust boundary.** A flat home network typically includes a smart TV, a
   vacuum, and a lightbulb running firmware from 2019. Put a password on the ingest API even
   though it is LAN-only — a single shared token in a header is enough at this scale, checked
-  on *every* route. Navidrome has its own auth; keep it on.
+  on *every* route. The player daemon has its own auth and web UI — keep it enabled too, and
+  do not expose its API unauthenticated just because our UI proxies to it.
+- **The media route is the exception, and must be designed for it.** Cast is pull-based: the
+  soundbar itself fetches the audio over plain HTTP and cannot send an `Authorization` header.
+  So `/media/{id}` needs a capability-style URL — an unguessable per-track or per-session token
+  in the path or query string, ideally expiring — rather than header auth. Do not solve this by
+  making the media route wide open. Log which IP fetched what; the soundbar's address should be
+  the only one that ever appears.
 - Tailscale remains the right answer *if* remote ingest is ever wanted, and is strictly better
   than opening a port. It is no longer required for the home path.
 - **Input handling:** treat search terms and URLs as untrusted. Pass arguments as a list to
@@ -352,13 +421,31 @@ This service downloads arbitrary URLs and executes ffmpeg. It must never be an o
 - [x] Confirm Alternative B vs A. → B.
 - [x] Host hardware: Raspberry Pi + USB SSD (or an existing always-on box).
 - [x] Access path: LAN-only bind. Tailscale optional, for remote *ingest* only.
-- [x] Soundbar identified: **LG SN9YG** — Chromecast built-in, AirPlay 2, Bluetooth, HDMI in,
-      HDMI out/eARC, optical. Nothing needs buying.
-- [ ] Confirm on the unit itself that Chromecast/AirPlay appear as inputs and that it is on
-      the Wi-Fi (Google Home app, or the LG remote's input list). *(cheap, do it first)*
-- [ ] Pick the phone-side client. If Android: Symfonium, for its cast support. If iOS: check
-      whether any Subsonic client can cast rather than only AirPlay-from-phone; if none can,
-      the OwnTone variant becomes the phone-independent answer. *(blocker for Phase 3)*
+- [x] Soundbar identified: **LG SN9YG**. **Chromecast built-in only — no AirPlay** (confirmed by
+      mDNS sweep and by the vendor's own spec). Also Bluetooth, HDMI in, HDMI out/eARC, optical.
+      Nothing needs buying.
+- [x] Confirmed live on the network: `192.168.50.13`, name "Living Room speaker", Cast ports
+      8008/8009/8443 open, `st=0` idle, ~18 h uptime while unused, same /24 as the host — so mDNS
+      discovery works and there is no VLAN problem. **The Cast endpoint does not sleep.**
+- [x] Playback owner: **the host**, not the phone. Phone is an HTTP remote only.
+- [x] **Cast verified end-to-end on the real device, 2026-09-26.** A 9 s AAC/m4a clip cast from
+      a laptop with `catt`:
+      - `State: PLAYING`, correct duration detected, clean finish and session teardown.
+      - Host HTTP log: `192.168.50.13 - - "GET /… HTTP/1.1" 206 - audio/mp4 - 132.67 KB`.
+        **The request came from the soundbar's own IP** — pull-based delivery confirmed on
+        hardware, not inferred. `206` means range requests work, so seeking is viable.
+      - Woke from `st=0` idle and selected the Cast input with nobody touching the remote.
+      - Volume reported as 33 and honoured; AAC/m4a needed no transcode.
+      So the format decision, the wake behaviour and the media-pull direction are all settled.
+- [ ] **Spike: can OwnTone drive the SN9YG over Chromecast?** Install it anywhere, point it at a
+      folder with one file, select the soundbar as output, press play. *(still the hard blocker:
+      the above proves the soundbar and the transport are fine, but not that OwnTone's Cast
+      output is. Its AirPlay output is more mature and this soundbar cannot use it.)*
+- [ ] **Test: does casting survive a WAN outage?** Unplug the router's uplink, leave Wi-Fi up,
+      try to start playback. The Cast receiver app is fetched from Google, so this may fail —
+      and with no AirPlay path, Bluetooth is the only remaining fallback. Worth knowing now.
+- [ ] If the OwnTone spike fails: fall back to driving Cast directly with `pychromecast`
+      (fallback A in 3.1), which is well-trodden and under our control.
 
 **Phase 1 — Walking skeleton (CLI only)**
 - [ ] Python project, yt-dlp pinned as a dependency; ffmpeg + deno present.
@@ -374,24 +461,25 @@ This service downloads arbitrary URLs and executes ffmpeg. It must never be an o
 - [ ] Dedupe by video id.
 - Exit criteria: queue three URLs from `curl`, all three land correctly.
 
-**Phase 3 — Listening (cast to the soundbar)**
-- [ ] Navidrome deployed against the music dir; rescan hook after ingest.
-- [ ] Subsonic client on the phone; verify lockscreen controls.
-- [ ] **Verify end-to-end: search on the phone → ingest → cast to the SN9YG → sound, with the
+**Phase 3 — Sound out of the soundbar, driven by the host**
+- [ ] OwnTone on the host against the music dir; library rescan hook after ingest.
+- [ ] Soundbar selected as a persistent output; survives an OwnTone restart and a soundbar
+      power-cycle without manual re-selection.
+- [ ] **Verify end-to-end: search on the phone → ingest → host plays it on the SN9YG, with the
       correct track title on the soundbar's display.** This is the acceptance test for the
       whole project.
-- [ ] Confirm the soundbar can reach Navidrome directly: watch the server access log for a
-      request originating from the soundbar's IP, not the phone's. If the stream is being
-      proxied through the phone, casting is not actually working.
-- [ ] **Walk away with the phone. Audio must continue.** This is the property that made the
-      wired-Pi plan unnecessary; if it does not hold, that plan comes back.
+- [ ] **Walk away with the phone, then kill the browser. Audio must continue, including the
+      transition to the next track.** The queue lives on the host; prove it.
+- [ ] Control it from a second device (laptop browser) to confirm the remote is stateless.
 - [ ] Verify the Bluetooth fallback still works.
-- [ ] Minimal ingest PWA: one search screen, installable to home screen.
+- Exit criteria: music plays with no phone involved at all.
 
-**Phase 4 — Only if Phase 3's walk-away test fails**
-- [ ] OwnTone on the box, output to the SN9YG over AirPlay 2 or Chromecast, browser remote.
-- [ ] Decide whether it replaces Navidrome or runs alongside it against the same folder.
-- Exit criteria: playback starts and continues with no phone involved.
+**Phase 4 — One web UI**
+- [ ] Single page served by the API: search, ingest progress, now-playing, transport controls.
+      Installable to the home screen. Playback controls proxy to OwnTone's JSON API.
+- [ ] Decide whether OwnTone's own web UI is good enough for the playback half; if so, link to
+      it and build only search/ingest.
+- Exit criteria: one icon on the phone does everything.
 
 **Phase 5 — Hardening**
 - [ ] Confirm nothing is bound to a public interface and no port is forwarded.
@@ -400,6 +488,8 @@ This service downloads arbitrary URLs and executes ffmpeg. It must never be an o
 - [ ] SSD-failure story: the music library is the only irreplaceable state.
 
 **Phase 6 — Optional**
+- [ ] Navidrome alongside OwnTone over the same folder, if a native Subsonic client with
+      offline caching or lockscreen controls turns out to be wanted after all.
 - [ ] Snapcast for synchronised multi-room, if a second speaker ever appears.
 - [ ] Tailscale, if queueing tracks from outside the house turns out to be wanted.
 - [ ] Source adapter interface + a licence-clean source, keeping Alternative E open.
@@ -415,12 +505,19 @@ This service downloads arbitrary URLs and executes ffmpeg. It must never be an o
 | Rate limiting / bot challenge | Low–Medium | Home IP by design, sleep intervals, concurrency 1–2, caching |
 | iOS PWA background audio is inadequate | High (for Alt A) | Chose Alt B specifically to avoid this |
 | Poor tags make the library unusable | Medium | `--parse-metadata` rules, optional MusicBrainz, manual fix path |
-| Pi is a single point of failure for all listening | Medium | Accepted. Client-side caching covers short outages; keep the SSD backed up |
+| **OwnTone can't drive the SN9YG reliably** | Medium | **The Phase 0 spike exists solely to find this out early.** Falls back to a casting Subsonic client, then Bluetooth |
+| Host is a single point of failure for all listening | Medium–High | Higher than before: the host now holds the playback session, so it must be genuinely always-on. Not a laptop |
 | SD-card or SSD failure loses the library | Medium | Library on USB SSD not SD; periodic backup. Tracks are re-ingestable but tags and playlists are not |
-| Casting works but the soundbar can't play the file | Low | AAC default (see Audio format); test one Opus file early to confirm the limit rather than assume it |
-| Cast handoff still leaves the phone in the audio path | Medium | Explicit access-log check plus walk-away test in Phase 3; OwnTone in Phase 4 if it fails |
-| Soundbar's Chromecast stack needs internet, or drops off Wi-Fi | Medium | House has internet anyway for ingest; Bluetooth fallback covers outages. Give the soundbar a DHCP reservation |
-| No iOS Subsonic client can cast | Medium | OwnTone's browser remote is the answer, and works on any phone |
+| Soundbar can't play the file | ~~Low~~ **Resolved** | AAC/m4a verified playing on the device 2026-09-26. Opus still untested; AAC is the default so it does not matter unless we change it |
+| Soundbar display shows filenames instead of track names | Medium | Cast metadata comes from the sender's LOAD payload, not the file's tags (verified). Map tags → LOAD explicitly; check OwnTone does this |
+| Soundbar's Chromecast stack needs internet | Medium–High | **No AirPlay fallback exists on this model**, so a WAN outage may leave only Bluetooth. Tested explicitly in Phase 0 |
+| Soundbar drops off Wi-Fi | Medium | DHCP reservation for 192.168.50.13; keep it on the same subnet as the host; Bluetooth covers outages |
+| OwnTone's *Chromecast* output is weaker than its AirPlay output | Medium–High | Raised from Medium now that AirPlay is unavailable. Phase 0 spike, then `pychromecast` fallback under our own control |
+| No gapless playback | Certain | Inherent to Cast: one `LOAD` per track. Narrow it with the Cast queue API; do not promise gapless |
+| Media route must be reachable unauthenticated-ish | Certain | Cast pulls over HTTP and cannot send headers → capability URLs with expiring tokens (see 3.2) |
+| Output selection doesn't survive reboots or power-cycles | Medium | Explicitly tested in Phase 3; automate re-selection on startup if manual |
+| No lockscreen or volume-button control | Certain | Accepted trade for phone-independence. Soundbar remote does volume; "Hey Google, pause" works once playing |
+| Web remote feels worse than a native app | Medium | Keep it to one screen. Phase 6 can add Navidrome + a native client if it grates |
 | Legal exposure grows with user count | — | Home-only, single user, not shared. Alternative E if it must ever be a product |
 
 ## 6. Non-goals
@@ -429,6 +526,8 @@ This service downloads arbitrary URLs and executes ffmpeg. It must never be an o
 - Public signup or monetisation.
 - **Listening outside the home**, or any internet-reachable endpoint.
 - Multi-user or multi-household.
+- **Playback that depends on the phone.** The phone is a remote; it is never a transport.
+- Building a player engine, queue, or cast stack — that is OwnTone's job.
 - Video. Audio only. In particular, nothing about the soundbar's Atmos or TV-audio role is
   in scope — this project only ever sends it stereo music.
 - Any change to the yt-dlp repo (see 0.1).
@@ -436,15 +535,22 @@ This service downloads arbitrary URLs and executes ffmpeg. It must never be an o
 ## 7. Open questions
 
 1. ~~Personal use only?~~ **Confirmed: home-only, single household.**
-2. ~~Does the soundbar support AirPlay/Chromecast?~~ **LG SN9YG: both, plus Bluetooth,
-   HDMI/eARC and optical. Confirm on the unit, but no hardware purchase is expected.**
-3. Is there already an always-on machine in the house (NAS, Mac mini, existing Pi)? If yes,
-   nothing needs buying at all; if no, that is the only spend.
-4. **iOS, Android, or both?** Now the highest-value unknown — it decides whether the phone can
-   cast from a Subsonic client (Android/Symfonium: yes) or whether Phase 4's OwnTone is needed
-   on day one.
-5. Is MP3 specifically needed anywhere, or was it shorthand for "audio file"? The AAC default
+2. ~~Does the soundbar support AirPlay/Chromecast?~~ **Chromecast only. No AirPlay — confirmed by
+   mDNS sweep and vendor spec. An earlier draft of this document wrongly claimed AirPlay 2;
+   the fallback chain in 3.1 was rewritten because of it.**
+3. ~~Should the phone run a Subsonic client?~~ **No. The host owns playback; the phone is an
+   HTTP remote. See section 2.**
+4. ~~iOS, Android, or both?~~ **Largely moot now — a browser remote behaves the same on both.
+   Only resurfaces if the OwnTone spike fails.**
+5. **Does OwnTone drive this soundbar?** The one hard unknown, and the only Phase 0 blocker
+   left. Cheap to answer and answerable today, with no tunebox code written.
+6. Is there already an always-on machine in the house (NAS, Mac mini, existing Pi)? If yes,
+   nothing needs buying; if no, that is the only spend. It need not be near the soundbar.
+7. Is MP3 specifically needed anywhere, or was it shorthand for "audio file"? The AAC default
    assumes the latter.
-6. Is the soundbar on 2.4 GHz or 5 GHz Wi-Fi, and is it on the same subnet as the host? Cast
-   discovery is mDNS and does not cross VLANs — relevant if the house has a guest or IoT
-   network, which is exactly where a soundbar often ends up.
+8. ~~Is the soundbar on the same subnet as the host?~~ **Yes — 192.168.50.13, same /24. mDNS
+   discovery verified working from this machine.**
+9. **Does Cast playback work with the WAN down?** Unknown and now important, because there is no
+   AirPlay path to fall back to. Phase 0 test.
+10. Is the phone's browser enough for a remote, or will the missing lockscreen controls push us
+    back to Navidrome plus a native client? Answer after living with Phase 4 for a week.
