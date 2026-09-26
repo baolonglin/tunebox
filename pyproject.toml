@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tunebox"
+version = "0.1.0"
+description = "Personal, home-network-only music ingest on top of yt-dlp"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+# Pinned deliberately: yt-dlp updates are a scheduled, canaried operation (PLAN.md 3.3),
+# never an accident of a fresh install.
+#
+# yt-dlp-ejs is not optional in practice: without it (plus a JS runtime such as deno) YouTube
+# answers the media request with HTTP 403 — observed 2026-09-26, exactly as PLAN.md 0.3 warns.
+dependencies = [
+    "yt-dlp==2026.8.19",
+    "yt-dlp-ejs==0.8.0",
+    "mutagen==1.47.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.5",
+]
+
+[project.scripts]
+tunebox = "tunebox.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tunebox"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

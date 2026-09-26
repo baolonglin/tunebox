@@ -1,0 +1,110 @@
+{
+  "id": "k歌之王",
+  "title": "k歌之王",
+  "_type": "playlist",
+  "entries": [
+    {
+      "_type": "url",
+      "ie_key": "Youtube",
+      "id": "9elvYViwP4g",
+      "url": "https://www.youtube.com/watch?v=9elvYViwP4g",
+      "title": "《K歌之王 AIR (Day Version)》陳奕迅 Eason Chan with The Heritage Orchestra【Official MV】",
+      "description": "作詞：林夕作曲：陳輝陽我唱得不夠動人你別皺眉我願意和你約定至死我只想嬉戲唱遊到下世紀請你別嫌我將這煽情奉獻給你還能憑 ...",
+      "duration": 282,
+      "channel_id": "UCnafe6M9Itwt08RFI51L6mw",
+      "channel": "Eason Chan",
+      "channel_url": "https://www.youtube.com/channel/UCnafe6M9Itwt08RFI51L6mw",
+      "uploader": "Eason Chan",
+      "uploader_id": null,
+      "uploader_url": null,
+      "thumbnails": [
+        {
+          "url": "https://i.ytimg.com/vi/9elvYViwP4g/hq720.jpg?sqp=-oaymwEcCNAFEJQDSFXyq4qpAw4IARUAAIhCGAFwAcABBg==&rs=AOn4CLArlSyHNFfC-8JqMH28wgUX2k8VcQ",
+          "height": 404,
+          "width": 720
+        }
+      ],
+      "timestamp": null,
+      "release_timestamp": null,
+      "availability": null,
+      "view_count": 6990377,
+      "live_status": null,
+      "channel_is_verified": true,
+      "__x_forwarded_for_ip": null
+    },
+    {
+      "_type": "url",
+      "ie_key": "Youtube",
+      "id": "Sm_DVsixxsk",
+      "url": "https://www.youtube.com/watch?v=Sm_DVsixxsk",
+      "title": "陳奕迅 Eason Chan《K歌之王》[Official MV]",
+      "description": "陳奕迅現已登陸iTunes | NOW available on iTunes : http://url.cn/7uEg9H K歌之王曲：陳輝陽詞：林夕編：陳輝陽我唱得不夠動人你 ...",
+      "duration": 229,
+      "channel_id": "UCs9f8LhgPIEmERSfn5zsc_A",
+      "channel": "英皇娛樂 eeg music",
+      "channel_url": "https://www.youtube.com/channel/UCs9f8LhgPIEmERSfn5zsc_A",
+      "uploader": "英皇娛樂 eeg music",
+      "uploader_id": "@eegmusichk",
+      "uploader_url": "https://www.youtube.com/@eegmusichk",
+      "thumbnails": [
+        {
+          "url": "https://i.ytimg.com/vi/Sm_DVsixxsk/hq720.jpg?sqp=-oaymwEcCNAFEJQDSFXyq4qpAw4IARUAAIhCGAFwAcABBg==&rs=AOn4CLCEDjyIhFUi7B89ssSTmed2H6yvUA",
+          "height": 404,
+          "width": 720
+        }
+      ],
+      "timestamp": null,
+      "release_timestamp": null,
+      "availability": null,
+      "view_count": 5522029,
+      "live_status": null,
+      "channel_is_verified": true,
+      "__x_forwarded_for_ip": null
+    },
+    {
+      "_type": "url",
+      "ie_key": "Youtube",
+      "id": "Iw3WgP8A18I",
+      "url": "https://www.youtube.com/watch?v=Iw3WgP8A18I",
+      "title": "陳奕迅 Eason Chan《K歌之王(國)》[Official MV]",
+      "description": "陳奕迅現已登陸iTunes | NOW available on iTunes : http://url.cn/7uEg9H K歌之王(國) 曲：陳輝陽詞：林夕編：陳輝陽我以為要是唱 ...",
+      "duration": 232,
+      "channel_id": "UCs9f8LhgPIEmERSfn5zsc_A",
+      "channel": "英皇娛樂 eeg music",
+      "channel_url": "https://www.youtube.com/channel/UCs9f8LhgPIEmERSfn5zsc_A",
+      "uploader": "英皇娛樂 eeg music",
+      "uploader_id": "@eegmusichk",
+      "uploader_url": "https://www.youtube.com/@eegmusichk",
+      "thumbnails": [
+        {
+          "url": "https://i.ytimg.com/vi/Iw3WgP8A18I/hqdefault.jpg?sqp=-oaymwE2COADEI4CSFXyq4qpAygIARUAAIhCGAFwAcABBvABAfgBjAWAAuADigIMCAAQARhlIGUoOzAP&rs=AOn4CLA5-0MaW7keDzDcd9y0nxsYJPZnVA",
+          "height": 270,
+          "width": 480
+        }
+      ],
+      "timestamp": null,
+      "release_timestamp": null,
+      "availability": null,
+      "view_count": 14177691,
+      "live_status": null,
+      "channel_is_verified": true,
+      "__x_forwarded_for_ip": null
+    }
+  ],
+  "webpage_url": "ytsearch3:k歌之王",
+  "original_url": "ytsearch3:k歌之王",
+  "webpage_url_basename": "k歌之王",
+  "webpage_url_domain": null,
+  "extractor": "youtube:search",
+  "extractor_key": "YoutubeSearch",
+  "release_year": null,
+  "playlist_count": 3,
+  "epoch": 1790460722,
+  "__files_to_move": {},
+  "_version": {
+    "version": "2026.08.19",
+    "current_git_head": null,
+    "release_git_head": "594bd50c2c78ac432f81600d309fdc4e0a92d82c",
+    "repository": "yt-dlp/yt-dlp"
+  }
+}

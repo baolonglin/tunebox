@@ -13,9 +13,10 @@ become one.
 `tunebox` is a placeholder name. This document is a decision record, not a spec — it exists
 so we choose an architecture before writing code.
 
-Status: **draft, no project code written yet.** Scope and architecture decided. The soundbar,
-the Cast transport and the audio format are **verified working on hardware** (see Phase 0). One
-blocker remains: whether OwnTone can drive Cast well, or whether we drive it ourselves.
+Status: **Phase 1 implemented (2026-09-26); language and code architecture decided (3.4).** Scope
+and architecture decided. The soundbar, the Cast transport and the audio format are **verified
+working on hardware** (see Phase 0), and ingest now produces a correctly tagged AAC file from the
+CLI. One blocker remains: whether OwnTone can drive Cast well, or whether we drive it ourselves.
 
 ---
 
@@ -66,6 +67,10 @@ Per yt-dlp's own README:
 - `ffmpeg` + `ffprobe` — required for audio extraction/conversion and metadata embedding.
 - `yt-dlp-ejs` + a JS runtime (`deno` recommended) — required for *full* YouTube support
   (signature/n-param deciphering). Without it, formats may be missing or throttled.
+  **Measured 2026-09-26: this is stronger than "may".** With `deno` installed but `yt-dlp-ejs`
+  absent, extraction and thumbnail download succeed and the audio download then dies with
+  `HTTP Error 403: Forbidden`. Both pieces are mandatory, and the failure does not name the
+  missing dependency — see Phase 1.
 - Possibly cookies and/or PO tokens for some videos; expect rate limiting.
 - `--sleep-requests` / `--sleep-interval` (or the `-t sleep` preset) to behave politely.
 
@@ -352,6 +357,34 @@ entirely: YouTube audio arrives lossy at 128–256 kbps and no container choice 
 "Artist - Title" uploads into proper fields, `--sponsorblock-remove` to strip intros/outros.
 Good tags are what makes the library browsable. Optional later: MusicBrainz lookup to correct tags.
 
+**Metadata, CJK — measured 2026-09-26/27, and not an afterthought.** The `"Artist - Title"` habit
+is Western. Chinese-language uploads write `陳奕迅 Eason Chan《K歌之王》[Official MV]`, put the title
+inside `《》`, and are usually uploaded by the *record label* ("英皇娛樂 eeg music"), so naive
+mapping produces an artist tag naming a company. Two live searches drove this out: `k歌之王` (five
+results, artist wrong on four) and `好久不见` (eight results, five distinct new failure modes).
+`sources/ytdlp_tags.py` therefore handles:
+
+- `《》`/`〈〉`/`「」`/`『』` title quotation, in both orders, and `[…]`/`【…】` as a secondary form
+  (`JAMES 楊永聰 [好久不見 Long Time No See]` — house style of several Taiwanese labels);
+- separators without spaces (`陈奕迅-K歌之王`), attempted only on titles containing CJK so
+  `Blink-182` is safe;
+- Chinese boilerplate: `歌词版`, `官方MV`, `中文字幕`, `動態歌詞MV`, full-width brackets, and a bare
+  `MV` glued to CJK text (`好久不見MV`);
+- channel decoration: `单依纯Official`, `…官方频道`, `Official Channel`, alongside `- Topic`/`VEVO`;
+- a **leading** hashtag as the performer (`#单依纯 《好久不见》…`, uploaded by a TV show's channel),
+  while trailing hashtags are stripped as topic spam;
+- lyric teasers: a quotation group over ~25 characters is song lyrics, not a title, and a spaced
+  separator occurring before the first bracket wins
+  (`單依純 - 好久不見 (Live)『你會不會忽然地出現…』【動態歌詞MV】` → `單依純` / `好久不見 (Live)`);
+- a plausibility guard: a candidate artist containing sentence punctuation is prose, not a name,
+  so clickbait (`开口就碎了！陈奕迅深情演绎《好久不见》…`) falls back to the channel instead of creating
+  a directory named after a sentence.
+
+`(現場版)`, `(超CD水準)` and `(Live)` survive, because they are information rather than marketing.
+Where a title genuinely contains no separator (`好久不见 陈奕迅 (歌词版)` on a lyric-video channel)
+the channel name stands and `--artist` is the fix; guessing would be worse. This is the concrete
+reason the MusicBrainz lookup above stays on the list.
+
 **Tags are not enough for the display — verified 2026-09-26.** A Cast receiver never reads the
 tags inside the file; title, artist and artwork come from the `LOAD` payload the *sender*
 supplies. In the test cast, an embedded title of "Tunebox Test Tone" showed up as
@@ -412,6 +445,78 @@ This service downloads arbitrary URLs and executes ffmpeg. It must never be an o
   before a user does.
 - Structured logs, retained; disk-space alarm on the music volume.
 
+### 3.4 Implementation language and code architecture
+
+Sections 3.1–3.3 decided the *system* shape and left the *code* shape open. Decided now,
+before Phase 1, because it is cheap to decide and expensive to change.
+
+**Language: Python 3.11+.** Not because Python is the best tool for daemons, but because every
+dependency this project cannot replace is Python: `yt-dlp` is the whole point, `pychromecast`
+is the fallback-A player, and FastAPI is the Phase 2 API. A Go or Rust service would still
+shell out to yt-dlp, and would then need a second language for fallback A — two toolchains for
+no gain. 3.11 is the floor because that is what a current Raspberry Pi OS ships; 3.12 is used
+for development here.
+
+What this costs, accepted: no single static binary, so deployment is a venv (or a container)
+plus system `ffmpeg`/`deno`. Python's weak process/threading story is irrelevant at a
+concurrency cap of 1–2.
+
+Rejected: TypeScript/Node (no yt-dlp binding worth having, and the Cast libraries are weaker
+than `pychromecast`), Go/Rust (see above), shell scripts (the tag mapping and path safety in
+3.2 want real tests).
+
+**Architecture: ports and adapters, with a CLI-first core.** The rule is that everything
+yt-dlp-shaped lives behind one interface, because 1.E and 3.1 both depend on being able to
+swap the source:
+
+```
+src/tunebox/
+  core/          domain: no network, no yt-dlp and no mutagen import. `naming.py` does touch the
+                 filesystem — resolving a path is how root confinement is enforced — but nothing
+                 in core reads or writes media.
+    models.py    SearchResult, TrackTags, FetchedMedia, IngestResult
+    ports.py     MusicSource protocol (search / inspect / fetch), TagWriter protocol
+    naming.py    TrackTags -> Artist/Album/Track.ext, sanitising and root confinement
+  sources/       adapters that know about YouTube
+    urls.py      URL allowlist and canonical video id  (3.2 "validate before yt-dlp")
+    ytdlp.py     subprocess adapter: argv lists, timeouts, progress parsing
+    ytdlp_tags.py  yt-dlp info dict -> TrackTags — the one place YouTube's shape is known
+  library.py     atomic placement under the music root
+  tagging.py     mutagen tag + cover writer (the TagWriter adapter)
+  ingest.py      the use case: inspect -> name -> dedupe -> fetch -> tag -> place.
+                 Application layer, not core: it is the thing that wires adapters together, and
+                 it takes the source and the tag writer as arguments so tests can pass fakes.
+  config.py      env-driven config, one frozen dataclass
+  errors.py      one exception tree, so the CLI can tell "this ingest failed" from "we have a bug"
+  cli.py         argparse front end: search / ingest / doctor  (+ `__main__.py` for `python -m`)
+```
+
+Three consequences worth stating, since they are decisions and not style:
+
+- **yt-dlp is a subprocess, never an import** (already decided in 3.1). The adapter builds
+  `argv` lists, never a shell string, and enforces its own timeouts. The pinned PyPI package
+  is still a declared dependency — it is what supplies the pinned binary, invoked as
+  `python -m yt_dlp` so the venv's version is the one that runs.
+- **Our tag mapping is the single source of truth for metadata, not `--embed-metadata`.**
+  yt-dlp downloads audio and a cover image; `tagging.py` writes every tag with mutagen. This
+  is a direct consequence of the 2026-09-26 Cast finding: something must map file tags into the
+  Cast `LOAD` payload, and that something should read the same `TrackTags` we wrote at ingest,
+  not re-derive them. It also removes a failure mode — `--embed-thumbnail` on m4a wants
+  AtomicParsley or a working ffmpeg mux path, and a cover-art failure should never fail an
+  ingest.
+- **The filesystem stays the library database** (3.1). `ingest.py` returns a path; nothing
+  in Phase 1 writes a database. SQLite arrives in Phase 2 for *jobs*, not for tracks.
+
+**Audio format, one implementation note.** `-f 'ba[ext=m4a]/ba'` plus
+`-x --audio-format m4a`: yt-dlp skips conversion when the stream is already AAC, so the normal
+YouTube path (format 140) is a passthrough remux at near-zero CPU, and the rare Opus-only video
+is transcoded to AAC rather than landing in a container the soundbar plays inconsistently.
+MP3 stays available as `--format mp3`, which does re-encode, for the Bluetooth fallback.
+
+`--sponsorblock-remove` is **not** on by default, contrary to the wording in 3.1: cutting
+segments forces a re-encode of the audio, which contradicts the passthrough decision. It
+becomes an opt-in flag later, per ingest.
+
 ---
 
 ## 4. Phased plan
@@ -447,12 +552,33 @@ This service downloads arbitrary URLs and executes ffmpeg. It must never be an o
 - [ ] If the OwnTone spike fails: fall back to driving Cast directly with `pychromecast`
       (fallback A in 3.1), which is well-trodden and under our control.
 
-**Phase 1 — Walking skeleton (CLI only)**
-- [ ] Python project, yt-dlp pinned as a dependency; ffmpeg + deno present.
-- [ ] `tunebox ingest <url>` → tagged file in the right place.
-- [ ] `tunebox search <query>` → JSON results.
-- [ ] Tests: search parsing and tag mapping against recorded fixtures (no network in CI).
-- Exit criteria: one command, one correct tagged file on disk.
+**Phase 1 — Walking skeleton (CLI only)** — **done, 2026-09-26**
+- [x] Language and code architecture decided and recorded (3.4): Python 3.11+, ports and adapters.
+- [x] Python project, yt-dlp pinned as a dependency; ffmpeg + deno present (`tunebox doctor`).
+- [x] `tunebox ingest <url>` → tagged file in the right place.
+- [x] `tunebox search <query>` → JSON results.
+- [x] Tests: search parsing and tag mapping against recorded fixtures (no network in CI).
+      261 tests, all offline (verified with sockets blocked); green on Python 3.11 and 3.12.
+      Fixtures re-recorded by `tools/record_fixtures.py`.
+- [x] **Non-Latin titles verified on real data, twice.** `tunebox search "k歌之王"` and
+      `"好久不见"` → correct results; `tunebox ingest Sm_DVsixxsk` →
+      `陳奕迅 Eason Chan/Singles/K歌之王.m4a`; `tunebox ingest I2hva376wbk` →
+      `單依純/Singles/好久不見 (Live).m4a`. Both AAC with cover art, and `ffprobe` (an independent
+      reader) confirms the Chinese tags. Every messy real-world title shape from those two
+      searches is now a recorded fixture with a test — see 3.1 **Metadata, CJK**.
+- [x] **`yt-dlp-ejs` is a hard requirement, not an optional extra — learned the hard way.**
+      With `deno` on PATH but no `yt-dlp-ejs` installed, metadata extraction and thumbnail
+      download both succeed and then the media request fails with `HTTP Error 403: Forbidden`.
+      Installing `yt-dlp-ejs` fixed it with no other change. It is now pinned in `pyproject.toml`
+      and checked by `tunebox doctor`, because the failure mode looks like a YouTube block
+      rather than a missing dependency and would waste an afternoon in Phase 5.
+- Exit criteria: one command, one correct tagged file on disk. **Met**, verified on real output:
+  `tunebox ingest iukUMRlaBBE` → `Kraftwerk/Singles/Autobahn (Single version 1974).m4a`,
+  3.4 MB, `aac`/`mp4a` 128 kbps 44.1 kHz stereo, 207 s, cover art embedded, tags read back as
+  title `Autobahn (Single version 1974)` / artist `Kraftwerk` / source id `iukUMRlaBBE`.
+  yt-dlp confirmed the passthrough itself: *"Not converting audio; file is already in target
+  format m4a"* — so a Pi does no transcoding in the default path. A second ingest of the same
+  track (via a different URL form) was deduped without downloading.
 
 **Phase 2 — Service**
 - [ ] FastAPI: `POST /ingest`, `GET /jobs/{id}`, `GET /search`.
