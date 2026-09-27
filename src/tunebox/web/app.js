@@ -415,43 +415,82 @@
   const LOOKS_LIKE_ID = /^[A-Za-z0-9_-]{11}$/;
 
   function wireSearch() {
-    el("search-form").addEventListener("submit", async (event) => {
+    const form = el("search-form");
+    const go = form.querySelector('button[type="submit"]');
+    form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const query = el("q").value.trim();
       if (!query) return;
-      if (LOOKS_LIKE_URL.test(query) || LOOKS_LIKE_ID.test(query)) {
-        // One field that does the right thing, because "paste a link" and "search for a song" are
-        // the same intent on a phone and asking which one it was would be a question with an
-        // obvious answer.
-        const job = await ingest(query);
-        if (job) el("q").value = "";
-        return;
+      // Greyed out for the round trip, for the same reason as addButton below: when the field holds
+      // a pasted link this button *is* the add button, and either branch is a yt-dlp subprocess on
+      // the host. Re-enabled in `finally` rather than left disabled, because unlike a queued track
+      // there is nothing here that stays done — the field is still there to search again with.
+      go.disabled = true;
+      try {
+        if (LOOKS_LIKE_URL.test(query) || LOOKS_LIKE_ID.test(query)) {
+          // One field that does the right thing, because "paste a link" and "search for a song" are
+          // the same intent on a phone and asking which one it was would be a question with an
+          // obvious answer.
+          const job = await ingest(query);
+          if (job) el("q").value = "";
+          return;
+        }
+        el("search-note").textContent = "Searching…";
+        clear(el("results"));
+        const results = await attempt(
+          () => api(`/search?q=${encodeURIComponent(query)}`),
+          "search"
+        );
+        if (!results) {
+          el("search-note").textContent = "";
+          return;
+        }
+        el("search-note").textContent = results.length
+          ? `${results.length} result${results.length === 1 ? "" : "s"}`
+          : "No results.";
+        fill(
+          el("results"),
+          results.map((item) =>
+            row(
+              item.title,
+              [item.uploader, duration(item.duration)].filter(Boolean).join(" · "),
+              [addButton(item.url)]
+            )
+          ),
+          "No results."
+        );
+      } finally {
+        go.disabled = false;
       }
-      el("search-note").textContent = "Searching…";
-      clear(el("results"));
-      const results = await attempt(
-        () => api(`/search?q=${encodeURIComponent(query)}`),
-        "search"
-      );
-      if (!results) {
-        el("search-note").textContent = "";
-        return;
-      }
-      el("search-note").textContent = results.length
-        ? `${results.length} result${results.length === 1 ? "" : "s"}`
-        : "No results.";
-      fill(
-        el("results"),
-        results.map((item) =>
-          row(
-            item.title,
-            [item.uploader, duration(item.duration)].filter(Boolean).join(" · "),
-            [button("Add", () => ingest(item.url), "primary")]
-          )
-        ),
-        "No results."
-      );
     });
+  }
+
+  /**
+   * The Add button on a search result: greyed out the moment it is tapped.
+   *
+   * Two reasons, and the second is the real one. A tap on a phone is easily a double-tap, and the
+   * round trip includes a yt-dlp metadata request — long enough to look like nothing happened. And
+   * once the job is queued a second tap cannot achieve anything: POST /ingest dedupes an identical
+   * request back to the same job, so the button would be offering work that will not be done.
+   *
+   * It stays disabled on success and comes back on failure, because a 401 or a dead worker is
+   * exactly when somebody wants to try again. The label carries the state as well as the colour —
+   * a disabled button that still says "Add" reads as broken rather than done, and this stylesheet's
+   * own rule is that nothing conveys state by colour alone.
+   */
+  function addButton(url) {
+    const node = button("Add", async () => {
+      node.disabled = true;
+      node.textContent = "Adding…";
+      const job = await ingest(url);
+      if (job) {
+        node.textContent = "Added";
+        return;
+      }
+      node.disabled = false;
+      node.textContent = "Add";
+    }, "primary");
+    return node;
   }
 
   async function ingest(url) {

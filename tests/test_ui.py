@@ -441,6 +441,63 @@ class TestTheTokenReveal:
         assert 'id="btn-show-token"' in markup
 
 
+class TestAddCannotBeTappedTwice:
+    """The Add button on a search result greys itself out the moment it is tapped.
+
+    A tap on a phone is easily a double-tap, and the round trip behind this one includes a yt-dlp
+    metadata request — long enough that nothing appears to have happened. The second tap cannot
+    achieve anything either way, because ``POST /ingest`` dedupes an identical request back to the
+    same job, so what it offers is work that will not be done.
+    """
+
+    @staticmethod
+    def source() -> str:
+        """The body of ``addButton``, comments stripped — the assertions below are about order."""
+        code = TestTheAssetsThemselves.code("app.js")
+        start = code.index("function addButton(")
+        return code[start : code.index("\n  }", start)]
+
+    def test_the_results_list_uses_it(self):
+        """Not a bare ``button("Add", …)`` inline in the row: the disabling lives in the factory so a
+        second caller cannot forget it, which is why there is exactly one construction site."""
+        code = TestTheAssetsThemselves.code("app.js")
+        assert "[addButton(item.url)]" in code
+        assert code.count('button("Add"') == 1, "the only Add button should be the one in addButton()"
+        assert 'button("Add"' in self.source(), "and that one should be inside the factory"
+
+    def test_it_is_disabled_before_the_request_not_after(self):
+        """The whole point is the gap between the tap and the answer. Disabling after the ``await``
+        would leave it live for exactly the period this exists to cover."""
+        body = self.source()
+        assert body.index("node.disabled = true") < body.index("await ingest(")
+
+    def test_the_label_says_what_the_colour_says(self):
+        """This stylesheet's rule is that nothing conveys state by colour alone, and a greyed-out
+        button still reading "Add" is indistinguishable from a broken one."""
+        body = self.source()
+        assert "Adding…" in body
+        assert 'node.textContent = "Added"' in body
+
+    def test_a_failure_gives_the_button_back(self):
+        """A 401 or a stopped worker is precisely when somebody wants to try again, so the disabling
+        must not outlive a request that achieved nothing."""
+        body = self.source()
+        assert "node.disabled = false" in body
+        assert body.index('node.textContent = "Added"') < body.index("node.disabled = false"), (
+            "success should return before the re-enable, or a queued track offers Add again"
+        )
+
+    def test_the_submit_button_is_held_for_the_round_trip(self):
+        """With a pasted link, the search form's own button *is* the add button — same double-tap,
+        same subprocess on the host. Unlike Add it comes back, because a search leaves nothing done."""
+        code = TestTheAssetsThemselves.code("app.js")
+        assert 'form.querySelector(\'button[type="submit"]\')' in code
+        assert "go.disabled = true" in code
+        assert re.search(r"finally \{\s*go\.disabled = false;", code), (
+            "restoring it in `finally` is what survives an early return or a thrown error"
+        )
+
+
 class TestTheScriptsParse:
     """Syntax-check the JavaScript with the JS runtime this project already depends on.
 
