@@ -13,10 +13,11 @@ become one.
 `tunebox` is a placeholder name. This document is a decision record, not a spec — it exists
 so we choose an architecture before writing code.
 
-Status: **Phase 1 implemented (2026-09-26); language and code architecture decided (3.4).** Scope
-and architecture decided. The soundbar, the Cast transport and the audio format are **verified
-working on hardware** (see Phase 0), and ingest now produces a correctly tagged AAC file from the
-CLI. One blocker remains: whether OwnTone can drive Cast well, or whether we drive it ourselves.
+Status: **Phases 1 and 2 implemented (2026-09-26/27); language and code architecture decided
+(3.4).** Scope and architecture decided. The soundbar, the Cast transport and the audio format are
+**verified working on hardware** (see Phase 0); ingest produces a correctly tagged AAC file from
+the CLI, and from an authenticated HTTP request queued on a job worker. One blocker remains:
+whether OwnTone can drive Cast well, or whether we drive it ourselves.
 
 ---
 
@@ -489,6 +490,10 @@ src/tunebox/
   config.py      env-driven config, one frozen dataclass
   errors.py      one exception tree, so the CLI can tell "this ingest failed" from "we have a bug"
   cli.py         argparse front end: search / ingest / doctor  (+ `__main__.py` for `python -m`)
+  jobs/          Phase 2: the queue. models.py (Job, TrackRecord), store.py (SQLite: claim,
+                 retry, ingest history), worker.py (threads calling `ingest.py`)
+  api/           Phase 2: FastAPI. app.py (factory + error handlers), auth.py (token middleware),
+                 routes.py, schemas.py. Thin: it validates, enqueues, and reads the queue back
 ```
 
 Three consequences worth stating, since they are decisions and not style:
@@ -580,12 +585,71 @@ becomes an opt-in flag later, per ingest.
   format m4a"* — so a Pi does no transcoding in the default path. A second ingest of the same
   track (via a different URL form) was deduped without downloading.
 
-**Phase 2 — Service**
-- [ ] FastAPI: `POST /ingest`, `GET /jobs/{id}`, `GET /search`.
-- [ ] SQLite job queue + worker, concurrency cap, timeouts, bounded retries.
-- [ ] Shared-token auth on every route; bound to the LAN interface only.
-- [ ] Dedupe by video id.
-- Exit criteria: queue three URLs from `curl`, all three land correctly.
+**Phase 2 — Service** — **done, 2026-09-27**
+- [x] FastAPI: `POST /ingest`, `GET /jobs/{id}`, `GET /search` (plus `GET /jobs`,
+      `DELETE /jobs/{id}` for a queued job, and `GET /healthz` reporting queue depth).
+      Handlers are synchronous and run in Starlette's threadpool: `/search` blocks on a yt-dlp
+      subprocess and must not sit on the event loop.
+- [x] SQLite job queue + worker, concurrency cap, timeouts, bounded retries. One process holds
+      both, because the queue is a file and the worker is threads waiting on subprocesses — and an
+      exclusive lock file beside the database makes that a rule: a second `serve` on the same queue
+      refuses to start rather than quietly doubling the download concurrency and re-claiming the
+      first one's in-flight jobs. Claims are a conditional `UPDATE` inside `BEGIN IMMEDIATE`, so no
+      two threads take the same row; backoff is stored as the job's `available_at`, so a waiting
+      retry occupies no thread; jobs left `running` by a crash are requeued at startup, and
+      requeued jobs keep their attempt count so a job that kills the process cannot become a
+      restart loop. Timeouts are the adapter's (it kills the whole yt-dlp process group), with a
+      sweep that requeues anything `running` past `inspect+fetch+60 s` with no live thread behind
+      it — measured, not assumed, that nothing can sit in the queue forever.
+- [x] Shared-token auth on every route; bound to the LAN interface only. The check is ASGI
+      middleware, not a dependency: FastAPI mounts `/docs` and `/openapi.json` outside the
+      router, so "every route" had to be a property rather than a habit. Unknown paths answer
+      `401`, not `404`, and so do `HEAD`, `OPTIONS` and a websocket upgrade. Tokens are compared
+      as **bytes** — decoding a header and handing it to `compare_digest` turns a request carrying
+      `0xFF` into a 500 raised outside the exception handlers. `serve` refuses to start without an
+      ASCII token of 16+ characters, and refuses a wildcard bind address parsed with `ipaddress`
+      rather than string-matched: `0`, `0.0`, `0x0`, `::`, `::0` and `0:0:0:0:0:0:0:0` all mean
+      `0.0.0.0` to the socket layer and a literal blocklist catches none of them.
+- [x] Dedupe by video id, in three layers: an already queued/running job for the *same request*
+      (same video, same container, same overrides) returns that job (`200`, not a second
+      download); a video already in the library **in the requested format** is caught by the
+      worker *before* it spends a metadata request; and the Phase 1 destination-path check
+      remains as the backstop for files that arrived another way. Matching on the video id alone
+      would have made `format` and `--artist` inoperative on a second request, and would have
+      reported an mp3 request as `done` while pointing at the m4a. A history entry whose file has
+      been deleted is dropped rather than blocking a re-ingest.
+- [x] Tests: 413 total (from 261), still entirely offline — and now *enforced* offline: an autouse
+      fixture fails any test that opens a non-local socket or resolves a name. The real store, the
+      real worker threads and the real app run against a fake source. Verified green on Python
+      3.11 and 3.12. The concurrency cap is tested by counting *overlapping downloads*, not
+      threads, since the cap exists to be polite to YouTube rather than to size a pool.
+- Exit criteria: queue three URLs from `curl`, all three land correctly. **Met**, verified live
+  on 2026-09-27 against `127.0.0.1:8099` with a throwaway music root:
+  `POST /ingest` ×3 (a `watch?v=` URL, a `youtu.be/` URL and a bare id, all canonicalised on the
+  way in) → `Kraftwerk/Singles/Autobahn (Single version 1974).m4a`,
+  `陳奕迅 Eason Chan/Singles/K歌之王.m4a`, `單依純/Singles/好久不見 (Live).m4a`, each `aac` 128 kbps
+  with the correct Chinese tags read back by `ffprobe`. Requests without the token got `401`.
+  **The retry path was exercised for real, not simulated:** one job hit `HTTP Error 403:
+  Forbidden` on attempt 1, was rescheduled 10 s later, and succeeded on attempt 2 — while the
+  worker moved on to the next job in the meantime. A repeat `POST` of an already-ingested video
+  came back `done`/`already_present` with no network request at all. `SIGINT` drained the worker
+  and shut down cleanly.
+- **Reviewed by an independent auditor after implementation, and it was worth it.** Nine real
+  defects came out of that pass, all fixed above and each with a regression test: the 500 on a
+  non-ASCII token, the bypassable wildcard-bind check, a store error killing a worker thread and
+  wedging the queue behind it, dedupe ignoring the requested format, an enqueue dedupe that
+  discarded the new request's overrides, no reaper for stuck `running` jobs, two `serve` processes
+  sharing one queue, a write lock orphaned when `BEGIN` failed, and a `close()` that did not
+  actually close. Two of the concurrency tests also turned out to pass with the transaction
+  removed — they were exercising an in-process lock, not the database. They now run through
+  separate connections, and the dedupe one does fail with `BEGIN IMMEDIATE` removed (checked by
+  mutating the code). The claim test passes either way, and that is correct rather than weak:
+  what prevents a double claim is the conditional `UPDATE ... WHERE state = 'queued'` and its
+  rowcount check; the transaction is what makes the read and that write one step.
+
+**Deliberately not done in Phase 2** (no user, no need yet): `/search` is not rate-limited, so
+enough concurrent searches could exhaust the ASGI threadpool; the API has no pagination beyond
+`limit`; and there is no metrics endpoint. All three are one-listener non-problems.
 
 **Phase 3 — Sound out of the soundbar, driven by the host**
 - [ ] OwnTone on the host against the music dir; library rescan hook after ingest.

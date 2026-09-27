@@ -69,6 +69,22 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="check external dependencies and the library root")
     doctor.set_defaults(func=_cmd_doctor)
 
+    serve = sub.add_parser(
+        "serve",
+        help="run the HTTP API and the ingest worker (needs TUNEBOX_TOKEN)",
+    )
+    serve.add_argument(
+        "--host",
+        help="address to bind (default $TUNEBOX_API_HOST or 127.0.0.1; never 0.0.0.0)",
+    )
+    serve.add_argument("--port", type=int, help="port to bind (default $TUNEBOX_API_PORT or 8080)")
+    serve.add_argument(
+        "--workers",
+        type=int,
+        help="concurrent ingests, 1 or 2 (default $TUNEBOX_WORKERS or 1)",
+    )
+    serve.set_defaults(func=_cmd_serve)
+
     return parser
 
 
@@ -197,6 +213,50 @@ def _cmd_doctor(args: argparse.Namespace, config: Config) -> int:
     for name, ok, note in checks:
         print(f"[{'ok' if ok else '!!'}] {name.ljust(width)}  {note}")
     return 0 if all(ok for _, ok, _ in checks) else 1
+
+
+def _cmd_serve(args: argparse.Namespace, config: Config) -> int:
+    """Run the API and the worker in one process (PLAN.md Phase 2).
+
+    One process, because the queue is a SQLite file and the worker is two threads waiting on
+    subprocesses — a second daemon would buy nothing and add a way for the two halves to disagree
+    about which database they are using.
+    """
+    import uvicorn  # imported here: `tunebox search` should not pay for FastAPI's import time
+
+    from .api.app import create_app
+
+    updates: dict[str, object] = {}
+    if args.host:
+        updates["api_host"] = args.host.strip()
+    if args.port:
+        updates["api_port"] = args.port
+    if args.workers:
+        updates["worker_concurrency"] = args.workers
+    if updates:
+        config = replace(config, **updates)
+
+    config.validate_for_serve()  # fail before the socket exists, with a fixable message
+    app = create_app(config)
+
+    print(
+        f"tunebox {__version__} serving on http://{config.api_host}:{config.api_port}\n"
+        f"  library:  {config.music_root}\n"
+        f"  queue:    {config.database_path}\n"
+        f"  workers:  {config.worker_concurrency}\n"
+        f"  auth:     X-Tunebox-Token header required on every route",
+        file=sys.stderr,
+    )
+    uvicorn.run(
+        app,
+        host=config.api_host,
+        port=config.api_port,
+        log_level="debug" if args.verbose else "info",
+        # Access logs record which IP asked for what, which is the audit trail PLAN.md 3.2 wants
+        # on a network that contains devices nobody is proud of.
+        access_log=True,
+    )
+    return 0
 
 
 # -------------------------------------------------------------------- helpers
