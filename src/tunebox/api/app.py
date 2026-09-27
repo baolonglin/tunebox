@@ -8,7 +8,7 @@ Three things happen here that are not "wiring":
 
 * **the token middleware is installed before anything else**, so it also covers ``/docs``,
   ``/openapi.json`` and 404s — see :mod:`tunebox.api.auth` for why that is middleware and not a
-  dependency;
+  dependency, and for the one Phase 4 exemption (the app shell, which carries no data);
 * **the exception handlers translate the one exception tree** in :mod:`tunebox.errors` into status
   codes, so no handler needs a try/except and a yt-dlp failure never reads as a bug in tunebox;
 * **the worker's lifetime is the app's lifetime** — started on startup, drained on shutdown, and
@@ -46,14 +46,17 @@ from ..player.owntone import OwnTonePlayer
 from ..player.selection import OutputKeeper
 from ..sources.ytdlp import YtDlpSource
 from ..tagging import write_tags
+from . import ui
 from .auth import TokenAuthMiddleware
+from .remote import router as remote_router
 from .routes import router
 
 log = logging.getLogger(__name__)
 
 DESCRIPTION = (
-    "Home-network-only ingest API. Every route requires the shared token in an "
-    "`X-Tunebox-Token` header (or `Authorization: Bearer`)."
+    "Home-network-only ingest API and playback remote. Every route requires the shared token in "
+    "an `X-Tunebox-Token` header (or `Authorization: Bearer`) — except the web app shell, which "
+    "carries no data and asks for the token itself."
 )
 
 
@@ -112,9 +115,22 @@ def create_app(
     app.state.player = player
     app.state.output_keeper = keeper
 
-    app.add_middleware(TokenAuthMiddleware, token=token)
+    # Phase 4. Built before the middleware so that a wheel with no assets in it fails here, with the
+    # missing filename, rather than on a phone in a kitchen.
+    ui_router = ui.create_ui_router(config) if config.ui_enabled else None
+    app.add_middleware(
+        TokenAuthMiddleware,
+        token=token,
+        exempt_paths=ui.exempt_paths() if ui_router is not None else (),
+        exempt_prefixes=ui.exempt_prefixes() if ui_router is not None else (),
+    )
     _install_error_handlers(app)
     app.include_router(router)
+    app.include_router(remote_router)
+    if ui_router is not None:
+        # Last, so a hand-written asset path can never shadow an API route: FastAPI matches in
+        # registration order, and the API is the part that must not move.
+        app.include_router(ui_router)
     return app
 
 

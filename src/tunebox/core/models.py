@@ -198,3 +198,58 @@ class IngestResult:
             "tags": self.tags.as_dict(),
             "warnings": list(self.warnings),
         }
+
+
+@dataclass(frozen=True)
+class LibraryTrack:
+    """One audio file under the music root, described by *where it is* (PLAN.md Phase 4).
+
+    Deliberately derived from the path rather than by reading tags. The filesystem is the library
+    database (PLAN.md 3.1) and :mod:`tunebox.core.naming` put the tags *into* the path on the way
+    in, so the path already carries the answer — while opening every file with mutagen would turn
+    browsing a thousand-track library into a thousand file reads on an SD card.
+
+    :attr:`path` is **relative** to the music root, POSIX-style. That is not cosmetic: it is the
+    only thing a remote ever sends back when asking to play something, so the absolute path is
+    reconstructed server-side and traversal is structurally impossible rather than filtered.
+    """
+
+    path: str
+    title: str
+    artist: str | None = None
+    album: str | None = None
+    track_number: int | None = None
+    size: int | None = None
+    modified: float | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "title": self.title,
+            "artist": self.artist,
+            "album": self.album,
+            "track_number": self.track_number,
+            "size": self.size,
+            "modified": self.modified,
+        }
+
+
+@dataclass(frozen=True)
+class LibraryPage:
+    """A page of :class:`LibraryTrack`, plus how much of the library it is speaking for.
+
+    ``truncated`` is a separate fact from ``total``: the first means "the walk gave up before
+    seeing everything", the second "there are more matches than this page holds". A UI that
+    conflates them would silently claim a small library.
+    """
+
+    tracks: tuple[LibraryTrack, ...] = ()
+    total: int = 0
+    truncated: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "tracks": [track.as_dict() for track in self.tracks],
+            "total": self.total,
+            "truncated": self.truncated,
+        }

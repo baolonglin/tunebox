@@ -143,7 +143,7 @@ class YtDlpSource:
 
     def _base_argv(self) -> list[str]:
         cfg = self._config
-        return [
+        argv = [
             *cfg.ytdlp,
             # Ignore user/system yt-dlp config files: this project's behaviour must not change
             # because someone left a ~/.config/yt-dlp/config on the host.
@@ -158,6 +158,14 @@ class YtDlpSource:
             "--max-sleep-interval",
             str(cfg.max_sleep_interval),
         ]
+        # yt-dlp enables **only deno** by default and then uses the highest-priority runtime that is
+        # actually installed. Naming the others *adds* them below deno rather than replacing it, so
+        # this is "deno if present, otherwise node, otherwise quickjs, otherwise bun" — which is the
+        # whole reason a 32-bit Raspberry Pi, where no deno build exists, can run this at all. See
+        # tunebox.config.DEFAULT_JS_RUNTIMES.
+        for runtime in cfg.js_runtimes:
+            argv += ["--js-runtimes", runtime]
+        return argv
 
     def _run_json(self, args: Sequence[str], *, timeout: int, what: str) -> dict[str, Any]:
         argv = [*self._base_argv(), "--no-progress", *args]

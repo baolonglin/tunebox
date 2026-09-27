@@ -12,6 +12,11 @@ The division of labour with the worker is deliberate:
 * everything slow, retryable, or network-shaped happens in :mod:`tunebox.jobs.worker`.
 
 That is what lets a phone queue three URLs and lock itself.
+
+``GET /library`` joins them in Phase 4, and is here rather than in :mod:`tunebox.api.remote`
+because it is a fact about *our* library rather than a command to the player: it walks the music
+root and needs no daemon running at all. Its handler blocks on a directory walk, which is the third
+reason these are not ``async def``.
 """
 
 from __future__ import annotations
@@ -27,8 +32,18 @@ from ..errors import TuneboxError
 from ..jobs.models import Job, JobState
 from ..jobs.store import JobStore
 from ..jobs.worker import Worker
+from ..library import list_tracks
 from ..sources import urls
-from .schemas import HealthView, IngestRequest, JobView, PlayerHealth, SearchItem
+from .remote import configured_output
+from .schemas import (
+    HealthView,
+    IngestRequest,
+    JobView,
+    LibraryTrackView,
+    LibraryView,
+    PlayerHealth,
+    SearchItem,
+)
 
 log = logging.getLogger(__name__)
 
@@ -98,23 +113,11 @@ def _player_health(request: Request) -> PlayerHealth | None:
         log.exception("player health check raised")
         return PlayerHealth(reachable=False, url=url, error=f"{type(exc).__name__}: {exc}")
 
-    # Same precedence as OwnTonePlayer.find_output: an id is unambiguous, a name is what somebody
-    # renamed in the Google Home app last week. Matching on *either* would let a name collision
-    # report the wrong speaker as selected while a configured id points somewhere else entirely.
-    if config.output_id:
-        target = next(
-            (output for output in status.outputs if output.id == config.output_id), None
-        )
-    else:
-        wanted = config.output_name.strip().casefold()
-        target = next(
-            (
-                output
-                for output in status.outputs
-                if output.name.strip().casefold() == wanted
-            ),
-            None,
-        )
+    # Same precedence as OwnTonePlayer.find_output, and shared with the Phase 4 remote so the two
+    # can never disagree about which speaker is "the" speaker: an id is unambiguous, a name is what
+    # somebody renamed in the Google Home app last week. Matching on *either* would let a name
+    # collision report the wrong speaker as selected while a configured id points somewhere else.
+    target = configured_output(status.outputs, config)
     now = status.now_playing
     return PlayerHealth(
         reachable=True,
@@ -141,6 +144,43 @@ def search(
     """
     results = _source(request).search(q, limit=limit or _config(request).search_limit)
     return [SearchItem(**result.as_dict()) for result in results]
+
+
+@router.get("/library", response_model=LibraryView, summary="Music files under the music root")
+def library(
+    request: Request,
+    q: str | None = Query(default=None, max_length=200, description="filter on path and artist"),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> LibraryView:
+    """List the library from the filesystem, newest first.
+
+    Newest first because of what the remote uses it for: the track somebody wants to play is
+    overwhelmingly the one they ingested a minute ago. Whole-library browsing by artist and album is
+    what OwnTone's own web UI already does well, and Phase 4's second bullet decided to link to that
+    rather than rebuild it.
+
+    No tags are read — the layout ``Artist/Album/Track.ext`` already carries them, because
+    :mod:`tunebox.core.naming` put them there. Opening every file with mutagen to display a list
+    would make browsing a thousand tracks a thousand reads off an SD card.
+
+    Paths come back **relative** to the music root, and that is the form ``POST /player/queue``
+    expects. It means no absolute host path ever reaches a client, and no client-supplied path is
+    ever used as one.
+    """
+    config = _config(request)
+    page = list_tracks(
+        config.music_root, query=q, limit=limit, max_files=config.library_max_files
+    )
+    if page.truncated:
+        log.warning(
+            "library listing truncated at %d files; TUNEBOX_MUSIC_ROOT may be wider than intended",
+            config.library_max_files,
+        )
+    return LibraryView(
+        tracks=[LibraryTrackView(**track.as_dict()) for track in page.tracks],
+        total=page.total,
+        truncated=page.truncated,
+    )
 
 
 @router.post(

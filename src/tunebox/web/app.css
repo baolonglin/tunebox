@@ -1,0 +1,471 @@
+/*
+ * tunebox remote — one screen, phone first (PLAN.md Phase 4).
+ *
+ * Sized for a thumb: every control is at least 44x44 CSS pixels, which is the smallest target
+ * Apple's and Google's own guidance considers reliable, and this is a thing people poke at while
+ * holding a cup of tea. Colours are checked for WCAG AA contrast against their own background
+ * rather than eyeballed, and nothing conveys state by colour alone — the transport button changes
+ * its glyph and its label, not just its fill.
+ */
+
+:root {
+  color-scheme: dark;
+  --bg: #11141a;
+  --surface: #1a1f28;
+  --surface-2: #232a35;
+  --line: #333c4a;
+  --text: #f2f5f9; /* 14.9:1 on --bg */
+  --muted: #a8b3c4; /* 7.4:1 on --bg  */
+  --accent: #6fb3ff;
+  --accent-ink: #08121f; /* dark ink on the light accent: 10.3:1 */
+  --danger: #ff9a8b;
+  --ok: #7ee2a8;
+  --radius: 12px;
+  --tap: 44px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/*
+ * `hidden` must win. The attribute hides an element through a UA rule (`[hidden] { display: none }`)
+ * that any author rule setting `display` on the same element beats on specificity — and this file
+ * sets `display: grid` on `.gate`, which is toggled by the attribute. Without this, unlocking left
+ * the token card rendered on top of the app: the attribute changed, the layout did not. The
+ * `!important` is the documented idiom for exactly this, not a shortcut around a specificity fight.
+ */
+[hidden] {
+  display: none !important;
+}
+
+html {
+  /* Never zoom text away on a phone that is rotated mid-song. */
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  /* Safe-area padding, so the footer is not under an iPhone's home indicator once installed. */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+    env(safe-area-inset-left);
+}
+
+h1 {
+  font-size: 1.25rem;
+  margin: 0;
+  letter-spacing: 0.02em;
+}
+
+h2 {
+  font-size: 0.95rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin: 1.5rem 0 0.5rem;
+}
+
+p {
+  margin: 0.35rem 0;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+  background: var(--surface-2);
+  border-radius: 4px;
+  padding: 0 0.3em;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.small {
+  font-size: 0.85rem;
+}
+
+.error {
+  color: var(--danger);
+}
+
+.noscript {
+  margin: 2rem;
+  color: var(--muted);
+}
+
+/* ------------------------------------------------------------------ the token gate */
+
+.gate {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 1.25rem;
+}
+
+.gate .card {
+  width: 100%;
+  max-width: 24rem;
+  display: grid;
+  gap: 0.6rem;
+}
+
+/* ------------------------------------------------------------------------ layout */
+
+.app {
+  max-width: 34rem;
+  margin: 0 auto;
+  padding: 0.75rem 0.9rem 2.5rem;
+}
+
+.top {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.35rem 0 0.6rem;
+}
+
+.banner {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--danger);
+  flex: 1;
+  min-width: 0;
+}
+
+main {
+  padding-bottom: 1rem;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.9rem;
+  margin: 0.6rem 0;
+}
+
+/* -------------------------------------------------------------------------- tabs */
+
+.tabs {
+  display: flex;
+  gap: 0.35rem;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.25rem;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.tabs button {
+  flex: 1;
+  min-height: var(--tap);
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.tabs button[aria-selected="true"] {
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 600;
+  /* A second, non-colour signal for the selected tab. */
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+/* --------------------------------------------------------------------- controls */
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  min-height: var(--tap);
+  min-width: var(--tap);
+  padding: 0 0.9rem;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+button.danger {
+  color: var(--danger);
+}
+
+button.link {
+  min-height: auto;
+  min-width: auto;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  padding: 0.5rem 0;
+  text-decoration: underline;
+}
+
+/* Visible focus everywhere — the default ring is what keyboard users navigate by, and removing it
+   is the single most common accessibility regression in a hand-written UI. */
+:is(a, button, input, [tabindex]):focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+label {
+  display: block;
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+}
+
+input[type="search"],
+input[type="password"],
+input[type="text"] {
+  width: 100%;
+  min-height: var(--tap);
+  padding: 0 0.7rem;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+}
+
+form.card {
+  display: grid;
+  gap: 0.5rem;
+}
+
+/* --------------------------------------------------------------- now playing */
+
+.now {
+  text-align: center;
+}
+
+.np-title {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin: 0.2rem 0;
+  overflow-wrap: anywhere;
+}
+
+.np-artist {
+  margin: 0 0 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.progress {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.4s linear;
+}
+
+.times {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin: 0.35rem 0 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.transport {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+  margin: 0.75rem 0;
+}
+
+.transport button {
+  flex: 1;
+  font-size: 1.15rem;
+}
+
+.transport button.big {
+  flex: 1.6;
+  font-size: 1.35rem;
+}
+
+.volume-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.volume-row input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  height: var(--tap);
+  accent-color: var(--accent);
+}
+
+.volume-row output {
+  min-width: 2.5ch;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.speaker {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.speaker p {
+  margin: 0;
+}
+
+/* -------------------------------------------------------------------- lists */
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.4rem;
+}
+
+.list li {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.6rem 0.7rem;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.list li.current {
+  border-color: var(--accent);
+}
+
+.row-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.row-title {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.row-sub {
+  display: block;
+  font-size: 0.82rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.row-actions {
+  display: flex;
+  gap: 0.35rem;
+  flex-shrink: 0;
+}
+
+.row-actions button {
+  padding: 0 0.6rem;
+  font-size: 0.85rem;
+}
+
+.empty {
+  color: var(--muted);
+  font-size: 0.9rem;
+  padding: 0.4rem 0;
+}
+
+/* -------------------------------------------------------------------- jobs */
+
+.job-bar {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  margin-top: 0.35rem;
+  overflow: hidden;
+}
+
+.job-bar > div {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+}
+
+.state {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.state.done {
+  color: var(--ok);
+}
+
+.state.failed {
+  color: var(--danger);
+}
+
+/* ------------------------------------------------------------------ footer */
+
+.foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-top: 1.5rem;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.85rem;
+}
+
+.foot a {
+  color: var(--accent);
+  min-height: var(--tap);
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Respect a user who has asked for less motion; the progress bar is the only thing that animates. */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

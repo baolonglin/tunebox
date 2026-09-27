@@ -286,11 +286,23 @@ def _cmd_doctor(args: argparse.Namespace, config: Config) -> int:
     version = _probe_version([*config.ytdlp, "--version"])
     checks.append(("yt-dlp", version is not None, version or "not runnable (required)"))
 
-    # ffmpeg extracts the audio; deno is the JS runtime yt-dlp-ejs needs. Both are hard
-    # requirements: without the JS runtime every media download fails with HTTP 403 (PLAN.md 0.3).
-    for binary in ("ffmpeg", "ffprobe", "deno"):
+    # ffmpeg extracts the audio and ffprobe inspects it. Both are hard requirements.
+    for binary in ("ffmpeg", "ffprobe"):
         path = shutil.which(binary)
         checks.append((binary, path is not None, path or "MISSING (required)"))
+
+    # The JS runtime is also a hard requirement — without one, every media download fails with
+    # HTTP 403 (PLAN.md 0.3) — but *which* one is not our business, and asserting "deno" would be
+    # wrong on the 32-bit Raspberry Pi that has no deno build. So yt-dlp is asked what it found.
+    runtime = _probe_js_runtimes(config)
+    checks.append(
+        (
+            "JS runtime",
+            runtime is not None,
+            runtime or "none usable (required: downloads fail with 403). Install deno, "
+            "or node 22+ / quickjs / bun — see TUNEBOX_JS_RUNTIMES",
+        )
+    )
 
     # Without yt-dlp-ejs + a JS runtime, YouTube returns 403 for the media stream (PLAN.md 0.3).
     try:
@@ -398,7 +410,13 @@ def _cmd_serve(args: argparse.Namespace, config: Config) -> int:
             else " (keeper disabled)"
         )
         + "\n"
-        "  auth:     X-Tunebox-Token header required on every route",
+        + (
+            f"  remote:   http://{config.api_host}:{config.api_port}/ "
+            "— open on the phone, paste the token once, add to home screen\n"
+            if config.ui_enabled
+            else "  remote:   disabled (TUNEBOX_UI=0)\n"
+        )
+        + "  auth:     X-Tunebox-Token header required on every route except the app shell",
         file=sys.stderr,
     )
     uvicorn.run(
@@ -599,6 +617,49 @@ def _probe_version(argv: Sequence[str]) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return completed.stdout.strip() or None if completed.returncode == 0 else None
+
+
+#: A URL the generic extractor resolves **locally**, so the probe below costs no network request.
+#: yt-dlp prints its debug banner before it touches an extractor, which is the only part we read.
+_JS_PROBE_URL = "file:///dev/null"
+_JS_RUNTIME_LINE = "JS runtimes:"
+
+
+def _probe_js_runtimes(config: Config) -> str | None:
+    """Ask yt-dlp which JavaScript runtime it would use, or ``None`` if it has none.
+
+    yt-dlp already knows how to find deno, node, quickjs and bun, and which versions of each it
+    considers usable. Re-implementing that here would mean two answers to one question, and the one
+    printed by ``doctor`` would be the wrong one exactly when it mattered — on a host with, say,
+    node 18 installed, which is present, on PATH, and useless.
+
+    So this parses yt-dlp's own ``-v`` banner. It reports what will actually be used, including the
+    version, and it keeps working when yt-dlp adds a runtime we have never heard of.
+    """
+    argv = [
+        *config.ytdlp,
+        "--ignore-config",
+        "-v",
+        "--simulate",
+        *[arg for runtime in config.js_runtimes for arg in ("--js-runtimes", runtime)],
+        _JS_PROBE_URL,
+    ]
+    try:
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # The banner goes to stderr, but the return code is a failure (there is nothing at that URL to
+    # download), so it is deliberately not checked.
+    for line in (completed.stderr + completed.stdout).splitlines():
+        _, separator, found = line.partition(_JS_RUNTIME_LINE)
+        if not separator:
+            continue
+        names = found.strip()
+        # "none" is what yt-dlp prints when nothing usable was found; an empty tail means the same.
+        if not names or names.lower() == "none":
+            return None
+        return names
+    return None
 
 
 def _probe_writable(root: Path) -> bool:

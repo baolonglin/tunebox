@@ -40,14 +40,35 @@ AUTH = {"X-Tunebox-Token": TOKEN}
 ROUTES = (
     ("GET", "/healthz", "/healthz"),
     ("GET", "/search", "/search?q=x"),
+    ("GET", "/library", "/library"),
     ("POST", "/ingest", "/ingest"),
     ("GET", "/jobs", "/jobs"),
     ("GET", "/jobs/{job_id}", "/jobs/abc123"),
     ("DELETE", "/jobs/{job_id}", "/jobs/abc123"),
+    # Phase 4's remote. Behaviour lives in ``tests/test_remote.py``; they are listed here so the
+    # matrix below still covers every route in the app.
+    ("GET", "/player", "/player"),
+    ("PUT", "/player/play", "/player/play"),
+    ("PUT", "/player/pause", "/player/pause"),
+    ("PUT", "/player/toggle", "/player/toggle"),
+    ("PUT", "/player/stop", "/player/stop"),
+    ("PUT", "/player/next", "/player/next"),
+    ("PUT", "/player/previous", "/player/previous"),
+    ("PUT", "/player/volume", "/player/volume"),
+    ("PUT", "/player/seek", "/player/seek"),
+    ("PUT", "/player/output/select", "/player/output/select"),
+    ("GET", "/player/queue", "/player/queue"),
+    ("POST", "/player/queue", "/player/queue"),
+    ("DELETE", "/player/queue", "/player/queue"),
 )
 
 #: Added by FastAPI itself, outside our router — and therefore the reason auth is middleware.
 DOC_ROUTES = ("/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc")
+
+#: The Phase 4 app shell: the *only* paths served without the token, because a browser cannot put a
+#: header on the document request it makes on your behalf. They carry no data — see
+#: ``tests/test_ui.py``, which is where that exemption is held to account.
+SHELL_ROUTES = ("/", "/sw.js", "/manifest.webmanifest", "/ui/{name}")
 
 
 @pytest.fixture
@@ -232,8 +253,21 @@ class TestAuth:
 
     def test_the_auth_matrix_covers_every_route(self, app):
         registered = {route.path for route in app.routes}
-        considered = {template for _, template, _ in ROUTES} | set(DOC_ROUTES)
+        considered = {template for _, template, _ in ROUTES} | set(DOC_ROUTES) | set(SHELL_ROUTES)
         assert registered <= considered, "a new route needs an entry in ROUTES"
+
+    def test_only_the_shell_is_exempt(self, app):
+        """The exemption list is small, deliberate, and worth failing a test over: it is the one
+        hole PLAN.md 3.2's "checked on *every* route" has ever had."""
+        from tunebox.api import ui
+
+        exempt = set(ui.exempt_paths())
+        assert exempt == {"/", "/sw.js", "/manifest.webmanifest"}
+        assert ui.exempt_prefixes() == ("/ui/",)
+        api_paths = {template for _, template, _ in ROUTES}
+        for path in api_paths:
+            assert path not in exempt
+            assert not any(path.startswith(prefix) for prefix in ui.exempt_prefixes())
 
     def test_serving_without_a_token_is_refused(self, tmp_path: Path):
         config = Config(music_root=tmp_path, db_path=tmp_path / "jobs.db", api_token=None)

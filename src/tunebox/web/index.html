@@ -1,0 +1,218 @@
+<!doctype html>
+<!--
+  tunebox — the one screen (PLAN.md Phase 4).
+
+  Hand-written HTML/CSS/JS with no build step and no dependencies, for the same reason the OwnTone
+  adapter uses stdlib urllib rather than httpx: this is a few hundred lines of DOM work on a
+  Raspberry Pi, and a toolchain to produce it would be the largest moving part in the project.
+
+  Nothing here is fetched from a third party — no CDN, no font, no analytics, and deliberately not
+  even the search-result thumbnails YouTube offers. A remote that loaded images from Google on every
+  search would make the house's own music browser phone home once per keystroke, which is the
+  opposite of what "home-network-only" is for (PLAN.md 6, non-goals).
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>tunebox</title>
+    <!-- viewport-fit=cover so the layout reaches under an iPhone's rounded corners once installed -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="description" content="Search, ingest and play music on the house speaker." />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#11141a" />
+    <!-- Both spellings: the unprefixed one is the standard, the Apple one is what iOS still reads. -->
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="tunebox" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/ui/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/ui/icon-180.png" />
+    <!-- ?v= so a tunebox upgrade cannot be served a cached script by the phone or the worker. -->
+    <link rel="stylesheet" href="/ui/app.css?v=__TUNEBOX_VERSION__" />
+  </head>
+  <body
+    data-version="__TUNEBOX_VERSION__"
+    data-owntone-url="__OWNTONE_URL__"
+    data-player-port="__PLAYER_PORT__"
+  >
+    <noscript>
+      <p class="noscript">
+        tunebox’s remote needs JavaScript. Without it, the API is still fully usable with
+        <code>curl</code> — see the README.
+      </p>
+    </noscript>
+
+    <!--
+      The token gate. The app shell is the one thing served without the shared token (a browser
+      cannot put a header on the document request it makes itself), so the first thing the shell
+      does is ask for one and prove it against GET /healthz. Nothing is displayed before that
+      succeeds, because there is nothing to display: every byte of library, queue and job data is
+      behind the token.
+    -->
+    <div id="gate" class="gate" hidden>
+      <form id="gate-form" class="card">
+        <h1>tunebox</h1>
+        <p class="muted">
+          This remote needs the shared token from <code>TUNEBOX_TOKEN</code>. It is stored on this
+          device only, and sent as a header on every request.
+        </p>
+        <label for="gate-token">Access token</label>
+        <input
+          id="gate-token"
+          name="token"
+          type="password"
+          required
+          minlength="16"
+          spellcheck="false"
+          autocomplete="current-password"
+          autocapitalize="off"
+          autocorrect="off"
+          enterkeyhint="go"
+        />
+        <p id="gate-error" class="error" role="alert" hidden></p>
+        <button type="submit" class="primary">Unlock</button>
+      </form>
+    </div>
+
+    <div id="app" class="app" hidden>
+      <header class="top">
+        <h1>tunebox</h1>
+        <p id="banner" class="banner" role="status" aria-live="polite" hidden></p>
+      </header>
+
+      <nav class="tabs" role="tablist" aria-label="Sections">
+        <button
+          type="button"
+          role="tab"
+          id="tab-now"
+          aria-controls="panel-now"
+          aria-selected="true"
+        >
+          Now playing
+        </button>
+        <button
+          type="button"
+          role="tab"
+          id="tab-add"
+          aria-controls="panel-add"
+          aria-selected="false"
+          tabindex="-1"
+        >
+          Add music
+        </button>
+        <button
+          type="button"
+          role="tab"
+          id="tab-library"
+          aria-controls="panel-library"
+          aria-selected="false"
+          tabindex="-1"
+        >
+          Library
+        </button>
+      </nav>
+
+      <main>
+        <!-- ------------------------------------------------------------ now playing -->
+        <section id="panel-now" role="tabpanel" aria-labelledby="tab-now" tabindex="0">
+          <div class="card now">
+            <p id="np-title" class="np-title">Nothing loaded</p>
+            <p id="np-artist" class="np-artist muted"></p>
+            <div
+              id="np-track"
+              class="progress"
+              role="progressbar"
+              aria-label="Track position"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="0"
+            >
+              <div id="np-bar" class="progress-fill"></div>
+            </div>
+            <p class="times">
+              <span id="np-elapsed">0:00</span>
+              <span id="np-length">0:00</span>
+            </p>
+          </div>
+
+          <div class="transport" role="group" aria-label="Transport">
+            <button type="button" id="btn-prev" aria-label="Previous track">⏮</button>
+            <button type="button" id="btn-toggle" class="primary big" aria-label="Play">▶</button>
+            <button type="button" id="btn-next" aria-label="Next track">⏭</button>
+            <button type="button" id="btn-stop" aria-label="Stop">⏹</button>
+          </div>
+
+          <div class="card volume">
+            <label for="vol">Volume</label>
+            <div class="volume-row">
+              <button type="button" id="btn-voldown" aria-label="Volume down">−</button>
+              <input id="vol" type="range" min="0" max="100" step="1" value="0" />
+              <button type="button" id="btn-volup" aria-label="Volume up">+</button>
+              <output id="vol-out" for="vol">0</output>
+            </div>
+          </div>
+
+          <div class="card speaker">
+            <p id="speaker-state" class="muted">Speaker: unknown</p>
+            <button type="button" id="btn-select" hidden>Turn the speaker on</button>
+          </div>
+
+          <h2>Queue <span id="queue-count" class="muted"></span></h2>
+          <ol id="queue" class="list"></ol>
+          <button type="button" id="btn-clear" class="danger">Clear the queue</button>
+        </section>
+
+        <!-- ------------------------------------------------------------- add music -->
+        <section id="panel-add" role="tabpanel" aria-labelledby="tab-add" tabindex="0" hidden>
+          <form id="search-form" class="card">
+            <label for="q">Search, or paste a YouTube link</label>
+            <input
+              id="q"
+              type="search"
+              required
+              maxlength="200"
+              enterkeyhint="search"
+              placeholder="kraftwerk autobahn"
+            />
+            <button type="submit" class="primary">Go</button>
+            <p class="muted small">
+              A link or a bare video id is queued straight away; anything else is searched.
+            </p>
+          </form>
+          <p id="search-note" class="muted" role="status" aria-live="polite"></p>
+          <ul id="results" class="list"></ul>
+
+          <h2>Ingests</h2>
+          <p id="jobs-note" class="muted"></p>
+          <ul id="jobs" class="list"></ul>
+        </section>
+
+        <!-- --------------------------------------------------------------- library -->
+        <section id="panel-library" role="tabpanel" aria-labelledby="tab-library" tabindex="0" hidden>
+          <form id="lib-form" class="card">
+            <label for="lq">Filter the library</label>
+            <input id="lq" type="search" maxlength="200" enterkeyhint="search" />
+            <button type="submit" class="primary">Filter</button>
+          </form>
+          <p id="lib-note" class="muted" role="status" aria-live="polite"></p>
+          <ul id="library" class="list"></ul>
+        </section>
+      </main>
+
+      <footer class="foot">
+        <a id="owntone-link" href="#" rel="noreferrer">Full library in OwnTone ↗</a>
+        <button type="button" id="btn-forget" class="link">Forget token</button>
+        <span class="muted small">tunebox __TUNEBOX_VERSION__</span>
+      </footer>
+    </div>
+
+    <!--
+      No inline <script> anywhere on this page, which is what lets the Content-Security-Policy
+      header say `script-src 'self'` with neither 'unsafe-inline' nor a per-response nonce. The two
+      constants the page needs are `data-` attributes on <body> above; neither is a secret, since
+      OwnTone announces itself over mDNS to the whole house anyway.
+    -->
+    <script src="/ui/app.js?v=__TUNEBOX_VERSION__" defer></script>
+  </body>
+</html>

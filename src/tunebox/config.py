@@ -11,6 +11,7 @@ import ipaddress
 import os
 import shutil
 import sys
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
@@ -20,6 +21,20 @@ from .errors import ConfigError
 #: Containers we are willing to produce. ``m4a`` (AAC) is the default because it is the format
 #: verified playing on the SN9YG over Cast; ``mp3`` exists for the Bluetooth fallback.
 SUPPORTED_FORMATS = ("m4a", "mp3")
+
+#: JavaScript runtimes yt-dlp knows how to drive, in its own order of priority. Named here only so a
+#: typo in ``TUNEBOX_JS_RUNTIMES`` is a startup error rather than a download that fails at 403.
+KNOWN_JS_RUNTIMES = ("deno", "node", "quickjs", "bun")
+
+#: Runtimes to *add* to yt-dlp's default. yt-dlp enables **only deno** out of the box and picks the
+#: highest-priority one that is actually installed, so naming the rest here means "deno if you have
+#: it, otherwise node, otherwise quickjs, otherwise bun" — and costs nothing on a host that has deno.
+#:
+#: This is not a nicety, it is what makes a 32-bit Raspberry Pi installable at all: there is no
+#: official deno build for 32-bit ARM, and without a JS runtime every media download fails with
+#: HTTP 403 (PLAN.md 0.3). Left as a default rather than something the installer has to detect,
+#: because "try the ones that exist" needs no detection.
+DEFAULT_JS_RUNTIMES = ("node", "quickjs", "bun")
 
 DEFAULT_MUSIC_ROOT = Path.home() / "Music" / "tunebox"
 
@@ -54,6 +69,12 @@ DEFAULT_OUTPUT_NAME = "Living Room speaker"
 #: that a soundbar power-cycle is invisible by the time someone reaches for their phone, and long
 #: enough to be free.
 DEFAULT_OUTPUT_CHECK_INTERVAL = 15.0
+
+#: Phase 4: how many files ``GET /library`` is willing to look at before it stops walking. The
+#: filesystem is the library database (PLAN.md 3.1), so a browse is a directory walk, and a walk of
+#: an accidentally-enormous root — a music root set to ``/`` by a typo — must not hold a worker
+#: thread for minutes. The answer is truncated and says so rather than being slow.
+DEFAULT_LIBRARY_MAX_FILES = 50_000
 
 
 def binds_every_interface(host: str) -> bool:
@@ -147,11 +168,37 @@ def resolve_ytdlp_command(env: Mapping[str, str] | None = None) -> tuple[str, ..
     return (found,) if found else ("yt-dlp",)
 
 
+def resolve_js_runtimes(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Extra runtimes to offer yt-dlp, from ``TUNEBOX_JS_RUNTIMES``.
+
+    An explicitly empty value means "deno only", which is yt-dlp's own default and the right setting
+    for a host where some ancient runtime is on PATH and must not be tried.
+    """
+    env = os.environ if env is None else env
+    raw = env.get("TUNEBOX_JS_RUNTIMES")
+    if raw is None:
+        return DEFAULT_JS_RUNTIMES
+    names = tuple(name for name in raw.replace(",", " ").split() if name)
+    for name in names:
+        if name not in KNOWN_JS_RUNTIMES:
+            raise ConfigError(
+                f"unknown JS runtime {name!r} in TUNEBOX_JS_RUNTIMES; "
+                f"yt-dlp supports {', '.join(KNOWN_JS_RUNTIMES)}"
+            )
+    return names
+
+
 @dataclass(frozen=True)
 class Config:
     music_root: Path = DEFAULT_MUSIC_ROOT
     audio_format: str = "m4a"
     ytdlp: tuple[str, ...] = field(default_factory=resolve_ytdlp_command)
+    #: Extra JS runtimes to enable, appended to yt-dlp's deno-only default. See
+    #: :data:`DEFAULT_JS_RUNTIMES` — this is what makes a Pi with no deno build work.
+    #:
+    #: Passed as ``--js-runtimes`` on every invocation, so a ``TUNEBOX_YTDLP`` override pointing at a
+    #: yt-dlp older than the flag needs ``TUNEBOX_JS_RUNTIMES=`` as well.
+    js_runtimes: tuple[str, ...] = field(default_factory=resolve_js_runtimes)
     search_limit: int = 20
     #: Metadata-only calls are fast; a long hang here is a bot challenge, not slow progress.
     inspect_timeout: int = 60
@@ -208,12 +255,32 @@ class Config:
     #: scan.
     rescan_after_ingest: bool = True
 
+    # -------------------------------------------------- Phase 4: the one web UI
+    #: Serve the app shell (HTML/CSS/JS/manifest/icons) from the API. On by default — Phase 4's exit
+    #: criterion is "one icon on the phone does everything", and an API with no UI does not meet it.
+    #: Off makes tunebox a pure JSON service again, which is the right setting for a host where the
+    #: only client is ``curl``: the shell is the one thing served without the token (see
+    #: :mod:`tunebox.api.ui`), so being able to remove it entirely is worth an env var.
+    ui_enabled: bool = True
+    #: Where OwnTone's own web UI lives, for the "browse the whole library / manage playlists" link.
+    #: Normally derived rather than configured — see :meth:`owntone_ui` — because the daemon runs on
+    #: loopback and a *phone* cannot follow a ``127.0.0.1`` link.
+    owntone_ui_url: str | None = None
+    #: Ceiling on the directory walk behind ``GET /library``.
+    library_max_files: int = DEFAULT_LIBRARY_MAX_FILES
+
     def __post_init__(self) -> None:
         if self.audio_format not in SUPPORTED_FORMATS:
             raise ConfigError(
                 f"unsupported audio format {self.audio_format!r}; "
                 f"expected one of {', '.join(SUPPORTED_FORMATS)}"
             )
+        for runtime in self.js_runtimes:
+            if runtime not in KNOWN_JS_RUNTIMES:
+                raise ConfigError(
+                    f"unknown JS runtime {runtime!r}; "
+                    f"yt-dlp supports {', '.join(KNOWN_JS_RUNTIMES)}"
+                )
         if not 1 <= self.api_port <= 65535:
             raise ConfigError(f"api port out of range: {self.api_port}")
         if not 1 <= self.worker_concurrency <= MAX_WORKER_CONCURRENCY:
@@ -233,6 +300,15 @@ class Config:
             raise ConfigError("output check interval must not be negative (0 disables it)")
         if self.output_volume is not None and not 0 <= self.output_volume <= 100:
             raise ConfigError(f"output volume must be 0-100, got {self.output_volume}")
+        if self.library_max_files < 1:
+            raise ConfigError(f"library max files must be at least 1, got {self.library_max_files}")
+        if self.owntone_ui_url is not None:
+            scheme = self.owntone_ui_url.split("://", 1)[0].lower()
+            if scheme not in ("http", "https"):
+                raise ConfigError(
+                    "owntone ui url must start with http:// or https://, got "
+                    f"{self.owntone_ui_url!r}"
+                )
         scheme = self.player_url.split("://", 1)[0].lower() if "://" in self.player_url else ""
         if scheme not in ("http", "https"):
             raise ConfigError(
@@ -243,6 +319,40 @@ class Config:
     def player_base_url(self) -> str:
         """The daemon's base URL without a trailing slash, so joining a path is unambiguous."""
         return self.player_url.rstrip("/")
+
+    @property
+    def player_port(self) -> int:
+        """The port OwnTone's own web UI answers on, taken from :attr:`player_url`.
+
+        Not a separate setting: OwnTone serves its web UI and its JSON API from the same listener,
+        so a second knob could only ever be wrong.
+        """
+        parsed = urllib.parse.urlsplit(self.player_base_url)
+        if parsed.port:
+            return parsed.port
+        return 443 if parsed.scheme == "https" else 80
+
+    @property
+    def owntone_ui_link(self) -> str:
+        """Absolute URL of OwnTone's web UI, or ``""`` for "the browser must work it out".
+
+        The empty answer is the *normal* one and it is not a failure to configure something. The
+        player lives on loopback (:data:`DEFAULT_PLAYER_URL`), and handing a phone a link to
+        ``http://127.0.0.1:3689`` would point it at itself. The browser already knows the host it
+        just loaded this page from, so the UI joins that hostname to :attr:`player_port` instead —
+        and the only case where that is wrong is a player on a *different* machine, which is exactly
+        the case where the player URL is already the right link.
+        """
+        if self.owntone_ui_url:
+            return self.owntone_ui_url.rstrip("/")
+        host = urllib.parse.urlsplit(self.player_base_url).hostname or ""
+        try:
+            if ipaddress.ip_address(host).is_loopback:
+                return ""
+        except ValueError:
+            if host.lower() in ("localhost", "localhost.localdomain", ""):
+                return ""
+        return self.player_base_url
 
     @property
     def scratch_root(self) -> Path:
@@ -308,6 +418,7 @@ class Config:
             music_root=Path(root).expanduser() if root else DEFAULT_MUSIC_ROOT,
             audio_format=(env.get("TUNEBOX_AUDIO_FORMAT") or "m4a").lower(),
             ytdlp=resolve_ytdlp_command(env),
+            js_runtimes=resolve_js_runtimes(env),
             search_limit=_env_int(env, "TUNEBOX_SEARCH_LIMIT", 20),
             inspect_timeout=_env_int(env, "TUNEBOX_INSPECT_TIMEOUT", 60),
             fetch_timeout=_env_int(env, "TUNEBOX_FETCH_TIMEOUT", 600),
@@ -334,4 +445,9 @@ class Config:
                 env, "TUNEBOX_OUTPUT_CHECK_INTERVAL", DEFAULT_OUTPUT_CHECK_INTERVAL
             ),
             rescan_after_ingest=_env_bool(env, "TUNEBOX_RESCAN_AFTER_INGEST", True),
+            ui_enabled=_env_bool(env, "TUNEBOX_UI", True),
+            owntone_ui_url=(env.get("TUNEBOX_OWNTONE_UI") or "").strip() or None,
+            library_max_files=_env_int(
+                env, "TUNEBOX_LIBRARY_MAX_FILES", DEFAULT_LIBRARY_MAX_FILES
+            ),
         )

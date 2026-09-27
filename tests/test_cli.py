@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from tunebox.cli import build_parser, main
-from tunebox.config import Config, resolve_ytdlp_command
+from tunebox.cli import _probe_js_runtimes, build_parser, main
+from tunebox.config import (
+    DEFAULT_JS_RUNTIMES,
+    Config,
+    resolve_js_runtimes,
+    resolve_ytdlp_command,
+)
 from tunebox.core.models import QueueItem
 from tunebox.errors import ConfigError
 
@@ -22,6 +28,71 @@ class TestConfig:
         assert config.music_root.name == "tunebox"
         assert config.scratch_root.name == ".tunebox-tmp"
 
+
+class TestJsRuntimeConfig:
+    """``TUNEBOX_JS_RUNTIMES`` — the setting that makes a Raspberry Pi installable.
+
+    yt-dlp enables **only deno** by default and picks the highest-priority runtime that is actually
+    installed. There is no official deno build for 32-bit ARM, so without naming the alternatives a
+    32-bit Raspberry Pi has no JS runtime, and without a JS runtime every media download fails with
+    HTTP 403 (PLAN.md 0.3).
+    """
+
+    def test_the_default_adds_fallbacks_below_deno(self):
+        """Not *instead of* deno: yt-dlp orders by its own priority, so naming these means "deno if
+        you have it, otherwise node, otherwise quickjs, otherwise bun"."""
+        assert resolve_js_runtimes({}) == DEFAULT_JS_RUNTIMES
+        assert "deno" not in DEFAULT_JS_RUNTIMES
+        assert DEFAULT_JS_RUNTIMES[0] == "node"
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("node", ("node",)),
+            ("node,quickjs", ("node", "quickjs")),
+            ("node quickjs bun", ("node", "quickjs", "bun")),
+            ("  node ,  bun ", ("node", "bun")),
+        ],
+    )
+    def test_it_is_parsed_from_a_list(self, raw, expected):
+        assert resolve_js_runtimes({"TUNEBOX_JS_RUNTIMES": raw}) == expected
+
+    def test_empty_means_deno_only(self):
+        """An escape hatch for a host with an unusable runtime on PATH that must not be tried."""
+        assert resolve_js_runtimes({"TUNEBOX_JS_RUNTIMES": ""}) == ()
+        assert resolve_js_runtimes({"TUNEBOX_JS_RUNTIMES": "   "}) == ()
+
+    def test_a_typo_is_a_startup_error(self):
+        """Otherwise it is a download that fails at 403 hours later, for a reason nothing reports."""
+        with pytest.raises(ConfigError, match="unknown JS runtime"):
+            resolve_js_runtimes({"TUNEBOX_JS_RUNTIMES": "deno,dino"})
+        with pytest.raises(ConfigError, match="unknown JS runtime"):
+            Config(js_runtimes=("dino",))
+
+    def test_they_reach_every_yt_dlp_invocation(self, tmp_path: Path):
+        from tunebox.sources.ytdlp import YtDlpSource
+
+        argv = YtDlpSource(
+            Config(music_root=tmp_path, ytdlp=("yt-dlp",), js_runtimes=("node", "bun"))
+        )._base_argv()
+
+        assert argv.count("--js-runtimes") == 2
+        assert argv[argv.index("--js-runtimes") + 1] == "node"
+        # Order is preserved, because yt-dlp reads it as a priority list.
+        assert argv[len(argv) - 1] == "bun"
+
+    def test_deno_only_adds_no_flag(self, tmp_path: Path):
+        """So a ``TUNEBOX_YTDLP`` override pointing at a yt-dlp older than ``--js-runtimes`` has a
+        way out that is not "patch tunebox"."""
+        from tunebox.sources.ytdlp import YtDlpSource
+
+        argv = YtDlpSource(
+            Config(music_root=tmp_path, ytdlp=("yt-dlp",), js_runtimes=())
+        )._base_argv()
+        assert "--js-runtimes" not in argv
+
+
+class TestConfigFromEnv:
     def test_from_env(self, tmp_path: Path):
         config = Config.from_env(
             {
@@ -198,36 +269,142 @@ class TestCLI:
         # what happens to be installed on the machine running the tests.
         monkeypatch.setattr("tunebox.cli._probe_version", lambda argv: "2026.08.19")
         monkeypatch.setattr("tunebox.cli.shutil.which", lambda name: f"/usr/local/bin/{name}")
+        monkeypatch.setattr("tunebox.cli._probe_js_runtimes", lambda config: "deno-2.9.6")
 
         code = main(["--music-root", str(tmp_path / "music"), "doctor"])
         out = capsys.readouterr().out
 
-        for expected in ("yt-dlp", "ffmpeg", "ffprobe", "deno", "yt-dlp-ejs", "mutagen", "music root"):
+        for expected in (
+            "yt-dlp",
+            "ffmpeg",
+            "ffprobe",
+            "JS runtime",
+            "yt-dlp-ejs",
+            "mutagen",
+            "music root",
+        ):
             assert expected in out
         assert code == 0
 
-    def test_doctor_fails_when_a_required_binary_is_missing(self, monkeypatch, capsys, tmp_path):
-        """Missing deno means every download 403s (PLAN.md 0.3), so it is not a warning."""
+    def test_doctor_names_the_runtime_yt_dlp_found(self, monkeypatch, capsys, tmp_path):
+        """Not "deno", because on a 32-bit Raspberry Pi there is no deno build and the answer is
+        node. Whatever yt-dlp says it will use is what gets printed."""
         monkeypatch.setattr("tunebox.cli._probe_version", lambda argv: "2026.08.19")
+        monkeypatch.setattr("tunebox.cli.shutil.which", lambda name: f"/bin/{name}")
+        monkeypatch.setattr("tunebox.cli._probe_js_runtimes", lambda config: "node-22.4.0")
+
+        code = main(["--music-root", str(tmp_path / "music"), "doctor"])
+        out = capsys.readouterr().out
+
+        assert code == 0
+        assert "[ok] JS runtime" in out
+        assert "node-22.4.0" in out
+
+    def test_doctor_fails_when_no_js_runtime_is_usable(self, monkeypatch, capsys, tmp_path):
+        """No JS runtime means every download 403s (PLAN.md 0.3), so it is not a warning."""
+        monkeypatch.setattr("tunebox.cli._probe_version", lambda argv: "2026.08.19")
+        monkeypatch.setattr("tunebox.cli.shutil.which", lambda name: f"/bin/{name}")
+        monkeypatch.setattr("tunebox.cli._probe_js_runtimes", lambda config: None)
+
+        code = main(["--music-root", str(tmp_path / "music"), "doctor"])
+        out = capsys.readouterr().out
+
+        assert code == 1
+        assert "[!!] JS runtime" in out
+        assert "403" in out
+
+    def test_doctor_fails_when_a_required_binary_is_missing(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setattr("tunebox.cli._probe_version", lambda argv: "2026.08.19")
+        monkeypatch.setattr("tunebox.cli._probe_js_runtimes", lambda config: "deno-2.9.6")
         monkeypatch.setattr(
-            "tunebox.cli.shutil.which", lambda name: None if name == "deno" else f"/bin/{name}"
+            "tunebox.cli.shutil.which", lambda name: None if name == "ffmpeg" else f"/bin/{name}"
         )
 
         code = main(["--music-root", str(tmp_path / "music"), "doctor"])
         out = capsys.readouterr().out
 
         assert code == 1
-        assert "[!!] deno" in out
+        assert "[!!] ffmpeg" in out
 
     def test_doctor_reports_an_unwritable_music_root(self, monkeypatch, capsys, tmp_path):
         monkeypatch.setattr("tunebox.cli._probe_version", lambda argv: "2026.08.19")
         monkeypatch.setattr("tunebox.cli.shutil.which", lambda name: f"/bin/{name}")
+        monkeypatch.setattr("tunebox.cli._probe_js_runtimes", lambda config: "deno-2.9.6")
         blocked = tmp_path / "library"
         blocked.write_bytes(b"")  # a file where a directory is expected
 
         code = main(["--music-root", str(blocked), "doctor"])
         assert code == 1
         assert "NOT writable" in capsys.readouterr().out
+
+
+class TestJsRuntimeProbe:
+    """``_probe_js_runtimes`` reads yt-dlp's own answer rather than looking for binaries itself.
+
+    Duplicating yt-dlp's version thresholds here would mean two answers to one question, and
+    ``doctor`` would print the wrong one exactly when it mattered — on a host with node 18 installed,
+    which is present, on PATH, and useless.
+    """
+
+    @staticmethod
+    def config(tmp_path, **overrides) -> Config:
+        return Config(music_root=tmp_path, ytdlp=("yt-dlp",), **overrides)
+
+    def fake_run(self, monkeypatch, *, stderr: str, returncode: int = 1):
+        seen: dict = {}
+
+        def run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, returncode, stdout="", stderr=stderr)
+
+        monkeypatch.setattr("tunebox.cli.subprocess.run", run)
+        return seen
+
+    def test_it_parses_the_debug_banner(self, monkeypatch, tmp_path):
+        self.fake_run(monkeypatch, stderr="[debug] JS runtimes: deno-2.9.6, node-23.7.0\n")
+        assert _probe_js_runtimes(self.config(tmp_path)) == "deno-2.9.6, node-23.7.0"
+
+    def test_a_failing_exit_code_is_not_a_failed_probe(self, monkeypatch, tmp_path):
+        """The probe URL has nothing to download, so yt-dlp always exits non-zero. The banner is
+        printed before it ever looks at an extractor, and the banner is all we read."""
+        self.fake_run(monkeypatch, stderr="[debug] JS runtimes: deno-2.9.6\n", returncode=1)
+        assert _probe_js_runtimes(self.config(tmp_path)) == "deno-2.9.6"
+
+    @pytest.mark.parametrize("banner", ["[debug] JS runtimes: none\n", "[debug] JS runtimes: \n"])
+    def test_no_runtime_is_none(self, monkeypatch, tmp_path, banner):
+        self.fake_run(monkeypatch, stderr=banner)
+        assert _probe_js_runtimes(self.config(tmp_path)) is None
+
+    def test_a_yt_dlp_that_says_nothing_is_none(self, monkeypatch, tmp_path):
+        """An older yt-dlp with no such banner must read as "cannot tell", not as a crash."""
+        self.fake_run(monkeypatch, stderr="[debug] Command-line config: ['-v']\n")
+        assert _probe_js_runtimes(self.config(tmp_path)) is None
+
+    def test_it_offers_the_configured_runtimes(self, monkeypatch, tmp_path):
+        """Otherwise the probe would report deno-only while ingest used the fallbacks, which is the
+        one disagreement a diagnostic must not have."""
+        seen = self.fake_run(monkeypatch, stderr="[debug] JS runtimes: node-22.4.0\n")
+        _probe_js_runtimes(self.config(tmp_path, js_runtimes=("node", "bun")))
+
+        argv = seen["argv"]
+        assert argv[:2] == ["yt-dlp", "--ignore-config"]
+        assert "--js-runtimes" in argv
+        assert argv[argv.index("--js-runtimes") + 1] == "node"
+        assert argv.count("--js-runtimes") == 2
+
+    def test_the_probe_url_is_resolved_locally(self, monkeypatch, tmp_path):
+        """``doctor`` must not make a network request; a ``file://`` URL is handled by the generic
+        extractor without one."""
+        seen = self.fake_run(monkeypatch, stderr="[debug] JS runtimes: deno-2.9.6\n")
+        _probe_js_runtimes(self.config(tmp_path))
+        assert seen["argv"][-1].startswith("file://")
+
+    def test_an_unrunnable_yt_dlp_is_none_not_a_traceback(self, monkeypatch, tmp_path):
+        def boom(argv, **kwargs):
+            raise OSError("no such binary")
+
+        monkeypatch.setattr("tunebox.cli.subprocess.run", boom)
+        assert _probe_js_runtimes(self.config(tmp_path)) is None
 
 
 class TestServe:
@@ -303,6 +480,27 @@ class TestServe:
         assert "9124" in captured.err
         assert "X-Tunebox-Token" in captured.err
         assert captured.out == ""
+
+    def test_serve_says_where_the_remote_is(self, monkeypatch, capsys, tmp_path, uvicorn_calls):
+        """The Phase 4 exit criterion is one icon on a phone, and the banner is where somebody
+        standing at the host finds out what to type into it."""
+        monkeypatch.setenv("TUNEBOX_TOKEN", "a-token-long-enough-to-pass")
+        main(["--music-root", str(tmp_path / "music"), "serve", "--port", "9125"])
+        err = capsys.readouterr().err
+
+        assert "remote:" in err
+        assert "http://127.0.0.1:9125/" in err
+        # The token is never printed, here or anywhere: this banner goes to a journal.
+        assert "a-token-long-enough-to-pass" not in err
+
+    def test_serve_says_so_when_the_remote_is_off(self, monkeypatch, capsys, tmp_path, uvicorn_calls):
+        monkeypatch.setenv("TUNEBOX_TOKEN", "a-token-long-enough-to-pass")
+        monkeypatch.setenv("TUNEBOX_UI", "0")
+        main(["--music-root", str(tmp_path / "music"), "serve"])
+        err = capsys.readouterr().err
+
+        assert "remote:   disabled" in err
+        assert uvicorn_calls[0]["app"].state.config.ui_enabled is False
 
     def test_serve_rejects_a_concurrency_above_the_cap(self, monkeypatch, capsys, tmp_path):
         monkeypatch.setenv("TUNEBOX_TOKEN", "a-token-long-enough-to-pass")
