@@ -13,11 +13,19 @@ become one.
 `tunebox` is a placeholder name. This document is a decision record, not a spec — it exists
 so we choose an architecture before writing code.
 
-Status: **Phases 1 and 2 implemented (2026-09-26/27); language and code architecture decided
+Status: **Phases 1, 2 and 3 implemented (2026-09-26/27); language and code architecture decided
 (3.4).** Scope and architecture decided. The soundbar, the Cast transport and the audio format are
 **verified working on hardware** (see Phase 0); ingest produces a correctly tagged AAC file from
-the CLI, and from an authenticated HTTP request queued on a job worker. One blocker remains:
-whether OwnTone can drive Cast well, or whether we drive it ourselves.
+the CLI, and from an authenticated HTTP request queued on a job worker. **The Phase 0 blocker is
+cleared: OwnTone does drive this soundbar over Chromecast, measured 2026-09-27, and the host now
+plays music with no phone involved.**
+
+One acceptance criterion did not survive contact with the hardware: **the soundbar's display stays
+blank, because OwnTone's Cast output is screen-mirroring and carries no track metadata.** That is not
+a bug in tunebox and cannot be configured away — it is the reason fallback A (`pychromecast`) is
+still on the table, now as a fix for a specific measured shortfall rather than as insurance. The same
+measurement removed a security requirement (3.2's capability URLs are inapplicable: the soundbar never
+fetches from us) and added a cost nobody predicted (every play is re-encoded to Opus on the host).
 
 ---
 
@@ -279,6 +287,14 @@ Consequences:
 - **Cast media delivery is pull-based, and that is now a hard constraint, not a maybe.** The
   soundbar fetches the audio from the host over plain HTTP. It cannot send custom auth headers,
   so any token must ride in the URL. See 3.2.
+  **Corrected 2026-09-27 — true of the `catt` test, false of the path we actually use.** Whether Cast
+  pulls depends entirely on *which Cast protocol the sender speaks*, and OwnTone does not speak the
+  one measured on 2026-09-26. It uses screen-mirroring (`castMode: "mirroring"`, receiver app
+  `85CDB22F`) and **pushes Opus over RTP/UDP** to a port the device nominates; it never sends a
+  `LOAD` and the soundbar never makes an HTTP request to the host. So for the OwnTone path there is
+  no media URL to protect and no capability-token problem — and also no metadata channel, which is
+  what costs us the soundbar display (Phase 0, Phase 3). The pull-based description still holds for
+  fallback A, which is the whole reason 3.2's media-route design is kept rather than deleted.
 - **Bluetooth stays as the last-resort fallback.** Cast beats it on quality (no A2DP re-encode of
   already-lossy audio) and keeps the phone out of the audio path, but it needs the network and,
   possibly, the internet.
@@ -299,8 +315,15 @@ So playback is host-owned, with two fallbacks kept alive:
    playback session, ships a web UI, exposes a JSON API for our own UI to drive, and additionally
    speaks the MPD protocol so off-the-shelf MPD remotes work. **Caveat that matters more now:**
    OwnTone began as an AirPlay server and AirPlay is its most mature output. With AirPlay off the
-   table we are relying on its *Chromecast* output, the less-travelled path. *Unverified — this is
-   the Phase 0 spike, and it is the single riskiest assumption in the document.*
+   table we are relying on its *Chromecast* output, the less-travelled path. *~~Unverified — this is
+   the Phase 0 spike, and it is the single riskiest assumption in the document.~~*
+   **Verified 2026-09-27: it works, and it is worse than AirPlay in one specific, permanent way.**
+   OwnTone 29.3 discovers the SN9YG, plays to it, honours volume and advances its own queue. But its
+   Cast output is *screen-mirroring* — it pushes Opus over RTP and sends no track metadata — so the
+   soundbar's display shows nothing useful and the audio is re-encoded rather than passed through.
+   Neither is a bug we can fix from outside OwnTone. Full measurements in Phase 0; the consequence is
+   that **fallback A is no longer only insurance — it is the fix for the display**, and possibly
+   for the re-encode too.
 2. **Fallback A — drive Cast ourselves with `pychromecast`.** If OwnTone's Cast output
    disappoints, we own the player: FastAPI serves `/media/{id}` and uses `pychromecast` (the
    mature library behind Home Assistant's Cast integration, also wrapped by `catt`) to `LOAD`
@@ -320,6 +343,14 @@ So playback is host-owned, with two fallbacks kept alive:
 Each track is a separate `LOAD`, so album transitions will have a short gap. The Cast media-queue
 API can preload the next item and narrow it, but do not promise true gapless. This is a real
 regression versus what a local-output player would give, and it is the price of having no cable.
+
+**Revised 2026-09-27, in OwnTone's favour.** "Each track is a separate `LOAD`" is not true of the
+path we use: OwnTone holds **one continuous mirroring stream** and changes what it feeds into it, so
+a track transition involves no receiver-side session teardown at all — observed live across an
+`Autobahn → K歌之王` boundary with `state=play` unbroken. Whether it is *bit*-gapless was not
+measured and would need ears on a gapless album, not an API. The one-`LOAD`-per-track gap remains a
+real cost of **fallback A**, which is now a point in OwnTone's favour worth weighing against the
+display problem.
 
 **Does Navidrome survive?** If OwnTone owns the library and playback, Navidrome is largely
 redundant — two daemons scanning one folder. Start with OwnTone alone. Add Navidrome later only
@@ -427,6 +458,17 @@ This service downloads arbitrary URLs and executes ffmpeg. It must never be an o
   in the path or query string, ideally expiring — rather than header auth. Do not solve this by
   making the media route wide open. Log which IP fetched what; the soundbar's address should be
   the only one that ever appears.
+  **Status 2026-09-27: not needed yet, and not deleted.** The OwnTone path never makes the soundbar
+  fetch anything from us (see 3.1), so tunebox currently serves no media route at all — the safest
+  possible version of this requirement. It comes back in full the moment fallback A does.
+- **The player daemon's own auth is not on by default, and the default is the wrong one.** Measured
+  2026-09-27: OwnTone ships `trusted_networks = { "lan" }`, which means `admin_password` is skipped
+  for every device on the home network — so `curl -X PUT http://host:3689/api/player/stop` from the
+  IoT device nobody is proud of returns `204`. That directly contradicts the bullet above about the
+  LAN not being a trust boundary. The fix is two lines of `owntone.conf`:
+  `trusted_networks = { "localhost" }` and a real `admin_password`. tunebox itself keeps working with
+  no credentials because it talks to loopback, and `TUNEBOX_PLAYER_PASSWORD` covers the case where it
+  does not. The Basic-auth username is `admin`, hard-coded in the daemon.
 - Tailscale remains the right answer *if* remote ingest is ever wanted, and is strictly better
   than opening a port. It is no longer required for the home path.
 - **Input handling:** treat search terms and URLs as untrusted. Pass arguments as a list to
@@ -494,7 +536,17 @@ src/tunebox/
                  retry, ingest history), worker.py (threads calling `ingest.py`)
   api/           Phase 2: FastAPI. app.py (factory + error handlers), auth.py (token middleware),
                  routes.py, schemas.py. Thin: it validates, enqueues, and reads the queue back
+  player/        Phase 3: the playback session, behind the `Player` port in core/ports.py.
+                 owntone.py (the JSON-API adapter), selection.py (keeps the soundbar selected),
+                 hooks.py (the rescan-after-ingest hook). The port is load-bearing, not
+                 decoration: fallback A is a sibling of owntone.py and nothing above it changes
 ```
+
+**One more consequence of the port, made concrete in Phase 3.** The `Player` protocol speaks in
+**paths**, not in the player daemon's own track ids — `ingest.py` returns a path, the filesystem is
+the library database, and mapping "this file" onto "whatever OwnTone calls it" is the adapter's
+problem. That turned out to matter: OwnTone's ids are *not stable across a library rescan*, so an
+adapter that leaked them upward would have leaked a race as well (see Phase 3's defect list).
 
 Three consequences worth stating, since they are decisions and not style:
 
@@ -547,15 +599,56 @@ becomes an opt-in flag later, per ingest.
       - Woke from `st=0` idle and selected the Cast input with nobody touching the remote.
       - Volume reported as 33 and honoured; AAC/m4a needed no transcode.
       So the format decision, the wake behaviour and the media-pull direction are all settled.
-- [ ] **Spike: can OwnTone drive the SN9YG over Chromecast?** Install it anywhere, point it at a
-      folder with one file, select the soundbar as output, press play. *(still the hard blocker:
-      the above proves the soundbar and the transport are fine, but not that OwnTone's Cast
-      output is. Its AirPlay output is more mature and this soundbar cannot use it.)*
+- [x] **Spike: can OwnTone drive the SN9YG over Chromecast? — YES, measured 2026-09-27.** Built
+      OwnTone 29.3 from source on the development Mac following upstream's own
+      `.github/workflows/macos.yml`, `--enable-chromecast`, into `$HOME/owntone_data` (no sudo: this
+      Homebrew install owns `/usr/local`). `GET /api/config` reports `Chromecast` in `buildoptions`;
+      the binary links `libprotobuf-c` and `libgnutls`. It then found the soundbar by itself:
+      ```
+      mdns: Bonjour Browser: NEW service 'LG-SN-Series-ThinQ-S-8365057286ba1880…' _googlecast._tcp
+      mdns: … resolved to 192.168.50.13
+      cast: Adding Chromecast device 'Living Room speaker'
+      ```
+      and `GET /api/outputs` listed it as `{"type": "Chromecast", "id": "2080974779"}`. Selecting it
+      and adding a queue item played audio: `state: play`, progress advancing, receiver reporting
+      `playerState: PLAYING`, volume honoured. **The hard blocker is cleared and fallback A is not
+      needed for sound** — but see the two findings below, one of which is not survivable for the
+      Phase 3 acceptance test as originally written.
+      - **Two build notes for the Pi, learned here.** `libinotify-kqueue` is a *hard* requirement —
+        OwnTone's configure aborts with "INOTIFY_CFLAGS and INOTIFY_LIBS" without it — and on
+        macOS 26 it fails to build because `fdclosedir` trips `-Werror=unguarded-availability-new`;
+        `./configure CFLAGS="-Wno-error=unguarded-availability-new"` fixes it. Neither applies to
+        Linux, where inotify is in libc.
+- [x] **OwnTone's Chromecast output is *mirroring*, not media-load — and that changes two decisions.**
+      Measured from OwnTone's own Cast protocol log: it launches receiver app `85CDB22F`
+      ("Chrome Audio Mirroring"), negotiates `{"castMode": "mirroring"}`, and streams **Opus over
+      RTP/UDP** to a port the device nominates (`UDP port in ANSWER is 10008`). Across an entire
+      session it sent **zero `LOAD` messages**, and the only media metadata the device ever received
+      was `{"metadataType": 0, "title": ""}`. Consequences:
+      - **The soundbar's display cannot show the track title on this path.** Not a configuration
+        problem: there is no metadata channel in use to put a title into. The Phase 3 acceptance
+        criterion that asks for it is therefore **not met by OwnTone** — see Phase 3.
+      - **Cast delivery is not pull-based here.** The host *pushes* RTP; the soundbar never makes an
+        HTTP request to us. The whole `/media/{id}` capability-URL requirement in 3.2 is inapplicable
+        to the OwnTone path, which removes a security design problem rather than creating one.
+      - **It re-encodes.** AAC 128 kbps → Opus 128 kbps at 48 kHz, every stream. The "no transcoding
+        on a Pi" property from 3.1 holds for *ingest* and does not hold for *playback*.
+- [x] **OwnTone's own API is unauthenticated on the LAN by default, contrary to 3.2.** Its default
+      `trusted_networks = { "lan" }` bypasses `admin_password` for exactly the clients that matter:
+      `curl http://<host>:3689/api/player/stop` from any device on the home network returned `204`.
+      Fixed by `trusted_networks = { "localhost" }` plus an `admin_password`, after which the LAN gets
+      `401` and tunebox (on loopback) still needs no credentials. Also measured: the Basic-auth
+      username is **`admin`**, hard-coded in `httpd_request_is_authorized` (`src/httpd.c`) and not
+      configurable — an empty username gets `401`.
 - [ ] **Test: does casting survive a WAN outage?** Unplug the router's uplink, leave Wi-Fi up,
       try to start playback. The Cast receiver app is fetched from Google, so this may fail —
       and with no AirPlay path, Bluetooth is the only remaining fallback. Worth knowing now.
-- [ ] If the OwnTone spike fails: fall back to driving Cast directly with `pychromecast`
-      (fallback A in 3.1), which is well-trodden and under our control.
+      *(Now more pointed than when it was written: OwnTone uses the `85CDB22F` mirroring receiver,
+      which is a Google-hosted app like any other.)*
+- [x] If the OwnTone spike fails: fall back to driving Cast directly with `pychromecast`
+      (fallback A in 3.1), which is well-trodden and under our control. **Not needed for audio** —
+      but it is now the only known way to get track titles onto the soundbar's display, so it is
+      promoted from insurance policy to the fix for a specific, measured shortfall.
 
 **Phase 1 — Walking skeleton (CLI only)** — **done, 2026-09-26**
 - [x] Language and code architecture decided and recorded (3.4): Python 3.11+, ports and adapters.
@@ -651,18 +744,110 @@ becomes an opt-in flag later, per ingest.
 enough concurrent searches could exhaust the ASGI threadpool; the API has no pagination beyond
 `limit`; and there is no metrics endpoint. All three are one-listener non-problems.
 
-**Phase 3 — Sound out of the soundbar, driven by the host**
-- [ ] OwnTone on the host against the music dir; library rescan hook after ingest.
-- [ ] Soundbar selected as a persistent output; survives an OwnTone restart and a soundbar
-      power-cycle without manual re-selection.
-- [ ] **Verify end-to-end: search on the phone → ingest → host plays it on the SN9YG, with the
-      correct track title on the soundbar's display.** This is the acceptance test for the
-      whole project.
-- [ ] **Walk away with the phone, then kill the browser. Audio must continue, including the
-      transition to the next track.** The queue lives on the host; prove it.
-- [ ] Control it from a second device (laptop browser) to confirm the remote is stateless.
-- [ ] Verify the Bluetooth fallback still works.
-- Exit criteria: music plays with no phone involved at all.
+**Phase 3 — Sound out of the soundbar, driven by the host** — **implemented 2026-09-27; one
+acceptance criterion not met, and it is not fixable with OwnTone**
+- [x] OwnTone on the host against the music dir; library rescan hook after ingest. The hook is
+      `PUT /api/update` behind a new `Player` port, called by the worker after a job that produced a
+      *new* file and by `tunebox ingest` after a CLI ingest. **It can never fail an ingest**: a
+      stopped OwnTone becomes a warning on a `done` job, because the audio is already on disk and a
+      retry would re-download it for nothing. Verified live — a `POST /ingest` of `qCFIRjycV5Q`
+      landed `Kraftwerk/3-D Der Katalog/Das Model.m4a` and OwnTone logged
+      `lib: Library rescan triggered` / `completed in 0 sec (2 changes)` with no warnings on the job,
+      taking its library from 3 songs to 4.
+- [x] Soundbar selected as a persistent output; survives an OwnTone restart and a soundbar
+      power-cycle without manual re-selection. Implemented as `player/selection.py`'s `OutputKeeper`,
+      a thread inside `tunebox serve`. **Verified on hardware for the restart case, twice and in both
+      directions:** with OwnTone's own speaker memory intact it came back already selected; with its
+      database deleted while it was down — a daemon that has genuinely forgotten — the keeper logged
+      `player is answering again; re-checking the output selection from scratch` /
+      `selected output 'Living Room speaker' (Chromecast, id 2080974779) at volume 20` and the output
+      was selected again with nobody touching anything. *The physical power-cycle was **not** tested:
+      it needs somebody to unplug the soundbar. The absent → present transition it produces is
+      covered by an offline test, not by hardware.*
+      - **The interesting part is when the keeper stays out of the way**, and getting that wrong is
+        how a "feature" becomes a bug. Deselecting the speaker in OwnTone's web UI is a legitimate
+        thing to do, so the keeper asserts selection only on *first sight* and on *absent → present*,
+        never on "present the whole time and switched off". A daemon outage is tracked separately from
+        speaker absence — otherwise restarting OwnTone would look like the soundbar reappearing and
+        would undo a deliberate deselection — and the recovery from an outage only re-asserts if the
+        speaker *was* selected before it. Verified live: deselecting via OwnTone's API left it
+        deselected across many keeper passes.
+- [x] **Verify end-to-end: search on the phone → ingest → host plays it on the SN9YG** — the audio
+      half is **met**, over HTTP, in the order a phone would do it: `GET /search?q=kraftwerk+das+model`
+      → `POST /ingest` → job `done` → rescan → `tunebox player play` → `state: play`, progress
+      advancing, `Living Room speaker (Chromecast)` the selected output at volume 20.
+- [ ] **…with the correct track title on the soundbar's display. NOT MET, and not a bug to fix.**
+      OwnTone's Cast output is screen-mirroring (Phase 0), so there is no Cast media metadata to
+      populate: the device received `{"metadataType": 0, "title": ""}` and zero `LOAD` messages all
+      session. Nothing in tunebox's configuration can change that. **This is precisely the failure
+      mode 3.1 predicted when it said tags are not enough for the display, and the mitigation it
+      named — fallback A, populating `MusicTrackMediaMetadata` ourselves — is now the only known fix.**
+      The `Player` port exists so that swapping it in is one new file, not a rewrite.
+- [x] **Walk away with the phone, then kill the browser. Audio must continue, including the
+      transition to the next track.** **Met.** Two tracks queued, seeked to five seconds before the
+      end of the first, then only observed: `Autobahn (207 s) → K歌之王` with `state=play` unbroken
+      across the boundary and the second track's progress counting up from zero. Nothing was driving
+      it; the host advanced its own queue. As a bonus, the mirroring transport does **not** tear down
+      and re-establish a session per track, which is why the plan's flat "no gapless" prediction is
+      softened below.
+- [x] Control it from a second device (laptop browser) to confirm the remote is stateless. **Met.**
+      OwnTone's web UI and JSON API answer on the host's LAN address; two independent fresh clients
+      paused and resumed the same session and the progress continued rather than restarting, with
+      **zero cookies set**. The session is on the host, and the remote carries no state. (Reaching it
+      now needs the `admin` password added in Phase 0 — still stateless, since Basic auth is
+      per-request.)
+- [ ] Verify the Bluetooth fallback still works. **Not tested** — it needs a phone physically paired
+      to the soundbar, which no amount of API calls can stand in for.
+- Exit criteria: music plays with no phone involved at all. **Met** — verified above, with the
+  soundbar as the only selected output and every command issued from the host.
+- **What this cost in code:** a `Player` port in `core/ports.py`, `player/owntone.py` (the adapter,
+  stdlib `urllib` only — no new runtime dependency for a handful of JSON calls to loopback),
+  `player/selection.py` (the keeper), `player/hooks.py` (the rescan hook), a `tunebox player`
+  command group, and a `player` block on `GET /healthz` that reports the session and **cannot fail
+  the route** — a monitor must not see `503` because a soundbar is unplugged. Tests went from 413 to
+  560, still entirely offline: the adapter is exercised against a real stub HTTP server on loopback
+  rather than a mocked `urllib`, because half of what it does is build URLs and read status codes.
+- **Three defects that only hardware could have found**, each now with a regression test:
+  - **Track ids are unstable during a rescan.** `tunebox player play FILE` originally rescanned and
+    then resolved the path, which is the obvious order and the wrong one: a scan deletes and
+    re-inserts rows, so the id was rejected as `Invalid uri` and OwnTone answered `500` — which reads
+    like a malformed request. Corrected to resolve *first* and rescan only when the file is genuinely
+    unknown, then wait for `updating` to go false before reading an id.
+  - **The keeper could not fix an OwnTone restart.** Because `tunebox serve` outlives OwnTone, the
+    keeper's own memory still said "present and handled", so a daemon that came back having forgotten
+    the speaker was left switched off — the exact scenario this bullet promises. Fixed by tracking
+    daemon reachability as a separate transition.
+  - **The Basic-auth username was wrong.** `:password` looks like the natural encoding and gets
+    `401`; OwnTone hard-codes `admin`.
+- **Reviewed by an independent auditor afterwards, and — as in Phase 2 — it was worth it.** The
+  reviewer read the diff against this document and mutated copies of the code to check whether the
+  tests had teeth. Three findings were serious:
+  - **The keeper could lose the soundbar permanently.** It recorded "was the output selected when I
+    last looked", so the observation that *triggered* a selection — "off" — was the one written down.
+    One power-cycle or OwnTone restart after the keeper had done the selecting, and it concluded the
+    speaker had been switched off on purpose and never brought it back. Silent, permanent, and
+    reachable from the most ordinary starting state there is: a fresh OwnTone. Fixed by rewriting the
+    state machine around *what we believe should be on* plus *has it been out of sight*, which
+    collapses three special-cased transitions into one rule and makes the bug structurally impossible
+    rather than patched.
+  - **`check_once` promised never to raise and only caught `PlayerError`.** Any other exception
+    killed the keeper thread for the lifetime of the process, with nothing to restart it and nothing
+    anywhere reporting its absence — and there was a reachable route to one, because a JSON body that
+    was not an object produced an `AttributeError` from inside a getter (see below). Fixed at both
+    ends: the adapter validates response shape, and both `check_once` and the loop are total.
+  - **The tests for the keeper all started from "already selected"** — the one initial state that
+    hides the first finding. They now start from a fresh unselected daemon where it matters, and the
+    load-bearing lines were each mutation-checked: removing the recovery branch fails four tests,
+    removing the "it went away" flag fails five, and removing the deselection memory fails two.
+  Medium findings, all fixed: unexpected JSON shapes escaping the exception tree; a bare `KeyError`
+  from a track record with no `id`; `/healthz` matching the output by name *or* id so a name collision
+  could report the wrong speaker as selected; a hard `limit=50` on the path lookup that turned a
+  truncated page into a misleading "the daemon has not indexed it"; a path match that only tried the
+  fully-resolved form and so would have failed on the symlinked external SSD this document's own 3.1
+  recommends; `doctor` able to traceback on a malformed `/api/config`; and secrets appearing in
+  `repr(Config)`. Two tests were vacuous and were proved so by mutation — one "non-JSON body" test
+  that passed an *empty* body, and one percent-encoding test that asserted through a decoder and so
+  was true of both encodings. 413 → 560 tests.
 
 **Phase 4 — One web UI**
 - [ ] Single page served by the API: search, ingest progress, now-playing, transport controls.
@@ -695,17 +880,19 @@ enough concurrent searches could exhaust the ASGI threadpool; the API has no pag
 | Rate limiting / bot challenge | Low–Medium | Home IP by design, sleep intervals, concurrency 1–2, caching |
 | iOS PWA background audio is inadequate | High (for Alt A) | Chose Alt B specifically to avoid this |
 | Poor tags make the library unusable | Medium | `--parse-metadata` rules, optional MusicBrainz, manual fix path |
-| **OwnTone can't drive the SN9YG reliably** | Medium | **The Phase 0 spike exists solely to find this out early.** Falls back to a casting Subsonic client, then Bluetooth |
+| **OwnTone can't drive the SN9YG reliably** | ~~Medium~~ **Resolved** | **The Phase 0 spike answered it on hardware 2026-09-27: it can.** Plays, honours volume, advances its own queue. What it cannot do is put a title on the display — tracked as its own row below |
 | Host is a single point of failure for all listening | Medium–High | Higher than before: the host now holds the playback session, so it must be genuinely always-on. Not a laptop |
 | SD-card or SSD failure loses the library | Medium | Library on USB SSD not SD; periodic backup. Tracks are re-ingestable but tags and playlists are not |
-| Soundbar can't play the file | ~~Low~~ **Resolved** | AAC/m4a verified playing on the device 2026-09-26. Opus still untested; AAC is the default so it does not matter unless we change it |
-| Soundbar display shows filenames instead of track names | Medium | Cast metadata comes from the sender's LOAD payload, not the file's tags (verified). Map tags → LOAD explicitly; check OwnTone does this |
-| Soundbar's Chromecast stack needs internet | Medium–High | **No AirPlay fallback exists on this model**, so a WAN outage may leave only Bluetooth. Tested explicitly in Phase 0 |
+| Soundbar can't play the file | ~~Low~~ **Resolved** | AAC/m4a verified playing on the device 2026-09-26. Opus still untested; AAC is the default so it does not matter unless we change it — **and OwnTone transcodes to Opus for Cast anyway, so the soundbar's Opus decoder is in fact exercised on every play** |
+| **Soundbar display shows filenames instead of track names** | ~~Medium~~ **Certain, on the OwnTone path** | Worse than predicted: it shows *nothing*, not filenames. OwnTone's Cast output is screen-mirroring and carries no media metadata at all (measured: zero `LOAD`s, `title: ""`). Unfixable from outside OwnTone. **Only fallback A can fix it**, by sending `MusicTrackMediaMetadata` ourselves — which is why the `Player` port exists |
+| **The host transcodes on every play** | **New, Certain** | Not foreseen: OwnTone re-encodes AAC → Opus 128 kbps/48 kHz for Cast, so 3.1's "a Pi does no transcoding" is true of ingest only. One Opus encode of one stereo stream is within a Pi 4's budget, but it is no longer free, and it is a second lossy generation |
+| **The player daemon is unauthenticated on the LAN out of the box** | **New, Certain if unaddressed** | OwnTone's default `trusted_networks = { "lan" }` bypasses its own password for every device on the home network — measured. Set `trusted_networks = { "localhost" }` plus `admin_password`; see 3.2 |
+| Soundbar's Chromecast stack needs internet | Medium–High | **No AirPlay fallback exists on this model**, so a WAN outage may leave only Bluetooth. Tested explicitly in Phase 0 — **still outstanding, and sharper now that the receiver in use (`85CDB22F`) is known to be a Google-hosted app** |
 | Soundbar drops off Wi-Fi | Medium | DHCP reservation for 192.168.50.13; keep it on the same subnet as the host; Bluetooth covers outages |
-| OwnTone's *Chromecast* output is weaker than its AirPlay output | Medium–High | Raised from Medium now that AirPlay is unavailable. Phase 0 spike, then `pychromecast` fallback under our own control |
-| No gapless playback | Certain | Inherent to Cast: one `LOAD` per track. Narrow it with the Cast queue API; do not promise gapless |
-| Media route must be reachable unauthenticated-ish | Certain | Cast pulls over HTTP and cannot send headers → capability URLs with expiring tokens (see 3.2) |
-| Output selection doesn't survive reboots or power-cycles | Medium | Explicitly tested in Phase 3; automate re-selection on startup if manual |
+| OwnTone's *Chromecast* output is weaker than its AirPlay output | ~~Medium–High~~ **Confirmed, and quantified** | It is weaker in exactly two ways, both measured: no metadata to the device, and a mandatory Opus re-encode. It is *stronger* in one way nobody expected — one continuous stream instead of one `LOAD` per track, so transitions do not tear down the session |
+| No gapless playback | ~~Certain~~ **Better than assumed** | Inherent to one-`LOAD`-per-track, which OwnTone does **not** do; transitions were seamless at the protocol level. Bit-gaplessness unmeasured. Becomes Certain again if fallback A is adopted |
+| Media route must be reachable unauthenticated-ish | ~~Certain~~ **Not applicable on the OwnTone path** | The soundbar never fetches from us: OwnTone pushes RTP. tunebox serves no media route at all. Returns in full with fallback A |
+| Output selection doesn't survive reboots or power-cycles | ~~Medium~~ **Handled for restarts; power-cycle untested** | `OutputKeeper` re-selects on first sight and on absent → present, and re-asserts after a daemon outage — verified on hardware against an OwnTone whose database had been deleted. The *physical* power-cycle was not performed; only the offline test covers it |
 | No lockscreen or volume-button control | Certain | Accepted trade for phone-independence. Soundbar remote does volume; "Hey Google, pause" works once playing |
 | Web remote feels worse than a native app | Medium | Keep it to one screen. Phase 6 can add Navidrome + a native client if it grates |
 | Legal exposure grows with user count | — | Home-only, single user, not shared. Alternative E if it must ever be a product |
@@ -732,8 +919,9 @@ enough concurrent searches could exhaust the ASGI threadpool; the API has no pag
    HTTP remote. See section 2.**
 4. ~~iOS, Android, or both?~~ **Largely moot now — a browser remote behaves the same on both.
    Only resurfaces if the OwnTone spike fails.**
-5. **Does OwnTone drive this soundbar?** The one hard unknown, and the only Phase 0 blocker
-   left. Cheap to answer and answerable today, with no tunebox code written.
+5. ~~Does OwnTone drive this soundbar?~~ **Yes — measured 2026-09-27. Audio, volume and queue
+   advancement all work. But it drives it by screen-mirroring, so the display stays blank and the
+   audio is re-encoded to Opus. See Phase 0.**
 6. Is there already an always-on machine in the house (NAS, Mac mini, existing Pi)? If yes,
    nothing needs buying; if no, that is the only spend. It need not be near the soundbar.
 7. Is MP3 specifically needed anywhere, or was it shorthand for "audio file"? The AAC default
@@ -744,3 +932,10 @@ enough concurrent searches could exhaust the ASGI threadpool; the API has no pag
    AirPlay path to fall back to. Phase 0 test.
 10. Is the phone's browser enough for a remote, or will the missing lockscreen controls push us
     back to Navidrome plus a native client? Answer after living with Phase 4 for a week.
+11. **Is a blank soundbar display actually worth switching player to fix?** The new open question,
+    and the only one that could still change the architecture. Fallback A would put the title on the
+    display and remove the Opus re-encode, at the cost of writing our own queue controller, losing
+    OwnTone's library management and web UI, and reintroducing one `LOAD` per track (so real gaps
+    between album tracks) plus 3.2's capability-URL work. Note that the *remote* will show the
+    correct title either way from Phase 4 onwards — this is specifically about the hardware display
+    on the soundbar's front panel. Worth deciding after living with Phase 4, not before.

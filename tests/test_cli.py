@@ -9,7 +9,10 @@ import pytest
 
 from tunebox.cli import build_parser, main
 from tunebox.config import Config, resolve_ytdlp_command
+from tunebox.core.models import QueueItem
 from tunebox.errors import ConfigError
+
+from fakes import SOUNDBAR, FakePlayer
 
 
 class TestConfig:
@@ -327,3 +330,329 @@ class _StubSource:
 
     def fetch(self, *a, **k):  # pragma: no cover - never reached: scratch creation fails first
         raise AssertionError("should not be called")
+
+
+class TestPlayerCLI:
+    """``tunebox player …`` — PLAN.md Phase 3.
+
+    The adapter is patched out at :func:`tunebox.cli._player`, because what is being tested here is
+    argparse wiring and output shape; the adapter's own behaviour is covered against a real HTTP
+    server in ``test_player.py``.
+    """
+
+    @pytest.fixture
+    def player(self, monkeypatch) -> FakePlayer:
+        fake = FakePlayer()
+        monkeypatch.setattr("tunebox.cli._player", lambda config: fake)
+        return fake
+
+    def _json(self, capsys) -> object:
+        return json.loads(capsys.readouterr().out)
+
+    def test_status_prints_the_session_as_json(self, player: FakePlayer, capsys):
+        player.state = "play"
+        assert main(["player", "status"]) == 0
+        body = self._json(capsys)
+        assert body["state"] == "play"
+        assert body["outputs"][0]["name"] == SOUNDBAR
+
+    def test_outputs_lists_what_the_daemon_can_see(self, player: FakePlayer, capsys):
+        assert main(["player", "outputs"]) == 0
+        assert [o["name"] for o in self._json(capsys)] == [SOUNDBAR]
+
+    def test_outputs_says_something_useful_when_the_list_is_empty(self, player: FakePlayer, capsys):
+        player.present = False
+        assert main(["player", "outputs"]) == 0
+        captured = capsys.readouterr()
+        assert json.loads(captured.out) == []
+        assert "powered and on" in captured.err
+
+    def test_select_enables_the_configured_speaker_and_reads_it_back(
+        self, player: FakePlayer, capsys
+    ):
+        assert main(["player", "select"]) == 0
+        assert player.selected is True
+        assert self._json(capsys)["selected"] is True
+
+    def test_select_honours_an_explicit_volume(self, player: FakePlayer, capsys):
+        assert main(["player", "select", "--volume", "45"]) == 0
+        capsys.readouterr()
+        assert player.selections == [(player.output_id, 45)]
+
+    def test_select_reports_an_absent_speaker_as_an_error_exit(self, player: FakePlayer, capsys):
+        player.present = False
+        assert main(["player", "select"]) == 1
+        assert "no output named" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "verb,expected",
+        [("pause", "pause"), ("stop", "stop"), ("next", "next"), ("prev", "previous")],
+    )
+    def test_the_transport_verbs_map_to_one_command_each(
+        self, player: FakePlayer, capsys, verb: str, expected: str
+    ):
+        assert main(["player", verb]) == 0
+        capsys.readouterr()
+        assert player.commands == [expected]
+
+    def test_play_with_no_arguments_resumes(self, player: FakePlayer, capsys):
+        assert main(["player", "play"]) == 0
+        capsys.readouterr()
+        assert player.commands == ["play"]
+        assert player.rescans == 0, "resuming must not walk the library"
+
+    def test_play_with_files_replaces_the_queue_and_starts(
+        self, player: FakePlayer, capsys, tmp_path: Path
+    ):
+        track = tmp_path / "Autobahn.m4a"
+        track.write_bytes(b"")
+        player.items = [
+            QueueItem(id="99", position=0, title="Something else", path="/old.m4a")
+        ]
+
+        assert main(["player", "play", str(track)]) == 0
+
+        body = self._json(capsys)
+        assert [item["title"] for item in body["queued"]] == ["Autobahn"]
+        assert [item.title for item in player.items] == ["Autobahn"], "queue replaced, not appended"
+        assert player.state == "play"
+
+    def test_a_file_already_in_the_library_is_played_without_a_rescan(
+        self, player: FakePlayer, capsys, tmp_path: Path
+    ):
+        """Rescanning first is not just wasteful, it is wrong: a scan deletes and re-inserts rows,
+        so a track id read during one is rejected by the time the queue-add lands. Measured on
+        hardware as a 500 from OwnTone."""
+        track = tmp_path / "Known.m4a"
+        track.write_bytes(b"")
+
+        assert main(["player", "play", str(track)]) == 0
+        capsys.readouterr()
+
+        assert player.rescans == 0
+        assert player.scan_waits == 0
+
+    def test_a_file_the_player_has_never_seen_triggers_a_rescan_and_waits_for_it(
+        self, player: FakePlayer, capsys, tmp_path: Path
+    ):
+        """The "play what I just ingested" case, which is the only reason the rescan is here."""
+        track = tmp_path / "Fresh.m4a"
+        track.write_bytes(b"")
+        player.indexed = set()  # the player knows nothing yet
+
+        def index_on_rescan() -> None:
+            player.indexed = {str(track)}
+
+        original = player.rescan
+
+        def rescan() -> None:
+            original()
+            index_on_rescan()
+
+        player.rescan = rescan  # type: ignore[method-assign]
+
+        assert main(["player", "play", str(track)]) == 0
+        capsys.readouterr()
+
+        assert player.rescans == 1
+        assert player.scan_waits == 1, "ids are unstable until the scan finishes"
+        assert [item.title for item in player.items] == ["Fresh"]
+
+    def test_a_file_that_never_appears_is_a_clean_error(
+        self, player: FakePlayer, capsys, tmp_path: Path
+    ):
+        track = tmp_path / "Ghost.m4a"
+        track.write_bytes(b"")
+        player.indexed = set()  # a rescan will not help: it is outside OwnTone's directories
+
+        assert main(["player", "play", "--wait", "0", str(track)]) == 1
+        assert "not in the player's library" in capsys.readouterr().err
+
+    def test_play_with_add_appends_and_does_not_start(
+        self, player: FakePlayer, capsys, tmp_path: Path
+    ):
+        existing = QueueItem(id="1", position=0, title="First", path="/first.m4a")
+        player.items = [existing]
+        track = tmp_path / "Second.m4a"
+        track.write_bytes(b"")
+
+        assert main(["player", "play", "--add", str(track)]) == 0
+        capsys.readouterr()
+
+        assert [item.title for item in player.items] == ["First", "Second"]
+        assert player.state == "stop"
+
+    def test_play_refuses_a_path_that_is_not_a_file(self, player: FakePlayer, capsys, tmp_path):
+        assert main(["player", "play", str(tmp_path / "nope.m4a")]) == 1
+        assert "not a file" in capsys.readouterr().err
+        assert player.rescans == 0
+
+    @pytest.mark.parametrize("given,expected", [("40", 40), ("0", 0), ("100", 100)])
+    def test_an_absolute_volume_is_set(self, player: FakePlayer, capsys, given: str, expected: int):
+        assert main(["player", "volume", given]) == 0
+        capsys.readouterr()
+        assert player.volume == expected
+
+    @pytest.mark.parametrize("given,expected", [("+5", 35), ("-10", 20)])
+    def test_a_signed_volume_is_a_step(self, player: FakePlayer, capsys, given: str, expected: int):
+        player.volume = 30
+        assert main(["player", "volume", given]) == 0
+        capsys.readouterr()
+        assert player.volume == expected
+
+    def test_a_nonsense_volume_is_a_clean_error(self, player: FakePlayer, capsys):
+        assert main(["player", "volume", "loud"]) == 1
+        assert "signed step" in capsys.readouterr().err
+
+    def test_queue_lists_and_can_clear(self, player: FakePlayer, capsys):
+        player.items = [QueueItem(id="1", position=0, title="One", path="/one.m4a")]
+        assert main(["player", "queue"]) == 0
+        assert [item["title"] for item in self._json(capsys)] == ["One"]
+
+        assert main(["player", "queue", "--clear"]) == 0
+        assert self._json(capsys) == []
+        assert player.items == []
+
+    def test_rescan_triggers_the_hook(self, player: FakePlayer, capsys):
+        assert main(["player", "rescan"]) == 0
+        capsys.readouterr()
+        assert player.rescans == 1
+
+    def test_a_dead_daemon_is_an_error_exit_with_a_readable_message(
+        self, player: FakePlayer, capsys
+    ):
+        """Not a traceback: "start OwnTone" is a fixable situation, so it must read as one."""
+        player.unavailable = True
+        assert main(["player", "status"]) == 1
+        assert "not answering" in capsys.readouterr().err
+
+    def test_output_on_the_command_line_overrides_a_configured_id(self, monkeypatch):
+        """Otherwise a configured TUNEBOX_OUTPUT_ID would silently win and ``--output Kitchen``
+        would act on the living room."""
+        seen: dict[str, object] = {}
+
+        def capture(config):
+            seen["name"] = config.output_name
+            seen["id"] = config.output_id
+            return FakePlayer()
+
+        monkeypatch.setenv("TUNEBOX_OUTPUT_ID", "42")
+        monkeypatch.setattr("tunebox.cli._player", capture)
+        main(["player", "--output", "Kitchen", "rescan"])
+
+        assert seen == {"name": "Kitchen", "id": None}
+
+    def test_the_player_url_can_be_overridden_on_the_command_line(self, monkeypatch):
+        seen: dict[str, object] = {}
+
+        def capture(config):
+            seen["url"] = config.player_base_url
+            return FakePlayer()
+
+        monkeypatch.setattr("tunebox.cli._player", capture)
+        main(["player", "--player-url", "http://pi.local:3689/", "rescan"])
+
+        assert seen == {"url": "http://pi.local:3689"}
+
+    def test_every_verb_is_reachable_from_the_parser(self):
+        """A verb that exists in the help but crashes on dispatch is worse than a missing one."""
+        parser = build_parser()
+        for verb in (
+            "status",
+            "outputs",
+            "select",
+            "play",
+            "pause",
+            "stop",
+            "next",
+            "prev",
+            "queue",
+            "rescan",
+        ):
+            args = parser.parse_args(["player", verb])
+            assert callable(args.func), verb
+        # `volume` takes a required positional, so it cannot go in the loop above — the original
+        # version of this test had an `if verb == "volume"` branch inside a tuple that never
+        # contained it, which is a dead branch pretending to be coverage.
+        assert callable(parser.parse_args(["player", "volume", "40"]).func)
+
+    def test_volume_requires_a_level(self):
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["player", "volume"])
+
+
+class TestDoctorPlayerCheck:
+    """The player check is *advisory*: PLAN.md 3.1 keeps ingest working with no player installed,
+    so a missing OwnTone must not make ``doctor`` exit non-zero on every Phase 1/2 host."""
+
+    @pytest.fixture(autouse=True)
+    def stub_probes(self, monkeypatch):
+        monkeypatch.setattr("tunebox.cli._probe_version", lambda argv: "2026.08.19")
+        monkeypatch.setattr("tunebox.cli.shutil.which", lambda name: f"/usr/local/bin/{name}")
+
+    def test_a_reachable_player_and_speaker_are_reported(self, monkeypatch, capsys, tmp_path):
+        player = FakePlayer(selected=True)
+        monkeypatch.setattr("tunebox.cli._player", lambda config: player)
+
+        code = main(["--music-root", str(tmp_path / "music"), "doctor"])
+        out = capsys.readouterr().out
+
+        assert code == 0
+        assert "[--] player" in out
+        assert SOUNDBAR in out
+        assert "selected" in out
+
+    def test_a_missing_player_is_reported_without_failing_the_check(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        monkeypatch.setattr("tunebox.cli._player", lambda config: FakePlayer(unavailable=True))
+
+        code = main(["--music-root", str(tmp_path / "music"), "doctor"])
+        out = capsys.readouterr().out
+
+        assert code == 0, "ingest works without a player, so this cannot be a failure"
+        assert "not answering" in out
+
+    def test_an_absent_speaker_is_reported_without_failing_the_check(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        monkeypatch.setattr("tunebox.cli._player", lambda config: FakePlayer(present=False))
+
+        code = main(["--music-root", str(tmp_path / "music"), "doctor"])
+        out = capsys.readouterr().out
+
+        assert code == 0
+        assert "[--] output" in out
+        assert "no output named" in out
+
+    def test_a_player_answering_nonsense_does_not_traceback(self, monkeypatch, capsys, tmp_path):
+        """``doctor`` is what someone runs *because* something is wrong. A traceback out of the
+        diagnostic is the least useful possible outcome, so "never raises" has to include the shape
+        of the answer and not just the transport."""
+        player = FakePlayer()
+        player.ping = lambda: ["not", "a", "dict"]  # type: ignore[method-assign]
+        monkeypatch.setattr("tunebox.cli._player", lambda config: player)
+
+        code = main(["--music-root", str(tmp_path / "music"), "doctor"])
+        out = capsys.readouterr().out
+
+        assert code == 0
+        assert "[--] player" in out
+
+    def test_a_player_whose_output_lookup_explodes_does_not_traceback(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        player = FakePlayer()
+
+        def explode():
+            raise AttributeError("'list' object has no attribute 'get'")
+
+        player.target_output = explode  # type: ignore[method-assign]
+        monkeypatch.setattr("tunebox.cli._player", lambda config: player)
+
+        code = main(["--music-root", str(tmp_path / "music"), "doctor"])
+        out = capsys.readouterr().out
+
+        assert code == 0
+        assert "AttributeError" in out

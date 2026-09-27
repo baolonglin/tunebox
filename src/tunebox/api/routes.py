@@ -23,11 +23,12 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from .. import __version__
 from ..config import Config
 from ..core.ports import MusicSource
+from ..errors import TuneboxError
 from ..jobs.models import Job, JobState
 from ..jobs.store import JobStore
 from ..jobs.worker import Worker
 from ..sources import urls
-from .schemas import HealthView, IngestRequest, JobView, SearchItem
+from .schemas import HealthView, IngestRequest, JobView, PlayerHealth, SearchItem
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +73,58 @@ def health(request: Request) -> HealthView:
         worker_running=bool(worker and worker.running),
         workers=config.worker_concurrency,
         jobs=_store(request).counts(),
+        player=_player_health(request),
+    )
+
+
+def _player_health(request: Request) -> PlayerHealth | None:
+    """Describe the playback session, or why it cannot be described.
+
+    Wrapped in a broad ``except`` on purpose: ``/healthz`` is what a monitor polls, and a health
+    check that answers 503 because the *soundbar* is unplugged reports the wrong outage. The player
+    being down is a field in the answer, not the answer's status code.
+    """
+    player = getattr(request.app.state, "player", None)
+    if player is None:
+        return None
+    config = _config(request)
+    url = getattr(player, "base_url", config.player_base_url)
+    try:
+        status = player.status()
+        queue = player.queue()
+    except TuneboxError as exc:
+        return PlayerHealth(reachable=False, url=url, error=str(exc))
+    except Exception as exc:  # pragma: no cover - an adapter bug must not take /healthz down
+        log.exception("player health check raised")
+        return PlayerHealth(reachable=False, url=url, error=f"{type(exc).__name__}: {exc}")
+
+    # Same precedence as OwnTonePlayer.find_output: an id is unambiguous, a name is what somebody
+    # renamed in the Google Home app last week. Matching on *either* would let a name collision
+    # report the wrong speaker as selected while a configured id points somewhere else entirely.
+    if config.output_id:
+        target = next(
+            (output for output in status.outputs if output.id == config.output_id), None
+        )
+    else:
+        wanted = config.output_name.strip().casefold()
+        target = next(
+            (
+                output
+                for output in status.outputs
+                if output.name.strip().casefold() == wanted
+            ),
+            None,
+        )
+    now = status.now_playing
+    return PlayerHealth(
+        reachable=True,
+        url=url,
+        state=status.state,
+        volume=status.volume,
+        now_playing=f"{now.artist} — {now.title}" if now and now.title else None,
+        queue_length=len(queue),
+        output=target.name if target else (config.output_id or config.output_name),
+        output_selected=target.selected if target else False,
     )
 
 

@@ -73,6 +73,27 @@ class SearchItem(BaseModel):
     thumbnail: str | None = None
 
 
+class PlayerHealth(BaseModel):
+    """What ``GET /healthz`` can say about the playback session without being able to fail.
+
+    Phase 3's exit criterion is "music plays with no phone involved at all", and the honest way to
+    check that from a second device is to ask the host what it thinks is happening. ``reachable``
+    is false rather than absent when OwnTone is down, because "no player" and "player not
+    answering" need different fixes.
+    """
+
+    reachable: bool
+    url: str
+    state: str | None = None
+    volume: int | None = None
+    now_playing: str | None = None
+    queue_length: int | None = None
+    #: The configured speaker, and whether the daemon currently has it enabled.
+    output: str | None = None
+    output_selected: bool | None = None
+    error: str | None = None
+
+
 class HealthView(BaseModel):
     status: Literal["ok"]
     version: str
@@ -81,6 +102,7 @@ class HealthView(BaseModel):
     worker_running: bool
     workers: int
     jobs: dict[str, int]
+    player: PlayerHealth | None = None
 
 
 class ErrorView(BaseModel):

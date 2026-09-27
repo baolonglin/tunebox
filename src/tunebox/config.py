@@ -41,6 +41,20 @@ DEFAULT_API_PORT = 8080
 #: throughput knob, so the ceiling is enforced rather than documented.
 MAX_WORKER_CONCURRENCY = 2
 
+#: Phase 3: the player daemon. Loopback again — OwnTone runs on the same always-on host as the
+#: API, and its own web UI is the Phase 3 remote, so nothing needs to reach it from off-box
+#: except a browser the user points at OwnTone's port directly.
+DEFAULT_PLAYER_URL = "http://127.0.0.1:3689"
+
+#: The speaker this household actually owns (PLAN.md Phase 0). Matched case-insensitively against
+#: the daemon's output names, so it is a default rather than a hard-coded device.
+DEFAULT_OUTPUT_NAME = "Living Room speaker"
+
+#: How often to check that the chosen output is still selected. Fifteen seconds is short enough
+#: that a soundbar power-cycle is invisible by the time someone reaches for their phone, and long
+#: enough to be free.
+DEFAULT_OUTPUT_CHECK_INTERVAL = 15.0
+
 
 def binds_every_interface(host: str) -> bool:
     """Would binding ``host`` expose the service on every interface, including the router-facing
@@ -84,6 +98,21 @@ def _env_float(env: Mapping[str, str], key: str, default: float) -> float:
         return float(raw)
     except ValueError as exc:
         raise ConfigError(f"{key} must be a number, got {raw!r}") from exc
+
+
+def _env_opt_int(env: Mapping[str, str], key: str, default: int | None = None) -> int | None:
+    """Like :func:`_env_int` but "unset" is a meaningful value, not a number.
+
+    Used for the output volume, where "leave whatever the speaker remembers" is different from
+    any particular level.
+    """
+    raw = env.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{key} must be an integer, got {raw!r}") from exc
 
 
 def _env_bool(env: Mapping[str, str], key: str, default: bool = False) -> bool:
@@ -138,7 +167,9 @@ class Config:
     api_port: int = DEFAULT_API_PORT
     #: Shared secret checked on *every* request (PLAN.md 3.2). No default: a service that
     #: downloads URLs and runs ffmpeg does not get to have a blank password.
-    api_token: str | None = None
+    #: ``repr=False`` so that logging a Config — which is exactly what someone does while debugging
+    #: a startup problem — cannot put the token in a log file or a traceback.
+    api_token: str | None = field(default=None, repr=False)
     #: Opt-in escape hatch for binding every interface, e.g. inside a container that only has
     #: one. Never enable it on a host that faces the router.
     allow_all_interfaces: bool = False
@@ -152,6 +183,30 @@ class Config:
     #: How long an idle worker waits before looking again; enqueues wake it immediately, so this
     #: only bounds the delay for retries that became due.
     job_poll_interval: float = 1.0
+
+    # ------------------------------------------------- Phase 3: the playback session
+    #: Base URL of the player daemon's JSON API (OwnTone: ``http://host:3689``).
+    player_url: str = DEFAULT_PLAYER_URL
+    #: OwnTone's ``admin_password``. Only needed when the request does not come from a network
+    #: OwnTone considers trusted; loopback normally is, so this is usually unset. ``repr=False`` for
+    #: the same reason as :attr:`api_token`.
+    player_password: str | None = field(default=None, repr=False)
+    #: Short by design: a playback command that has not been acknowledged in a couple of seconds
+    #: has failed, and a phone waiting on a spinner is worse than an error.
+    player_timeout: float = 5.0
+    #: The speaker to keep selected, by name. An id wins over a name if both are given, because an
+    #: id is unambiguous and a name is what a user renamed in the Google Home app last week.
+    output_name: str = DEFAULT_OUTPUT_NAME
+    output_id: str | None = None
+    #: Volume to set when *first* selecting the output, so a fresh session is never silent or
+    #: deafening. ``None`` leaves whatever the speaker remembers.
+    output_volume: int | None = None
+    #: Seconds between output-selection checks. ``0`` disables the keeper entirely.
+    output_check_interval: float = DEFAULT_OUTPUT_CHECK_INTERVAL
+    #: Trigger a library rescan after each successful ingest (PLAN.md Phase 3). On by default; it
+    #: is the whole reason a freshly ingested track is playable without waiting for a periodic
+    #: scan.
+    rescan_after_ingest: bool = True
 
     def __post_init__(self) -> None:
         if self.audio_format not in SUPPORTED_FORMATS:
@@ -172,6 +227,22 @@ class Config:
             raise ConfigError("retry backoff must not be negative")
         if self.job_poll_interval <= 0:
             raise ConfigError(f"poll interval must be positive, got {self.job_poll_interval}")
+        if self.player_timeout <= 0:
+            raise ConfigError(f"player timeout must be positive, got {self.player_timeout}")
+        if self.output_check_interval < 0:
+            raise ConfigError("output check interval must not be negative (0 disables it)")
+        if self.output_volume is not None and not 0 <= self.output_volume <= 100:
+            raise ConfigError(f"output volume must be 0-100, got {self.output_volume}")
+        scheme = self.player_url.split("://", 1)[0].lower() if "://" in self.player_url else ""
+        if scheme not in ("http", "https"):
+            raise ConfigError(
+                f"player url must start with http:// or https://, got {self.player_url!r}"
+            )
+
+    @property
+    def player_base_url(self) -> str:
+        """The daemon's base URL without a trailing slash, so joining a path is unambiguous."""
+        return self.player_url.rstrip("/")
 
     @property
     def scratch_root(self) -> Path:
@@ -253,4 +324,14 @@ class Config:
             job_retry_backoff=_env_float(env, "TUNEBOX_JOB_BACKOFF", 10.0),
             job_retry_backoff_max=_env_float(env, "TUNEBOX_JOB_BACKOFF_MAX", 300.0),
             job_poll_interval=_env_float(env, "TUNEBOX_JOB_POLL_INTERVAL", 1.0),
+            player_url=(env.get("TUNEBOX_PLAYER_URL") or DEFAULT_PLAYER_URL).strip(),
+            player_password=env.get("TUNEBOX_PLAYER_PASSWORD") or None,
+            player_timeout=_env_float(env, "TUNEBOX_PLAYER_TIMEOUT", 5.0),
+            output_name=(env.get("TUNEBOX_OUTPUT") or DEFAULT_OUTPUT_NAME).strip(),
+            output_id=(env.get("TUNEBOX_OUTPUT_ID") or "").strip() or None,
+            output_volume=_env_opt_int(env, "TUNEBOX_OUTPUT_VOLUME"),
+            output_check_interval=_env_float(
+                env, "TUNEBOX_OUTPUT_CHECK_INTERVAL", DEFAULT_OUTPUT_CHECK_INTERVAL
+            ),
+            rescan_after_ingest=_env_bool(env, "TUNEBOX_RESCAN_AFTER_INGEST", True),
         )

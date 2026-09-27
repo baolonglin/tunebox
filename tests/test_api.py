@@ -6,18 +6,29 @@ with a fake source in place of yt-dlp. Nothing here opens a socket to the intern
 
 from __future__ import annotations
 
+import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
+import anyio
 import pytest
 from fastapi.testclient import TestClient
 
 from tunebox.config import Config
 from tunebox.core.models import SearchResult
-from tunebox.errors import ConfigError, SourceError, SourceTimeout
+from tunebox.errors import (
+    ConfigError,
+    OutputNotFound,
+    PlayerError,
+    PlayerUnavailable,
+    SourceError,
+    SourceTimeout,
+    TuneboxError,
+)
 from tunebox.jobs.store import JobStore
 
-from fakes import FakeSource, RecordingTagWriter, video_id
+from fakes import SOUNDBAR, FakePlayer, FakeSource, RecordingTagWriter, video_id
 
 from tunebox.api.app import create_app
 
@@ -75,13 +86,27 @@ def source() -> FakeSource:
 
 
 @pytest.fixture
-def app(config: Config, store: JobStore, source: FakeSource):
+def player() -> FakePlayer:
+    """Injected everywhere, so the suite never talks to a real OwnTone.
+
+    Not a nicety: ``create_app`` builds an :class:`~tunebox.player.owntone.OwnTonePlayer` pointing at
+    loopback by default, and ``conftest.no_network`` permits loopback — so on the development host,
+    where OwnTone *is* running, these tests would otherwise re-select speakers and trigger library
+    rescans on the real daemon.
+    """
+    return FakePlayer()
+
+
+@pytest.fixture
+def app(config: Config, store: JobStore, source: FakeSource, player: FakePlayer):
     return create_app(
         config,
         store=store,
         source=source,
         tag_writer=RecordingTagWriter(),
         run_worker=False,
+        player=player,
+        keep_output=False,
     )
 
 
@@ -261,6 +286,88 @@ class TestHealth:
         assert body["jobs"] == {"queued": 0, "running": 0, "done": 0, "failed": 0}
         assert body["worker_running"] is False  # run_worker=False in this fixture
 
+    def test_health_reports_the_playback_session(
+        self, client: TestClient, player: FakePlayer, config: Config
+    ):
+        """PLAN.md Phase 3 wants to be able to check "music plays with no phone involved" from a
+        second device. This is the cheapest way to ask the host what it thinks is happening."""
+        player.selected = True
+        player.state = "play"
+        player.enqueue_paths([Path("/music/Kraftwerk/Singles/Autobahn.m4a")], start=True)
+
+        body = client.get("/healthz", headers=AUTH).json()["player"]
+
+        assert body["reachable"] is True
+        assert body["state"] == "play"
+        assert body["output"] == config.output_name
+        assert body["output_selected"] is True
+        assert body["queue_length"] == 1
+        assert "Autobahn" in body["now_playing"]
+
+    def test_an_unplugged_soundbar_is_reported_not_selected_rather_than_hidden(
+        self, client: TestClient, player: FakePlayer, config: Config
+    ):
+        player.present = False
+        body = client.get("/healthz", headers=AUTH).json()["player"]
+        assert body["reachable"] is True, "the daemon is up; it is the speaker that is not"
+        assert body["output"] == config.output_name
+        assert body["output_selected"] is False
+
+    def test_a_configured_output_id_wins_over_a_name_match(
+        self, config: Config, store: JobStore, source: FakeSource
+    ):
+        """The README promises the id wins, and `find_output` implements that. Matching on *either*
+        would let a speaker that merely shares the configured name be reported as the selected
+        output while the id points somewhere else entirely — a green health check for a speaker
+        nothing is driving."""
+        player = FakePlayer(output_id="1234", output_name=SOUNDBAR, selected=True)
+        app = create_app(
+            replace(config, output_id="not-this-one", output_name=SOUNDBAR),
+            store=store,
+            source=source,
+            tag_writer=RecordingTagWriter(),
+            run_worker=False,
+            player=player,
+            keep_output=False,
+        )
+
+        body = TestClient(app).get("/healthz", headers=AUTH).json()["player"]
+
+        assert body["output"] == "not-this-one", "the configured id, since nothing matched it"
+        assert body["output_selected"] is False
+
+    def test_a_dead_player_does_not_make_the_health_check_fail(
+        self, client: TestClient, player: FakePlayer
+    ):
+        """A monitor polling /healthz must not see 503 because the *soundbar* is off. The player
+        being down is a field in the answer, not the answer's status code."""
+        player.unavailable = True
+
+        response = client.get("/healthz", headers=AUTH)
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        assert response.json()["player"]["reachable"] is False
+        assert "not answering" in response.json()["player"]["error"]
+
+    def test_an_adapter_bug_does_not_make_the_health_check_fail_either(
+        self, client: TestClient, player: FakePlayer
+    ):
+        """"Never fails because of the player" has to include the exception types we did not think
+        of, or the guarantee is only as good as our imagination."""
+
+        def explode():
+            raise AttributeError("'list' object has no attribute 'get'")
+
+        player.status = explode  # type: ignore[method-assign]
+
+        response = client.get("/healthz", headers=AUTH)
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        assert response.json()["player"]["reachable"] is False
+        assert "AttributeError" in response.json()["player"]["error"]
+
 
 class TestSearch:
     def test_search_returns_the_fields_a_phone_needs(self, client: TestClient):
@@ -436,15 +543,63 @@ class TestJobs:
 # ------------------------------------------------------------- the exit criterion
 
 
+class TestPlayerErrorMapping:
+    """The player half of the "one exception tree" property (PLAN.md 3.4).
+
+    No Phase 3 route can reach these — `/healthz` deliberately swallows player failures — so they
+    would otherwise be wiring nobody had ever executed by the time Phase 4 starts proxying transport
+    commands. Asserted by invoking the registered handlers, which is what Starlette does.
+    """
+
+    @pytest.mark.parametrize(
+        "exc,expected",
+        [
+            (PlayerUnavailable("owntone is not running"), 503),
+            (OutputNotFound("no output named 'Living Room speaker'"), 404),
+            (PlayerError("HTTP 500 from the daemon"), 502),
+        ],
+    )
+    def test_each_player_failure_maps_to_its_own_status(self, app, exc, expected):
+        handler = _handler_for(app, type(exc))
+        assert handler is not None, f"no handler registered for {type(exc).__name__}"
+
+        response = anyio.run(handler, None, exc)
+
+        assert response.status_code == expected
+        assert json.loads(bytes(response.body))["error"] == str(exc)
+
+    def test_the_specific_handlers_win_over_the_generic_tunebox_one(self, app):
+        """Registration order must not decide this: a 503 reported as a 500 tells a client to stop
+        retrying when it should keep going."""
+        assert _handler_for(app, PlayerUnavailable) is not _handler_for(app, TuneboxError)
+        assert _handler_for(app, OutputNotFound) is not _handler_for(app, PlayerError)
+
+
+def _handler_for(app, exc_type: type) -> object | None:
+    """The handler Starlette would pick for ``exc_type``: the nearest match up the MRO."""
+    for klass in exc_type.__mro__:
+        if klass in app.exception_handlers:
+            return app.exception_handlers[klass]
+    return None
+
+
 class TestExitCriterion:
-    def test_three_urls_queued_over_http_all_land(self, config: Config, store: JobStore, source):
+    def test_three_urls_queued_over_http_all_land(
+        self, config: Config, store: JobStore, source, player: FakePlayer
+    ):
         """PLAN.md Phase 2: *"queue three URLs from curl, all three land correctly."*
 
         Same path curl takes — POST three times, poll the job ids — with the worker running for
         real inside the app's lifespan.
         """
         app = create_app(
-            config, store=store, source=source, tag_writer=RecordingTagWriter(), run_worker=True
+            config,
+            store=store,
+            source=source,
+            tag_writer=RecordingTagWriter(),
+            run_worker=True,
+            player=player,
+            keep_output=False,
         )
         ids = [video_id(n) for n in (1, 2, 3)]
 
@@ -474,11 +629,17 @@ class TestExitCriterion:
             assert job["tags"]["source_id"] == vid
 
     def test_a_failing_ingest_is_visible_as_a_failed_job_not_a_lost_one(
-        self, config: Config, store: JobStore
+        self, config: Config, store: JobStore, player: FakePlayer
     ):
         source = FakeSource(fail_fetch_times={video_id(9): 99})
         app = create_app(
-            config, store=store, source=source, tag_writer=RecordingTagWriter(), run_worker=True
+            config,
+            store=store,
+            source=source,
+            tag_writer=RecordingTagWriter(),
+            run_worker=True,
+            player=player,
+            keep_output=False,
         )
         with TestClient(app) as client:
             job_id = client.post("/ingest", json={"url": video_id(9)}, headers=AUTH).json()["id"]

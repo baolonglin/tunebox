@@ -15,13 +15,16 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Sequence, TextIO
+from typing import TYPE_CHECKING, Sequence, TextIO
 
 from . import __version__, ingest as ingest_module
 from .config import SUPPORTED_FORMATS, Config
 from .core.models import Progress
-from .errors import TuneboxError
+from .errors import PlayerError, TuneboxError
 from .sources.ytdlp import YtDlpSource
+
+if TYPE_CHECKING:  # the player adapter is imported lazily so `tunebox search` stays fast
+    from .player.owntone import OwnTonePlayer
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,7 +88,81 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.set_defaults(func=_cmd_serve)
 
+    _add_player_parser(sub)
+
     return parser
+
+
+#: ``tunebox player <verb>`` — the whole transport surface, and the thing the Phase 3 acceptance
+#: test is driven with. Phase 4 puts a web page in front of these; a terminal is enough to prove
+#: that the *host* owns the session, which is what Phase 3 is about.
+def _add_player_parser(sub: argparse._SubParsersAction) -> None:
+    player = sub.add_parser(
+        "player",
+        help="drive the playback session on the host (OwnTone -> Chromecast -> soundbar)",
+        description=(
+            "Control the player daemon that owns the queue. Nothing here streams audio: the "
+            "soundbar pulls it, so every command returns as soon as the daemon has accepted it."
+        ),
+    )
+    player.add_argument(
+        "--player-url",
+        help="player daemon base URL (default $TUNEBOX_PLAYER_URL or http://127.0.0.1:3689)",
+    )
+    player.add_argument("--output", help="speaker name to act on (default $TUNEBOX_OUTPUT)")
+    verbs = player.add_subparsers(dest="player_command", required=True)
+
+    status = verbs.add_parser("status", help="transport state, volume, now playing, outputs")
+    status.set_defaults(func=_cmd_player_status)
+
+    outputs = verbs.add_parser("outputs", help="list the speakers the daemon can see")
+    outputs.set_defaults(func=_cmd_player_outputs)
+
+    select = verbs.add_parser("select", help="enable the configured speaker (or --output NAME)")
+    select.add_argument("--volume", type=int, help="also set this output's volume (0-100)")
+    select.set_defaults(func=_cmd_player_select)
+
+    play = verbs.add_parser(
+        "play",
+        help="resume playback, or queue FILEs and start them",
+        description=(
+            "With no arguments this resumes whatever is loaded. With file paths it clears the "
+            "queue, adds them and starts — which is the 'play this now' the acceptance test uses."
+        ),
+    )
+    play.add_argument("files", nargs="*", type=Path, help="library files to play now")
+    play.add_argument(
+        "--add",
+        action="store_true",
+        help="append to the queue instead of replacing it, and do not start playback",
+    )
+    play.add_argument(
+        "--wait",
+        type=float,
+        default=20.0,
+        help="seconds to wait for a freshly ingested file to appear in the library (default 20)",
+    )
+    play.set_defaults(func=_cmd_player_play)
+
+    for verb, handler, helptext in (
+        ("pause", _cmd_player_pause, "pause playback"),
+        ("stop", _cmd_player_stop, "stop playback and unload the track"),
+        ("next", _cmd_player_next, "skip to the next queue item"),
+        ("prev", _cmd_player_prev, "skip to the previous queue item"),
+    ):
+        node = verbs.add_parser(verb, help=helptext)
+        node.set_defaults(func=handler)
+
+    volume = verbs.add_parser("volume", help="set or change volume, e.g. 40, +5, -5")
+    volume.add_argument("level", help="absolute 0-100, or a signed step such as +5")
+    volume.set_defaults(func=_cmd_player_volume)
+
+    queue = verbs.add_parser("queue", help="list the queue")
+    queue.add_argument("--clear", action="store_true", help="empty the queue instead of listing it")
+    queue.set_defaults(func=_cmd_player_queue)
+
+    rescan = verbs.add_parser("rescan", help="ask the daemon to index new files under the music root")
+    rescan.set_defaults(func=_cmd_player_rescan)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -103,6 +180,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             overrides["music_root"] = args.music_root.expanduser()
         if getattr(args, "format", None):
             overrides["audio_format"] = args.format
+        if getattr(args, "player_url", None):
+            overrides["player_url"] = args.player_url.strip()
+        if getattr(args, "output", None):
+            # Naming an output on the command line also clears any configured id: otherwise the id
+            # would silently win and ``--output "Kitchen"`` would act on the living room.
+            overrides["output_name"] = args.output.strip()
+            overrides["output_id"] = None
         if overrides:
             config = replace(config, **overrides)
         return int(args.func(args, config))
@@ -172,15 +256,33 @@ def _cmd_ingest(args: argparse.Namespace, config: Config) -> int:
         force=args.force,
     )
     reporter.finish()
+    result = _rescan_after_cli_ingest(result, config)
     json.dump(result.as_dict(), sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
     return 0
 
 
+def _rescan_after_cli_ingest(result, config: Config):
+    """The Phase 3 rescan hook, for the CLI path.
+
+    The worker does this too (:meth:`tunebox.jobs.worker.Worker._rescan`); both call the same hook
+    so that a track ingested from a terminal is as playable as one queued from a phone. Skipped for
+    an already-present file, and it can only ever add a warning — a player daemon that is not
+    running must not turn a successful download into a failure.
+    """
+    if result.already_present or not config.rescan_after_ingest:
+        return result
+    from .player.hooks import rescan_library
+
+    warning = rescan_library(_player(config))
+    if warning is None:
+        return result
+    return replace(result, warnings=(*result.warnings, warning))
+
+
 def _cmd_doctor(args: argparse.Namespace, config: Config) -> int:
     """Check exactly the dependencies PLAN.md 0.3 says YouTube audio needs."""
     checks: list[tuple[str, bool, str]] = []
-
     version = _probe_version([*config.ytdlp, "--version"])
     checks.append(("yt-dlp", version is not None, version or "not runnable (required)"))
 
@@ -212,7 +314,51 @@ def _cmd_doctor(args: argparse.Namespace, config: Config) -> int:
     width = max(len(name) for name, _, _ in checks)
     for name, ok, note in checks:
         print(f"[{'ok' if ok else '!!'}] {name.ljust(width)}  {note}")
+
+    # Phase 3, and *advisory*: ingest is fully functional with no player installed, so a missing
+    # OwnTone is information rather than a broken dependency. Reporting it as a failure would make
+    # `doctor` exit non-zero on every Phase 1/2 host, which is how a useful check gets ignored.
+    for name, note in _probe_player(config):
+        print(f"[--] {name.ljust(width)}  {note}")
+
     return 0 if all(ok for _, ok, _ in checks) else 1
+
+
+def _probe_player(config: Config) -> list[tuple[str, str]]:
+    """Describe the player daemon and the configured speaker, never raising.
+
+    "Never raising" has to include the shape of the answer, not just the transport: ``doctor`` is the
+    command someone runs *because* something is wrong, and a traceback out of the diagnostic is the
+    least useful possible outcome.
+    """
+    wanted = config.output_id or config.output_name
+    try:
+        player = _player(config)
+        info = player.ping()
+        version = info.get("version") if isinstance(info, dict) else None
+    except TuneboxError as exc:
+        return [("player", f"{config.player_base_url} — {exc}")]
+    except Exception as exc:  # pragma: no cover - doctor must always print something
+        return [("player", f"{config.player_base_url} — {type(exc).__name__}: {exc}")]
+
+    rows = [("player", f"{config.player_base_url} — OwnTone {version or '?'}")]
+    try:
+        output = player.target_output()
+    except TuneboxError as exc:
+        rows.append(("output", f"{wanted!r} — {exc}"))
+        return rows
+    except Exception as exc:  # pragma: no cover - same reasoning as above
+        rows.append(("output", f"{wanted!r} — {type(exc).__name__}: {exc}"))
+        return rows
+    rows.append(
+        (
+            "output",
+            f"{output.name!r} ({output.type}, id {output.id}) — "
+            f"{'selected' if output.selected else 'NOT selected'}"
+            + (f", volume {output.volume}" if output.volume is not None else ""),
+        )
+    )
+    return rows
 
 
 def _cmd_serve(args: argparse.Namespace, config: Config) -> int:
@@ -244,7 +390,15 @@ def _cmd_serve(args: argparse.Namespace, config: Config) -> int:
         f"  library:  {config.music_root}\n"
         f"  queue:    {config.database_path}\n"
         f"  workers:  {config.worker_concurrency}\n"
-        f"  auth:     X-Tunebox-Token header required on every route",
+        f"  player:   {config.player_base_url}\n"
+        f"  output:   {config.output_id or config.output_name!r}"
+        + (
+            f" (re-selected every {config.output_check_interval:.0f}s)"
+            if config.output_check_interval > 0
+            else " (keeper disabled)"
+        )
+        + "\n"
+        "  auth:     X-Tunebox-Token header required on every route",
         file=sys.stderr,
     )
     uvicorn.run(
@@ -257,6 +411,151 @@ def _cmd_serve(args: argparse.Namespace, config: Config) -> int:
         access_log=True,
     )
     return 0
+
+
+# -------------------------------------------------------------- player commands
+#
+# PLAN.md Phase 3. These are thin by design: every one of them is "build the adapter, send one
+# command, print what the daemon says". The interesting behaviour lives in
+# :mod:`tunebox.player.owntone` and :mod:`tunebox.player.selection`, which is where it can be
+# tested without argparse in the way.
+
+
+def _player(config: Config) -> "OwnTonePlayer":
+    from .player.owntone import OwnTonePlayer
+
+    return OwnTonePlayer(config)
+
+
+def _emit(payload: object) -> int:
+    json.dump(payload, sys.stdout, indent=2, ensure_ascii=False, default=str)
+    sys.stdout.write("\n")
+    return 0
+
+
+def _cmd_player_status(args: argparse.Namespace, config: Config) -> int:
+    return _emit(_player(config).status().as_dict())
+
+
+def _cmd_player_outputs(args: argparse.Namespace, config: Config) -> int:
+    outputs = _player(config).outputs()
+    if not outputs:
+        print(
+            "no outputs visible. A Chromecast speaker only appears while it is powered and on "
+            "the network — check the soundbar, then try again",
+            file=sys.stderr,
+        )
+    return _emit([output.as_dict() for output in outputs])
+
+
+def _cmd_player_select(args: argparse.Namespace, config: Config) -> int:
+    player = _player(config)
+    output = player.target_output()
+    volume = args.volume if args.volume is not None else config.output_volume
+    player.select_output(output.id, volume=volume)
+    # Read it back rather than reporting what we asked for: "selected" is the daemon's opinion, and
+    # a Cast device that refuses the session is exactly the failure this command exists to catch.
+    return _emit(player.find_output(output_id=output.id).as_dict())
+
+
+def _cmd_player_play(args: argparse.Namespace, config: Config) -> int:
+    player = _player(config)
+    if not args.files:
+        player.play()
+        return _emit(player.status().as_dict())
+
+    paths = [path.expanduser() for path in args.files]
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise TuneboxError(f"not a file: {', '.join(missing)}")
+
+    _ensure_indexed(player, paths, wait=args.wait)
+
+    items = player.enqueue_paths(paths, clear=not args.add, start=not args.add)
+    return _emit(
+        {
+            "queued": [item.as_dict() for item in items],
+            "player": player.status().as_dict(),
+        }
+    )
+
+
+def _ensure_indexed(player: "OwnTonePlayer", paths: Sequence[Path], *, wait: float) -> None:
+    """Make sure every path is in the player's library, rescanning only if one is not.
+
+    The order matters, and it is the opposite of the obvious one. Rescanning first looks safer but
+    is actively worse: a scan deletes and re-inserts rows, so a track id read during one is rejected
+    as ``Invalid uri`` when the queue-add arrives — measured on hardware, as a ``500`` that looked
+    like a malformed request. Resolving first means the common case (playing something already in
+    the library) touches no scan at all, and the rescan is reserved for the case it actually exists
+    for: a file ingested seconds ago.
+    """
+    unknown: list[Path] = []
+    for path in paths:
+        try:
+            player.resolve_track(path)
+        except PlayerError:
+            unknown.append(path)
+    if not unknown:
+        return
+
+    player.rescan()
+    # Wait for the scan to *finish*, not just to be accepted: ids are unstable while it runs.
+    player.wait_for_scan(timeout=max(wait, 1.0))
+    for path in unknown:
+        player.resolve_track(path, timeout=wait)
+
+
+def _cmd_player_pause(args: argparse.Namespace, config: Config) -> int:
+    player = _player(config)
+    player.pause()
+    return _emit(player.status().as_dict())
+
+
+def _cmd_player_stop(args: argparse.Namespace, config: Config) -> int:
+    player = _player(config)
+    player.stop()
+    return _emit(player.status().as_dict())
+
+
+def _cmd_player_next(args: argparse.Namespace, config: Config) -> int:
+    player = _player(config)
+    player.next_track()
+    return _emit(player.status().as_dict())
+
+
+def _cmd_player_prev(args: argparse.Namespace, config: Config) -> int:
+    player = _player(config)
+    player.previous_track()
+    return _emit(player.status().as_dict())
+
+
+def _cmd_player_volume(args: argparse.Namespace, config: Config) -> int:
+    player = _player(config)
+    level = args.level.strip()
+    try:
+        if level.startswith(("+", "-")):
+            # A signed value is a step, so the CLI never has to read the level before changing it —
+            # which also means two "+5" in a row do the right thing.
+            player.change_volume(int(level))
+        else:
+            player.set_volume(int(level))
+    except ValueError as exc:
+        raise TuneboxError(f"volume must be 0-100 or a signed step like +5, got {level!r}") from exc
+    return _emit(player.status().as_dict())
+
+
+def _cmd_player_queue(args: argparse.Namespace, config: Config) -> int:
+    player = _player(config)
+    if args.clear:
+        player.clear_queue()
+    return _emit([item.as_dict() for item in player.queue()])
+
+
+def _cmd_player_rescan(args: argparse.Namespace, config: Config) -> int:
+    player = _player(config)
+    player.rescan()
+    return _emit(player.library_info())
 
 
 # -------------------------------------------------------------------- helpers

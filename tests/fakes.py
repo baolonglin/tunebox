@@ -1,8 +1,13 @@
-"""Fakes shared by the Phase 2 tests.
+"""Fakes shared by the Phase 2 and Phase 3 tests.
 
 The point of the ports in :mod:`tunebox.core.ports` is that the queue, the worker and the API can
 be exercised without yt-dlp, ffmpeg or a network — so these tests run the real store, the real
-worker threads and the real FastAPI app, and only the *source* is fake.
+worker threads and the real FastAPI app, and only the *source* and the *player* are fake.
+
+:class:`FakePlayer` matters for a second reason. Once OwnTone is installed on the development host
+it is listening on loopback, which the no-network fixture in ``conftest.py`` deliberately permits;
+a test that built the real :class:`~tunebox.player.owntone.OwnTonePlayer` would then quietly start
+re-selecting speakers and triggering rescans on the machine running the suite.
 """
 
 from __future__ import annotations
@@ -11,8 +16,16 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from tunebox.core.models import FetchedMedia, Progress, SearchResult, TrackTags
-from tunebox.errors import SourceError
+from tunebox.core.models import (
+    FetchedMedia,
+    Output,
+    PlayerStatus,
+    Progress,
+    QueueItem,
+    SearchResult,
+    TrackTags,
+)
+from tunebox.errors import PlayerUnavailable, SourceError
 from tunebox.sources import urls
 
 
@@ -102,3 +115,216 @@ class RecordingTagWriter:
     def __call__(self, audio_path: Path, tags: TrackTags, cover_path: Path | None = None) -> None:
         with self._lock:
             self.calls.append((audio_path, tags, cover_path))
+
+
+#: The speaker the real system plays to (PLAN.md Phase 0), used as the fake's default so tests read
+#: like the thing they describe.
+SOUNDBAR = "Living Room speaker"
+
+
+@dataclass
+class FakePlayer:
+    """An in-memory :class:`~tunebox.core.ports.Player`.
+
+    Everything a test wants to assert is a counter or a list here rather than a log line, and the
+    two interesting failure modes have switches: ``unavailable`` makes every call raise (OwnTone not
+    started), and ``present=False`` removes the speaker from the output list (soundbar unplugged).
+    """
+
+    name: str = "fake-player"
+    base_url: str = "http://player.invalid:3689"
+    output_name: str = SOUNDBAR
+    output_id: str = "9999"
+    output_type: str = "Chromecast"
+    #: Is the speaker visible on the network at all?
+    present: bool = True
+    selected: bool = False
+    #: Is the daemon itself answering?
+    unavailable: bool = False
+    #: Listing the output works but selecting it fails — the race a speaker dropping off Wi-Fi
+    #: between two requests actually produces.
+    fail_select: bool = False
+    state: str = "stop"
+    volume: int = 30
+    items: list[QueueItem] = field(default_factory=list)
+    rescans: int = 0
+    scan_waits: int = 0
+    #: ``None`` means "every path is already indexed". A set makes anything outside it unknown to
+    #: the player, which is what a file ingested a second ago looks like.
+    indexed: set[str] | None = None
+    selections: list[tuple[str, int | None]] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    #: Raised by :meth:`rescan` when set, so the "a rescan failure is not an ingest failure" rule
+    #: can be tested rather than asserted in a docstring.
+    rescan_error: Exception | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    # ----------------------------------------------------------------- plumbing
+
+    def _guard(self) -> None:
+        if self.unavailable:
+            raise PlayerUnavailable(f"player daemon is not answering at {self.base_url}")
+
+    def _outputs(self) -> list[Output]:
+        if not self.present:
+            return []
+        return [
+            Output(
+                id=self.output_id,
+                name=self.output_name,
+                type=self.output_type,
+                selected=self.selected,
+                volume=self.volume,
+            )
+        ]
+
+    # ------------------------------------------------------------------- status
+
+    def status(self) -> PlayerStatus:
+        self._guard()
+        now = self.items[0] if self.items else None
+        return PlayerStatus(
+            state=self.state,
+            volume=self.volume,
+            item_id=now.id if now else None,
+            now_playing=now,
+            outputs=tuple(self._outputs()),
+        )
+
+    def outputs(self) -> list[Output]:
+        self._guard()
+        return self._outputs()
+
+    def target_output(self) -> Output:
+        from tunebox.errors import OutputNotFound
+
+        self._guard()
+        found = self._outputs()
+        if not found:
+            raise OutputNotFound(f"no output named {self.output_name!r}; visible now: (none)")
+        return found[0]
+
+    def find_output(self, *, output_id: str | None = None, name: str | None = None) -> Output:
+        return self.target_output()
+
+    def select_output(self, output_id: str, *, volume: int | None = None) -> None:
+        self._guard()
+        if self.fail_select:
+            raise PlayerUnavailable("the speaker went away between listing and selecting")
+        with self._lock:
+            self.selections.append((output_id, volume))
+            self.selected = True
+            if volume is not None:
+                self.volume = volume
+
+    def deselect_output(self, output_id: str) -> None:
+        self._guard()
+        self.selected = False
+
+    def set_volume(self, volume: int, *, output_id: str | None = None) -> None:
+        self._guard()
+        self.volume = max(0, min(100, int(volume)))
+
+    def change_volume(self, step: int, *, output_id: str | None = None) -> None:
+        self._guard()
+        self.set_volume(self.volume + int(step))
+
+    # ---------------------------------------------------------------- transport
+
+    def play(self) -> None:
+        self._guard()
+        self.commands.append("play")
+        self.state = "play"
+
+    def pause(self) -> None:
+        self._guard()
+        self.commands.append("pause")
+        self.state = "pause"
+
+    def stop(self) -> None:
+        self._guard()
+        self.commands.append("stop")
+        self.state = "stop"
+
+    def toggle(self) -> None:
+        self._guard()
+        self.commands.append("toggle")
+        self.state = "pause" if self.state == "play" else "play"
+
+    def next_track(self) -> None:
+        self._guard()
+        self.commands.append("next")
+        if self.items:
+            self.items = self.items[1:]
+
+    def previous_track(self) -> None:
+        self._guard()
+        self.commands.append("previous")
+
+    def seek(self, position_ms: int) -> None:
+        self._guard()
+        self.commands.append(f"seek:{position_ms}")
+
+    # -------------------------------------------------------------------- queue
+
+    def queue(self) -> list[QueueItem]:
+        self._guard()
+        return list(self.items)
+
+    def clear_queue(self) -> None:
+        self._guard()
+        self.items = []
+
+    def enqueue_paths(
+        self, paths, *, clear: bool = False, start: bool = False
+    ) -> list[QueueItem]:
+        self._guard()
+        if clear:
+            self.items = []
+        added: list[QueueItem] = []
+        for path in paths:
+            path = Path(path)
+            item = QueueItem(
+                id=str(len(self.items) + len(added) + 1),
+                position=len(self.items) + len(added),
+                title=path.stem,
+                artist=path.parent.parent.name,
+                album=path.parent.name,
+                path=str(path),
+                track_id=str(abs(hash(str(path))) % 100000),
+            )
+            added.append(item)
+        self.items = [*self.items, *added]
+        if start:
+            self.state = "play"
+        return added
+
+    def resolve_track(self, path, *, timeout: float = 0.0) -> dict:
+        self._guard()
+        if self.indexed is not None and str(Path(path)) not in self.indexed:
+            from tunebox.errors import PlayerError
+
+            raise PlayerError(f"{path} is not in the player's library.")
+        return {"id": str(abs(hash(str(path))) % 100000), "path": str(Path(path))}
+
+    def wait_for_scan(self, timeout: float = 30.0, poll: float = 0.25) -> bool:
+        self._guard()
+        self.scan_waits += 1
+        return True
+
+    # ------------------------------------------------------------------ library
+
+    def rescan(self) -> None:
+        self._guard()
+        with self._lock:
+            self.rescans += 1
+        if self.rescan_error is not None:
+            raise self.rescan_error
+
+    def library_info(self) -> dict:
+        self._guard()
+        return {"songs": len(self.items), "updating": False}
+
+    def ping(self) -> dict:
+        self._guard()
+        return {"version": "fake"}

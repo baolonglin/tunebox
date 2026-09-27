@@ -11,7 +11,9 @@ Three things happen here that are not "wiring":
   dependency;
 * **the exception handlers translate the one exception tree** in :mod:`tunebox.errors` into status
   codes, so no handler needs a try/except and a yt-dlp failure never reads as a bug in tunebox;
-* **the worker's lifetime is the app's lifetime** — started on startup, drained on shutdown.
+* **the worker's lifetime is the app's lifetime** — started on startup, drained on shutdown, and
+  from Phase 3 the :class:`~tunebox.player.selection.OutputKeeper` alongside it, so that the
+  soundbar is re-selected without anybody being asked to.
 """
 
 from __future__ import annotations
@@ -27,10 +29,21 @@ from fastapi.responses import JSONResponse
 
 from .. import __version__
 from ..config import Config
-from ..core.ports import MusicSource
-from ..errors import ConfigError, InvalidURLError, SourceError, SourceTimeout, TuneboxError
+from ..core.ports import MusicSource, Player
+from ..errors import (
+    ConfigError,
+    InvalidURLError,
+    OutputNotFound,
+    PlayerError,
+    PlayerUnavailable,
+    SourceError,
+    SourceTimeout,
+    TuneboxError,
+)
 from ..jobs.store import JobStore
 from ..jobs.worker import Worker
+from ..player.owntone import OwnTonePlayer
+from ..player.selection import OutputKeeper
 from ..sources.ytdlp import YtDlpSource
 from ..tagging import write_tags
 from .auth import TokenAuthMiddleware
@@ -51,6 +64,8 @@ def create_app(
     source: MusicSource | None = None,
     tag_writer=write_tags,
     run_worker: bool = True,
+    player: Player | None = None,
+    keep_output: bool = True,
 ) -> FastAPI:
     """Build the API. ``config.validate_for_serve()`` decides whether this is allowed to exist."""
     config = config or Config.from_env()
@@ -58,15 +73,28 @@ def create_app(
 
     store = store or JobStore(config.database_path)
     source = source or YtDlpSource(config)
-    worker = Worker(store=store, config=config, source=source, tag_writer=tag_writer)
+    player = player or OwnTonePlayer(config)
+    worker = Worker(
+        store=store, config=config, source=source, tag_writer=tag_writer, player=player
+    )
+    # Duck-typed rather than ``isinstance(player, OwnTonePlayer)``: the keeper only needs
+    # ``target_output`` and ``select_output``, and a fallback-A player would supply both.
+    keeper = OutputKeeper(player=player, config=config) if hasattr(player, "target_output") else None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if run_worker:
             worker.start()
+        # The keeper is started even when the player is unreachable: it is what notices OwnTone
+        # coming up later, and PLAN.md 3.1 explicitly wants ingest to keep working with no player
+        # installed at all.
+        if keeper is not None and keep_output:
+            keeper.start()
         try:
             yield
         finally:
+            if keeper is not None and keep_output:
+                keeper.stop()
             if run_worker:
                 worker.stop()
             store.close()
@@ -81,6 +109,8 @@ def create_app(
     app.state.store = store
     app.state.source = source
     app.state.worker = worker
+    app.state.player = player
+    app.state.output_keeper = keeper
 
     app.add_middleware(TokenAuthMiddleware, token=token)
     _install_error_handlers(app)
@@ -110,6 +140,22 @@ def _install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ConfigError)
     async def _misconfigured(request: Request, exc: ConfigError) -> JSONResponse:
         return error(500, str(exc))
+
+    @app.exception_handler(PlayerUnavailable)
+    async def _player_down(request: Request, exc: PlayerUnavailable) -> JSONResponse:
+        # The daemon is not answering. Retryable by the client once OwnTone is up, which is what
+        # 503 means and 502 does not.
+        return error(503, str(exc))
+
+    @app.exception_handler(OutputNotFound)
+    async def _no_output(request: Request, exc: OutputNotFound) -> JSONResponse:
+        # A genuinely missing resource: an unplugged soundbar is not on the network to be found.
+        return error(404, str(exc))
+
+    @app.exception_handler(PlayerError)
+    async def _player_failed(request: Request, exc: PlayerError) -> JSONResponse:
+        log.warning("player error: %s", exc)
+        return error(502, str(exc))
 
     @app.exception_handler(TuneboxError)
     async def _tunebox_error(request: Request, exc: TuneboxError) -> JSONResponse:

@@ -19,7 +19,7 @@ from tunebox.jobs.models import JobState
 from tunebox.jobs.store import JobStore
 from tunebox.jobs.worker import Worker, WorkerBusyError
 
-from fakes import FakeSource, RecordingTagWriter, video_id
+from fakes import FakePlayer, FakeSource, RecordingTagWriter, video_id
 
 VID = video_id(1)
 
@@ -465,3 +465,104 @@ def _wait_for(predicate, timeout: float = 10.0) -> None:
             return
         time.sleep(0.02)
     raise AssertionError("condition not met within the timeout")
+
+
+class TestRescanHook:
+    """PLAN.md Phase 3: *"library rescan hook after ingest"*.
+
+    The hook is the smallest piece of Phase 3 and the one with the sharpest rule attached: it can
+    never turn a finished download into a failed job. A retry after a "failure" caused by a stopped
+    OwnTone would re-download the file for nothing.
+    """
+
+    def _worker(self, store, config, source, player, **overrides) -> Worker:
+        return Worker(
+            store=store,
+            config=replace(config, **overrides) if overrides else config,
+            source=source,
+            tag_writer=RecordingTagWriter(),
+            player=player,
+        )
+
+    def test_a_new_file_triggers_exactly_one_rescan(self, store, config, source):
+        player = FakePlayer()
+        worker = self._worker(store, config, source, player)
+        job_id = enqueue(store)
+
+        drain(worker, store)
+
+        assert store.get(job_id).state is JobState.DONE
+        assert player.rescans == 1
+
+    def test_a_deduped_job_does_not_rescan(self, store, config, source):
+        """Nothing changed on disk, so a rescan could only find what the daemon already knows."""
+        player = FakePlayer()
+        worker = self._worker(store, config, source, player)
+        enqueue(store)
+        drain(worker, store)
+        assert player.rescans == 1
+
+        enqueue(store)
+        drain(worker, store)
+        assert player.rescans == 1
+
+    def test_a_dead_player_is_a_warning_on_a_done_job_not_a_failure(self, store, config, source):
+        player = FakePlayer(unavailable=True)
+        worker = self._worker(store, config, source, player)
+        job_id = enqueue(store)
+
+        drain(worker, store)
+
+        job = store.get(job_id)
+        assert job.state is JobState.DONE, "a stopped OwnTone must not cost us the download"
+        assert job.attempts == 1, "and must not trigger a retry that downloads it again"
+        assert any("library rescan failed" in warning for warning in job.warnings)
+        assert Path(job.path).is_file()
+
+    def test_the_warning_reaches_the_job_record_not_just_the_log(self, store, config, source):
+        """The rescan runs *before* ``mark_done``; a warning written afterwards would never reach
+        ``GET /jobs/{id}``."""
+        player = FakePlayer(rescan_error=RuntimeError("owntone exploded"))
+        worker = self._worker(store, config, source, player)
+        job_id = enqueue(store)
+
+        drain(worker, store)
+
+        job = store.get(job_id)
+        assert job.state is JobState.DONE
+        assert any("owntone exploded" in warning for warning in job.warnings)
+
+    def test_a_failed_ingest_does_not_rescan(self, store, config):
+        player = FakePlayer()
+        source = FakeSource(fail_fetch_times={VID: 99})
+        worker = self._worker(store, config, source, player, job_max_attempts=1)
+        job_id = enqueue(store, max_attempts=1)
+
+        drain(worker, store)
+
+        assert store.get(job_id).state is JobState.FAILED
+        assert player.rescans == 0
+
+    def test_the_hook_can_be_switched_off(self, store, config, source):
+        player = FakePlayer()
+        worker = self._worker(store, config, source, player, rescan_after_ingest=False)
+        enqueue(store)
+
+        drain(worker, store)
+
+        assert player.rescans == 0
+
+    def test_a_worker_with_no_player_behaves_exactly_as_it_did_in_phase_2(
+        self, store, config, source
+    ):
+        """Ingest must keep working on a host with no player daemon installed at all."""
+        worker = Worker(
+            store=store, config=config, source=source, tag_writer=RecordingTagWriter()
+        )
+        job_id = enqueue(store)
+
+        drain(worker, store)
+
+        job = store.get(job_id)
+        assert job.state is JobState.DONE
+        assert job.warnings == ()

@@ -31,3 +31,24 @@ class LibraryError(TuneboxError):
 
 class TaggingError(TuneboxError):
     """Writing tags to the downloaded file failed."""
+
+
+class PlayerError(TuneboxError):
+    """The player daemon refused a command or answered with something we cannot parse."""
+
+
+class PlayerUnavailable(PlayerError):
+    """The player daemon is not answering at all — not started, wrong port, or wrong password.
+
+    Separate from :class:`PlayerError` because the fix is different: this one is "start OwnTone",
+    not "that command was wrong". The ingest path treats it as a warning, never a failure.
+    """
+
+
+class OutputNotFound(PlayerError):
+    """The configured speaker is not in the daemon's output list.
+
+    Expected and survivable: a soundbar that is unplugged disappears from mDNS. PLAN.md Phase 3
+    requires that it be re-selected automatically when it comes back, which is
+    :class:`tunebox.player.selection.OutputKeeper`'s job.
+    """

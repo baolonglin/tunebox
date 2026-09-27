@@ -20,6 +20,13 @@ Where the Phase 2 requirements live:
 * **dedupe by video id** — checked here, before ``inspect``, so a repeat costs zero network
   requests rather than one. The path-based dedupe inside ``ingest()`` remains as the backstop
   for files that arrived some other way.
+
+And where Phase 3's requirement lives:
+
+* **library rescan hook** — a successful ingest that actually produced a *new* file tells the
+  player daemon to index it (PLAN.md Phase 3). It runs just *before* the outcome is recorded, not
+  after, so that a rescan warning can still reach ``GET /jobs/{id}``; it is skipped when the file was
+  already present; and it can only ever add a warning — see :mod:`tunebox.player.hooks`.
 """
 
 from __future__ import annotations
@@ -35,8 +42,9 @@ from .. import ingest as ingest_module
 from .. import tagging
 from ..config import Config
 from ..core.models import IngestResult, Progress, TrackTags
-from ..core.ports import MusicSource, TagWriter
+from ..core.ports import MusicSource, Player, TagWriter
 from ..errors import InvalidURLError, LibraryError, SourceError, TuneboxError
+from ..player.hooks import rescan_library
 from .models import Job, JobState
 from .store import JobStore
 
@@ -70,11 +78,15 @@ class Worker:
         config: Config,
         source: MusicSource,
         tag_writer: TagWriter = tagging.write_tags,
+        player: Player | None = None,
     ) -> None:
         self._store = store
         self._config = config
         self._source = source
         self._tag_writer = tag_writer
+        #: Optional: ingest works perfectly well with no player installed, and Phases 1 and 2 did
+        #: exactly that. When one is present, a finished ingest tells it to rescan.
+        self._player = player
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -290,6 +302,9 @@ class Worker:
         return _deduped_result(path, record.tags)
 
     def _finish(self, job: Job, result: IngestResult) -> None:
+        # Before the outcome is written, not after: the rescan can add a warning, and a warning
+        # that lands after ``mark_done`` would never reach ``GET /jobs/{id}``.
+        result = self._rescan(result)
         tags = result.tags.as_dict()
         self._store.mark_done(
             job.id,
@@ -311,6 +326,21 @@ class Worker:
         except Exception:  # pragma: no cover - the path check inside ingest() still dedupes
             log.exception("could not index %s for dedupe", job.video_id)
         log.info("job %s done: %s", job.id, result.path)
+
+    def _rescan(self, result: IngestResult) -> IngestResult:
+        """Tell the player daemon about a newly placed file (PLAN.md Phase 3).
+
+        Skipped when nothing new landed: a deduped job changed no file, so asking OwnTone to walk
+        the library for it would be a request that can only find what it already knows.
+        """
+        if self._player is None or not self._config.rescan_after_ingest:
+            return result
+        if result.already_present:
+            return result
+        warning = rescan_library(self._player)
+        if warning is None:
+            return result
+        return replace(result, warnings=(*result.warnings, warning))
 
     def _fail(self, job: Job, message: str) -> None:
         try:
