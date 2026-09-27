@@ -501,6 +501,17 @@ class JobStore:
         with self._writing() as conn:
             conn.execute("DELETE FROM tracks WHERE video_id = ?", (video_id,))
 
+    def forget_path(self, path: str) -> int:
+        """Drop history entries naming ``path``, returning how many there were.
+
+        Called when a track is deleted from the library. Tidiness rather than correctness: the
+        worker already treats an entry whose file is missing as no entry at all (see ``_dedupe``),
+        so re-ingesting a deleted track works either way. What this buys is that it works without
+        a log line saying the index was stale.
+        """
+        with self._writing() as conn:
+            return conn.execute("DELETE FROM tracks WHERE path = ?", (path,)).rowcount
+
 
 def _job_from_row(row: sqlite3.Row) -> Job:
     return Job(

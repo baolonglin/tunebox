@@ -17,28 +17,37 @@ That is what lets a phone queue three URLs and lock itself.
 because it is a fact about *our* library rather than a command to the player: it walks the music
 root and needs no daemon running at all. Its handler blocks on a directory walk, which is the third
 reason these are not ``async def``.
+
+``DELETE /library`` is here for the same reason and is the one destructive route in the project — it
+unlinks files from the music root. Everything that makes that safe is in its own docstring below;
+the reason it is not in :mod:`tunebox.api.remote` is that it does not go through the ``Player`` port
+at all. It only *tells* the player afterwards, and cannot fail because of it.
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 
 from .. import __version__
 from ..config import Config
 from ..core.ports import MusicSource
-from ..errors import TuneboxError
+from ..errors import LibraryError, TuneboxError
 from ..jobs.models import Job, JobState
 from ..jobs.store import JobStore
 from ..jobs.worker import Worker
-from ..library import list_tracks
+from ..library import delete_track, list_tracks, resolve_track_path
+from ..player.hooks import rescan_library
 from ..sources import urls
 from .remote import configured_output
 from .schemas import (
     HealthView,
     IngestRequest,
     JobView,
+    LibraryDeletedView,
+    LibraryDeleteRequest,
     LibraryTrackView,
     LibraryView,
     PlayerHealth,
@@ -181,6 +190,133 @@ def library(
         total=page.total,
         truncated=page.truncated,
     )
+
+
+@router.delete(
+    "/library",
+    response_model=LibraryDeletedView,
+    summary="Delete tracks from the library, and the directories they empty",
+)
+def delete_library(payload: LibraryDeleteRequest, request: Request) -> LibraryDeletedView:
+    """Remove files from the music root. **Destructive, and there is no trash.**
+
+    The remote is otherwise a one-way door — a mistagged ingest, a wrong search result or a
+    duplicate can be added from a phone and then only removed by finding a terminal — so this
+    exists; and because it is the one route that destroys the only irreplaceable state in the
+    system (PLAN.md 3.1), four things about it are deliberate:
+
+    * **Every path is resolved before anything is deleted.** A typo in the third entry is a ``400``
+      that removed nothing, the same all-or-nothing property ``POST /player/queue`` has. Duplicate
+      spellings of one file (the relative form and the absolute form) collapse to one delete rather
+      than making the second a "no such track".
+    * **The track the player has loaded is refused with a ``409``.** Pulling the file out from under
+      the daemon mid-song is the one case with an audible failure mode, and refusing is cheaper to
+      explain than whatever OwnTone does about it. Later queue entries are *not* refused: the daemon
+      discovers a missing file on its next ``LOAD``, and a queue is not a claim on the library.
+    * **A player that cannot be asked does not block the delete.** If the daemon is down there is
+      nothing playing to protect, and the file is on our disk, not its. Same for the rescan
+      afterwards — :func:`~tunebox.player.hooks.rescan_library` cannot fail an operation, it can
+      only add a warning to it.
+    * **No confirmation lives here.** An API that asked twice would be a protocol nobody follows;
+      the confirmation step is the remote's job, and it has one.
+    """
+    config = _config(request)
+    player = getattr(request.app.state, "player", None)
+
+    # Resolve first, delete second. Keyed by the resolved path so that ["a.m4a", "/music/a.m4a"]
+    # is one delete and not one delete followed by a 400 about a file we just removed.
+    targets: dict[Path, str] = {}
+    try:
+        for entry in payload.paths:
+            targets.setdefault(resolve_track_path(config.music_root, entry), entry)
+    except LibraryError as exc:
+        # A client naming a file it should not, or one that is not there: its mistake, not ours.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    loaded = _loaded_track_path(player)
+    if loaded is not None:
+        for target in targets:
+            if _same_file(target, loaded):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"{target.name} is the track the player has loaded; "
+                        "stop playback or skip past it first"
+                    ),
+                )
+
+    store = _store(request)
+    deleted: list[str] = []
+    removed: list[str] = []
+    for target, entry in targets.items():
+        record = delete_track(config.music_root, entry)
+        deleted.append(record.path)
+        removed.extend(record.removed_directories)
+        _forget_ingest_history(store, target)
+        log.info("deleted %s from the library", record.path)
+
+    warnings: list[str] = []
+    if player is not None:
+        # Unconditional, unlike the ingest hook's ``TUNEBOX_RESCAN_AFTER_INGEST``: that setting is
+        # about not making the daemon re-index after every download, while an index that still
+        # offers a file which no longer exists is a track that fails when somebody taps it.
+        warning = rescan_library(player)
+        if warning:
+            warnings.append(warning)
+    return LibraryDeletedView(deleted=deleted, removed_directories=removed, warnings=warnings)
+
+
+def _loaded_track_path(player: object | None) -> Path | None:
+    """The file the player currently has loaded, or ``None`` if it cannot be asked.
+
+    Broad ``except`` on purpose, and it is the same reasoning as ``_player_health`` above: this is a
+    *courtesy* check on the way to deleting a file from our own disk. A daemon that is down is not
+    playing anything, so failing the delete because the question could not be asked would refuse an
+    operation for the sake of a risk that is not there.
+    """
+    if player is None:
+        return None
+    try:
+        now = player.status().now_playing  # type: ignore[attr-defined]
+    except TuneboxError as exc:
+        log.debug("could not ask the player what is loaded: %s", exc)
+        return None
+    except Exception:  # pragma: no cover - an adapter bug must not block a delete either
+        log.exception("player status raised while checking what is loaded")
+        return None
+    if now is None or not now.path:
+        return None
+    return Path(now.path)
+
+
+def _same_file(one: Path, other: Path) -> bool:
+    """Whether two paths name the same file, allowing for a symlinked music root.
+
+    PLAN.md 3.1 deploys the library through a symlink to an external SSD, and OwnTone reports
+    whatever spelling its own ``directories`` setting gave it — so string equality alone would miss
+    the match in the deployment that matters.
+    """
+    if one == other:
+        return True
+    try:
+        return one.resolve() == other.resolve()
+    except OSError:  # pragma: no cover - resolve() of a plain path does not need the file to exist
+        return False
+
+
+def _forget_ingest_history(store: JobStore, path: Path) -> None:
+    """Drop the video-id history entry for a deleted file, in both spellings of its path.
+
+    Not load-bearing: the worker already treats an entry whose file has gone as no entry at all, so
+    a deleted track is re-ingestable with or without this. Which is also why a failure here is
+    logged and swallowed — the file is already gone, and an index is an optimisation.
+    """
+    spellings = {str(path), str(path.resolve())}
+    try:
+        for spelling in spellings:
+            store.forget_path(spelling)
+    except Exception:  # pragma: no cover - a store failure must not fail a completed delete
+        log.exception("could not drop the ingest history entry for %s", path)
 
 
 @router.post(

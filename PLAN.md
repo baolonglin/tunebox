@@ -945,6 +945,84 @@ acceptance criterion not met, and it is not fixable with OwnTone**
   an artefact of `--window-size` not setting the *viewport* in Chrome's new headless mode. Measured
   through `Emulation.setDeviceMetricsOverride`, `scrollWidth == innerWidth == 390` on all three
   panels.
+- [x] **Delete a track from the library** *(added after Phase 5, because the remote was a one-way
+      door: a mistagged ingest, a wrong search result or a duplicate could be added from a phone and
+      then only removed by finding a terminal)*. `DELETE /library`, plus a confirmation step in the
+      Library panel. This is the first destructive operation tunebox exposes and the thing it destroys
+      is the only irreplaceable state the system has, so the five decisions it carries are recorded
+      here rather than left in the code:
+  - **Hard delete, no trash directory.** A dot-directory under the music root would be recoverable
+    from the phone and is invisible to `list_tracks` for free, but it sits *inside* the tree `tunebox
+    backup` mirrors, so deleted music would keep occupying the backup disk until something expired
+    it. **The backup is the undo instead** — which makes this and `TUNEBOX_BACKUP_PRUNE` related in a
+    way nothing previously said out loud: with prune on, there is no undo left. Prune is off by
+    default for exactly this class of accident (Phase 5), and the README now says the two belong
+    together.
+  - **Empty parent directories are removed, upward, stopping at the music root.** Deleting the last
+    track in `Artist/Singles/` otherwise leaves directories that `GET /library` cannot see (it walks
+    files) but OwnTone's browse view can, so they accumulate as phantom artists. The emptiness check
+    is `rmdir` failing rather than a prior `iterdir`, because an ingest running in parallel can fill
+    the directory between the two — and a root containing nothing else survives, with a test.
+  - **The track the player has loaded is refused with a `409`; later queue entries are not.** Pulling
+    the file out from under the daemon mid-song is the one case with an audible failure mode. A queue
+    is not a claim on the library, though: OwnTone discovers a missing file on its next `LOAD`, and
+    refusing for the whole queue would make a queued album undeletable. A daemon that cannot be
+    *asked* does not block the delete — if it is not answering, it is not playing — which is the same
+    indifference the rescan hook has, since the file is gone either way.
+  - **`DELETE /library` with `{"paths": [...]}`, not a wildcard path parameter.** A library path holds
+    slashes and, in this household, CJK; encoding one twice to build `DELETE /library/{path}` is how a
+    delete names the wrong file. The body also makes it all-or-nothing like `POST /player/queue`:
+    every path is resolved through `library.resolve_track_path` — the same single path-handling site,
+    not a second one — before anything is unlinked, so a typo in the third entry costs nothing. Two
+    spellings of one file collapse to one delete rather than a 400 about a file just removed.
+  - **The confirmation is in the UI, and it is not a third button beside Play.** An API that asked
+    twice would be a protocol every client eventually skips; `window.confirm` is a modal a browser may
+    suppress and which looks like a crash in an installed web app. So each library row gains a `⋯`
+    that reveals a strip naming the track and saying the file is removed from the disk. No CLI verb
+    was added: from a terminal `rm` is the tool, and `tunebox` has no `library` command group.
+  - Ingest history needed no new bookkeeping: the worker already treats a history entry whose file has
+    disappeared as no entry at all, so a deleted track is re-ingestable either way. `store.forget_path`
+    drops it eagerly so that it happens without a log line about a stale index. Tests 1056 → 1120.
+- **A bug found by using the remote rather than by testing it: the Library panel was drawn once and
+  never again.** After an ingest reached `done` in the Ingests list, the library listing still showed
+  what it had shown at unlock. One condition caused it —
+  `if (name === "library" && !el("library").childElementCount) loadLibrary()` — and both halves were
+  individually defensible, which is why nothing caught it: the guard avoided a directory walk per tab
+  switch, and the panel *was* loaded once. Its worst case was the empty library, because the
+  "The library is empty — add something first" placeholder is itself a child element, so the panel kept
+  saying exactly that after somebody did add something. Now a tab switch always re-reads, and
+  `refreshJobs` — which is already polling while an ingest is in flight — reloads the listing when a job
+  *transitions* to done, so the panel updates with nobody touching it. One guard on that: a background
+  reload is skipped while a delete confirmation is open, because the listing is newest-first and a track
+  landing mid-confirmation would shift every row down by one, moving the row a thumb was about to
+  confirm a delete on.
+  **Verified in a real browser again, and this time the driver is cheap enough to keep the recipe:**
+  `deno` (already a hard dependency) speaks CDP over its built-in WebSocket, so a live `tunebox serve`
+  with the fake source and fake player can be driven from the page's own controls. Before the fix, two
+  tracks on disk and "The library is empty" on screen through two tab switches; after it, the track
+  appears while the Library tab sits open and untouched. Both behaviours are now assertions in
+  `tests/test_ui.py` (`TestTheLibraryPanelDoesNotGoStale`), including that `childElementCount` never
+  comes back. Tests 1120 → 1125.
+- **And the fix above did not reach the phone, which turned out to be a second and worse bug: the
+  shell's cache key was the version, not the bytes.** Reported as "I ran install.sh, ingested, waited
+  for done, clicked Library, still nothing" — and measured on the live installation: the host was
+  serving the corrected `app.js` (`curl` proved it), `GET /library` returned the track, and the browser
+  was still running the previous script. The page asks for `/ui/app.js?v=<version>`, `/ui/*` is served
+  `public, max-age=3600`, and `__version__` does not change when an asset does — so an upgrade that
+  edits the JavaScript without a release leaves every browser that loaded the page in the last hour on
+  the old file, with the service worker's cache name (`tunebox-shell-<version>`) unchanged too, so
+  `activate` kept the stale precached copy as well. Every test passed, because every test asked the
+  server.
+  The key is now a **build id**: `ui.build_id()`, an eight-character digest of the shell's own bytes
+  plus the version, substituted as `__TUNEBOX_BUILD__` into the two `?v=` URLs and the worker's cache
+  name. Content-addressed and deterministic — a restart or a second worker computes the same id, so it
+  does not re-download the shell for no reason, and it is computed from the *raw* files so that
+  substituting it cannot change it. The version stays what the footer shows and what a bug report
+  names; the build id is what a cache is keyed on. What makes it take effect at all is that the
+  document itself is `no-cache`: one load picks up new HTML, which then asks for a URL no browser can
+  have. Verified on the live service: `?v=0.1.0` before the reinstall, `?v=6cb5109c` after, and that
+  URL returns the corrected script. Tests 1125 → 1131, including one that edits an asset in a copied
+  web root and asserts the URL in the document changes.
 
 **Phase 4.5 — Deployment** *(not in the original plan; added because Phase 4's exit criterion is
 unreachable without it — an icon on a phone needs something that is always running behind it)*
@@ -1050,7 +1128,10 @@ unreachable without it — an icon on a phone needs something that is always run
       in its place — copying an open WAL database byte-wise is how a backup that restores into a
       corrupt database is made. And the half that is normally never executed until the day it must
       work, `tunebox restore`, exists, is a **dry run by default**, never passes `--delete`, and is
-      tested against real rsync on both directions.
+      tested against real rsync on both directions. **Since Phase 4 gained `DELETE /library`, the
+      opt-in half of this carries a second load:** the backup is the only undo a delete from the phone
+      has, so `TUNEBOX_BACKUP_PRUNE=1` and the delete button are two settings that have to be read
+      together.
 - **Two real bugs were found by running this on the actual hardware rather than by reading it.**
   Both are the same shape — a platform difference that no amount of unit testing would surface.
   First, macOS now ships **openrsync**, which announces itself as "rsync version 2.6.9 compatible"

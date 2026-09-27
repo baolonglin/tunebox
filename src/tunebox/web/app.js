@@ -41,6 +41,8 @@
     /** True while a volume drag is in flight, so a poll cannot yank the slider out from under a thumb. */
     holdingVolume: false,
     jobsActive: false,
+    /** Ids of ingests already seen as finished. ``null`` until the first poll — see noticeFinishedIngests. */
+    finishedJobs: null,
     timer: null,
     ticker: null,
   };
@@ -269,7 +271,11 @@
       trigger.tabIndex = active ? 0 : -1;
       panel.hidden = !active;
     });
-    if (name === "library" && !el("library").childElementCount) loadLibrary();
+    // Unconditionally, *not* "only if the list is empty": the library changes behind this page's
+    // back on every finished ingest, and a cached-once listing is how a track that says "done" in
+    // the Ingests list ends up missing from the Library panel. One directory walk per tab switch is
+    // what the panel is for, and it is capped by TUNEBOX_LIBRARY_MAX_FILES.
+    if (name === "library") refreshLibrary();
     if (name === "add") refreshJobs();
   }
 
@@ -509,6 +515,7 @@
     const jobs = await attempt(() => api("/jobs?limit=15"), "jobs");
     if (!jobs) return;
     state.jobsActive = jobs.some((job) => ACTIVE.has(job.state));
+    noticeFinishedIngests(jobs);
     fill(
       el("jobs"),
       jobs.map((job) => {
@@ -563,6 +570,43 @@
     );
   }
 
+  /**
+   * Reload the library when an ingest has just finished.
+   *
+   * Without this, the Library panel is only as fresh as the last time it was drawn: a track can say
+   * "done" in the list above and be absent from the one below, which is the same library described
+   * twice and disagreeing. It is a *transition* rather than a count, because the first poll after
+   * unlocking sees every past ingest as done — news, then, would mean reloading the library on every
+   * page load for no reason.
+   */
+  function noticeFinishedIngests(jobs) {
+    const finished = new Set(
+      jobs.filter((job) => job.state === "done" && job.path).map((job) => job.id)
+    );
+    const previous = state.finishedJobs;
+    state.finishedJobs = finished;
+    if (previous === null) return; // the first poll is history, not news
+    for (const id of finished) {
+      if (!previous.has(id)) {
+        refreshLibrary();
+        return;
+      }
+    }
+  }
+
+  /**
+   * Redraw the library — unless a delete confirmation is open in it.
+   *
+   * Rebuilding the rows underneath an open confirmation would be worse than showing a stale list for
+   * another moment: the listing is newest-first, so a freshly ingested track pushes every row down by
+   * one, and the tap that was about to confirm a delete would land on the row that took its place.
+   * A deferred refresh costs a tab switch; a mis-aimed delete costs a file.
+   */
+  function refreshLibrary() {
+    if (el("library").querySelector(".row-confirm:not([hidden])")) return;
+    loadLibrary();
+  }
+
   function jobLabel(job) {
     if (job.state === "running") {
       return job.progress ? `running ${Math.round(job.progress)}%` : "running";
@@ -612,18 +656,93 @@
       : `${shown} of ${page.total} track${page.total === 1 ? "" : "s"}, newest first.`;
     fill(
       el("library"),
-      page.tracks.map((track) =>
-        row(
-          track.title,
-          [track.artist, track.album].filter(Boolean).join(" · "),
-          [
-            button("Play", () => enqueue(track.path, "replace", true), "primary"),
-            button("Queue", () => enqueue(track.path, "append", false)),
-          ]
-        )
-      ),
+      page.tracks.map(libraryRow),
       query ? "Nothing matches that." : "The library is empty — add something first."
     );
+  }
+
+  /** Unique ids for the disclosure wiring below; the rows themselves are rebuilt on every load. */
+  let rowSeq = 0;
+
+  /**
+   * One library row: **Play**, **Queue**, and — two taps away — **Delete**.
+   *
+   * Delete is not a third button beside Play, and that is the whole design of this function. It is
+   * the only irreversible thing the remote can do, what it destroys is the only irreplaceable state
+   * the system has, and Play sits where a thumb lands on a phone. So it is behind the row's `⋯`,
+   * and then behind a button that names the track it is about to remove.
+   *
+   * The confirmation is here rather than in the API on purpose: an endpoint that asked twice would
+   * be a protocol every client eventually skips, while `window.confirm` is a modal a browser is
+   * free to suppress — and in an installed web app it looks like the page has crashed.
+   */
+  function libraryRow(track) {
+    const subtitle = [track.artist, track.album].filter(Boolean).join(" · ");
+    const li = row(track.title, subtitle, [
+      button("Play", () => enqueue(track.path, "replace", true), "primary"),
+      button("Queue", () => enqueue(track.path, "append", false)),
+    ]);
+
+    const panel = make("div", "row-confirm");
+    panel.id = `row-confirm-${++rowSeq}`;
+    panel.hidden = true;
+
+    const more = button("⋯", () => reveal(panel.hidden));
+    more.setAttribute("aria-label", `More actions for ${track.title}`);
+    more.setAttribute("aria-expanded", "false");
+    more.setAttribute("aria-controls", panel.id);
+    li.querySelector(".row-actions").appendChild(more);
+
+    function reveal(show) {
+      panel.hidden = !show;
+      more.setAttribute("aria-expanded", String(show));
+    }
+
+    panel.appendChild(
+      make(
+        "p",
+        "row-warn",
+        `Delete “${track.title}”? The file is removed from the disk, and the remote cannot put it back.`
+      )
+    );
+    const actions = make("div", "row-actions");
+    const remove = button("Delete", async () => {
+      remove.disabled = true;
+      remove.textContent = "Deleting…";
+      const result = await deleteTrack(track);
+      if (result) return; // the list is being rebuilt, so this row is about to disappear
+      remove.disabled = false;
+      remove.textContent = "Delete";
+    }, "danger");
+    actions.appendChild(remove);
+    actions.appendChild(button("Cancel", () => reveal(false)));
+    panel.appendChild(actions);
+    li.appendChild(panel);
+    return li;
+  }
+
+  /**
+   * Delete one track, then redraw both halves of what it was in.
+   *
+   * The library listing *and* the player: the queue may have been holding this file, and a 409 is
+   * the answer when it is the track currently loaded — which `attempt` puts in the banner verbatim,
+   * because "stop playback or skip past it first" is the whole of what somebody needs to know.
+   */
+  async function deleteTrack(track) {
+    const result = await attempt(
+      () => api("/library", { method: "DELETE", body: { paths: [track.path] } }),
+      "delete"
+    );
+    if (!result) return null;
+    await loadLibrary();
+    await refreshPlayer();
+    const pruned = (result.removed_directories || []).length;
+    el("lib-note").textContent =
+      `Deleted ${track.title}.` + (pruned ? ` ${pruned} empty folder${pruned === 1 ? "" : "s"} removed.` : "");
+    // A rescan the daemon refused is worth saying out loud: the file is gone, but OwnTone's own
+    // browse view will keep offering it until it re-indexes.
+    if (result.warnings && result.warnings.length) banner(result.warnings[0]);
+    return result;
   }
 
   function wireLibrary() {

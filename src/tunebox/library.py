@@ -9,6 +9,10 @@ Two properties matter for placement, both because a music daemon is watching thi
 play. It walks the tree rather than querying a database, because there is no database to query:
 "the filesystem is the database for audio" (PLAN.md 3.1), and duplicating it into SQLite would
 create a second place for the library to be wrong.
+
+:func:`delete_track` is the third, and the only destructive thing in the project. It is here rather
+than in the route for the same reason placement is: the rule that nothing outside the music root can
+be named by a request body belongs next to the code that enforces it, not spread across the callers.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ from pathlib import Path, PurePosixPath
 from typing import Iterator
 
 from .core import naming
-from .core.models import LibraryPage, LibraryTrack, TrackTags
+from .core.models import DeletedTrack, LibraryPage, LibraryTrack, TrackTags
 from .errors import LibraryError
 
 #: Extensions :func:`list_tracks` treats as music. Wider than :data:`tunebox.config.SUPPORTED_FORMATS`
@@ -117,6 +121,85 @@ def resolve_track_path(root: Path, relative: str) -> Path:
     if resolved.suffix.lower() not in AUDIO_EXTENSIONS:
         raise LibraryError(f"not a music file: {text}")
     return resolved
+
+
+# ------------------------------------------------------------------ taking it out again
+
+
+def delete_track(root: Path, relative: str, *, prune: bool = True) -> DeletedTrack:
+    """Delete one track from the library, plus any directories that emptied because of it.
+
+    The only destructive operation tunebox has, and what it destroys is the only irreplaceable
+    state the system holds — so three things about it are decisions rather than implementation:
+
+    * **It is a hard delete, not a move into a trash directory.** A dot-directory under the music
+      root would be recoverable from the phone and invisible to :func:`list_tracks` for free, but it
+      would also sit *inside* the tree ``tunebox backup`` mirrors, so deleted music would keep
+      occupying the backup disk until something expired it. The backup is the undo instead — which
+      is only true while ``TUNEBOX_BACKUP_PRUNE`` is off, and off is its default for exactly this
+      kind of reason (PLAN.md Phase 5: "the accident a home backup most often has to survive is
+      somebody deleting an album").
+    * **Empty parents are removed, upward, stopping at the music root.** Deleting the last track in
+      ``Artist/Singles/`` otherwise leaves a directory that ``GET /library`` cannot see (it walks
+      files) but OwnTone's browse view can, so they accumulate as phantom artists. The emptiness
+      check is :meth:`~pathlib.Path.rmdir` itself failing rather than a prior ``iterdir``, because
+      an ingest running in parallel can fill the directory between the two.
+    * **The path goes through :func:`resolve_track_path` and nothing else.** It is the one place
+      that reduces an absolute path to the relative form, refuses ``..`` and symlinks that leave the
+      root, and rejects a non-audio extension — and a second path handler in the *delete* route is
+      precisely where a traversal bug would be worth having.
+
+    ``relative`` is whatever the client sent: either form ``GET /library`` or ``GET /jobs`` hands
+    out. Raises :class:`~tunebox.errors.LibraryError` if it names anything else.
+    """
+    target = resolve_track_path(root, relative)
+    try:
+        target.unlink()
+    except OSError as exc:
+        raise LibraryError(f"could not delete {relative}: {exc}") from exc
+    removed = _prune_empty_parents(root, target.parent) if prune else ()
+    return DeletedTrack(path=_relative_to_root(root, target), removed_directories=removed)
+
+
+def _prune_empty_parents(root: Path, directory: Path) -> tuple[str, ...]:
+    """Remove ``directory`` and its parents while they are empty, never touching ``root`` itself.
+
+    A music root that holds nothing else must survive: an empty library is the state ``tunebox
+    serve`` starts in, and :func:`list_tracks` already treats a missing root as an empty library
+    rather than an error — but removing the directory OwnTone is configured to watch would be a
+    surprise nobody asked a delete for.
+    """
+    removed: list[str] = []
+    root_resolved = root.resolve()
+    current = directory
+    while True:
+        try:
+            resolved = current.resolve()
+        except OSError:  # pragma: no cover - a parent that cannot be resolved is a parent to leave
+            break
+        # Stop at the root, and stop if we somehow left it: the same containment rule as
+        # ``naming.resolve_within``, applied on the way *out* of the tree rather than into it.
+        if resolved == root_resolved or root_resolved not in resolved.parents:
+            break
+        try:
+            current.rmdir()
+        except OSError:
+            # Not empty (the common case, and the point), or not removable. Either way, stop here.
+            break
+        removed.append(_relative_to_root(root, current))
+        current = current.parent
+    return tuple(removed)
+
+
+def _relative_to_root(root: Path, path: Path) -> str:
+    """``path`` as a POSIX path relative to ``root`` — the only form a client is ever told."""
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:  # pragma: no cover - callers pass paths built by joining onto root
+        return path.name
+
+
+# ------------------------------------------------------------------ listing it
 
 
 def list_tracks(

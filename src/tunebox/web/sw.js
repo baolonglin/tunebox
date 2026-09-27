@@ -17,18 +17,22 @@
  * * The token is in a header the page attaches per request, never in a cached response, so nothing
  *   here can leak it into storage that outlives "forget token".
  *
- * The cache name carries the tunebox version, substituted when this file is served. That is what
- * makes an upgrade take effect: a new version is a new cache, and `activate` deletes every older
- * one rather than leaving a phone on last month's JavaScript.
+ * The cache name carries the tunebox version *and the build id* — a digest of the shell's own bytes,
+ * substituted when this file is served. That is what makes an upgrade take effect: changing any asset
+ * is a new build id, therefore a new cache and new `?v=` URLs, and `activate` deletes every older
+ * cache rather than leaving a phone on last month's JavaScript. Keying this on the version alone was
+ * a bug: an upgrade that edited `app.js` without releasing a new version changed neither the cache
+ * name nor the URL, so the phone kept the old script.
  */
 
 const VERSION = "__TUNEBOX_VERSION__";
-const CACHE = `tunebox-shell-${VERSION}`;
+const BUILD = "__TUNEBOX_BUILD__";
+const CACHE = `tunebox-shell-${VERSION}-${BUILD}`;
 
 const SHELL = [
   "/",
-  `/ui/app.css?v=${VERSION}`,
-  `/ui/app.js?v=${VERSION}`,
+  `/ui/app.css?v=${BUILD}`,
+  `/ui/app.js?v=${BUILD}`,
   "/ui/icon.svg",
   "/ui/icon-180.png",
   "/manifest.webmanifest",

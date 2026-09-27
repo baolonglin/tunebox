@@ -146,6 +146,7 @@ class TestTemplating:
     def test_no_placeholder_survives(self, client: TestClient, path: str):
         text = client.get(path).text
         assert "__TUNEBOX_VERSION__" not in text
+        assert "__TUNEBOX_BUILD__" not in text
         assert "__OWNTONE_URL__" not in text
         assert "__PLAYER_PORT__" not in text
 
@@ -175,6 +176,82 @@ class TestTemplating:
 
 
 # ------------------------------------------------------- the exemption costs nothing
+
+
+class TestTheCacheKeyIsTheBytes:
+    """``/ui/*`` is cached by the phone, so the key has to change when the file does.
+
+    The bug this class exists for was found on the real installation, after an upgrade: the page asked
+    for ``/ui/app.js?v=0.1.0``, the assets were served ``max-age=3600``, and editing ``app.js`` without
+    releasing a new version left that URL byte-identical as far as the browser was concerned. So the
+    host was serving the fix and the phone was running the old script — with a stale Library panel as
+    the visible symptom, which is exactly the class of bug that looks like a server bug.
+
+    The key is now :func:`tunebox.api.ui.build_id`, a digest of the shell's own bytes. The document is
+    still ``no-cache``, which is what makes a new build id reach the phone at all.
+    """
+
+    @staticmethod
+    def web_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """A writable copy of the shell, so a test can change an asset and ask what happens."""
+        root = tmp_path / "web"
+        shutil.copytree(ui.WEB_ROOT, root)
+        monkeypatch.setattr(ui, "WEB_ROOT", root)
+        return root
+
+    def test_the_page_asks_for_the_build_id_not_the_version(self, client: TestClient):
+        page = client.get("/").text
+        assert f"/ui/app.js?v={ui.build_id()}" in page
+        assert f"/ui/app.js?v={__version__}" not in page, (
+            "keying the cache on the version is the bug: it does not change when app.js does"
+        )
+
+    def test_the_worker_precaches_the_same_urls_the_page_requests(self, client: TestClient):
+        """Two spellings of the same asset would mean the worker caching a URL nobody asks for, so
+        the page would download it twice and never once from the cache."""
+        page = client.get("/").text
+        worker = client.get("/sw.js").text
+        assert "`/ui/app.js?v=${BUILD}`" in worker
+        assert f'BUILD = "{ui.build_id()}"' in worker
+        assert f"/ui/app.js?v={ui.build_id()}" in page
+
+    def test_the_cache_name_carries_it_too(self, client: TestClient):
+        """Otherwise the old precached copy survives `activate` and the worker serves it offline."""
+        worker = client.get("/sw.js").text
+        assert "tunebox-shell-${VERSION}-${BUILD}" in worker
+
+    def test_changing_an_asset_changes_the_build_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        root = self.web_copy(tmp_path, monkeypatch)
+        before = ui.build_id()
+        assert ui.build_id() == before, "it must be stable, or every restart re-downloads the shell"
+
+        script = root / "app.js"
+        script.write_text(script.read_text(encoding="utf-8") + "\n// one more line\n", encoding="utf-8")
+
+        assert ui.build_id() != before
+
+    def test_a_changed_asset_reaches_the_page(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: Config, store: JobStore
+    ):
+        """End to end, because this is the property that was broken: edit an asset, restart, and the
+        URL in the document is one no browser can have cached."""
+        root = self.web_copy(tmp_path, monkeypatch)
+        first = TestClient(build(config, store)).get("/").text
+
+        script = root / "app.js"
+        script.write_text(script.read_text(encoding="utf-8") + "\n// changed\n", encoding="utf-8")
+        second = TestClient(build(config, store)).get("/").text
+
+        asked = lambda page: re.findall(r"/ui/app\.js\?v=([0-9a-f]+)", page)  # noqa: E731
+        assert asked(first) and asked(second)
+        assert asked(first) != asked(second)
+
+    def test_the_version_is_still_what_the_footer_shows(self, client: TestClient):
+        """The build id is for caches; the version is what a person reads and reports a bug against."""
+        page = client.get("/").text
+        assert f'data-version="{__version__}"' in page
 
 
 class TestTheExemptionIsNarrow:
@@ -496,6 +573,146 @@ class TestAddCannotBeTappedTwice:
         assert re.search(r"finally \{\s*go\.disabled = false;", code), (
             "restoring it in `finally` is what survives an early return or a thrown error"
         )
+
+
+class TestDeleteAsksFirst:
+    """Delete in the Library panel — the only irreversible thing the remote can do.
+
+    A confirmation step is not optional here, and it is not optional for a reason that is about
+    thumbs rather than about principle: Play and Queue sit at the right-hand edge of every row, the
+    file this removes is the only irreplaceable state the system has (PLAN.md 3.1), and a backup is
+    the only undo. So the assertions below are mostly about how *far* Delete is from where a tap
+    lands: behind the row's ``⋯``, and then behind a button that names the track.
+    """
+
+    @staticmethod
+    def source() -> str:
+        """The body of ``libraryRow``, comments stripped — these tests are about order."""
+        code = TestTheAssetsThemselves.code("app.js")
+        start = code.index("function libraryRow(")
+        return code[start : code.index("\n  }", start)]
+
+    def test_delete_is_not_a_third_button_next_to_play(self):
+        """The row's own actions are Play and Queue. Delete is built into the confirm panel, which
+        ships hidden, so a mis-tap on a moving list cannot reach it."""
+        body = self.source()
+        assert 'button("Play"' in body and 'button("Queue"' in body
+        assert body.index("panel.hidden = true") < body.index('button("Delete"')
+        assert body.index('button("Queue"') < body.index("row-confirm")
+
+    def test_there_is_exactly_one_delete_button_in_the_page(self):
+        code = TestTheAssetsThemselves.code("app.js")
+        assert code.count('button("Delete"') == 1
+
+    def test_the_disclosure_is_announced(self):
+        """``⋯`` is not a label. Without ``aria-label`` and ``aria-expanded`` a screen reader gets
+        an unnamed button that changes nothing it can perceive."""
+        body = self.source()
+        assert 'more.setAttribute("aria-label"' in body
+        assert 'more.setAttribute("aria-expanded", "false")' in body
+        assert 'more.setAttribute("aria-controls", panel.id)' in body
+        assert "panel.id = `row-confirm-" in body, "aria-controls needs an id that resolves"
+
+    def test_the_confirmation_names_the_track_and_says_it_is_final(self):
+        """"Are you sure?" is a question nobody reads. The track's own title is what tells somebody
+        they are about to delete the wrong one."""
+        body = self.source()
+        warn = body[body.index('"row-warn"') : body.index("const actions")]
+        assert "${track.title}" in warn
+        assert "removed from the disk" in warn
+
+    def test_cancel_is_offered_beside_it(self):
+        body = self.source()
+        assert 'button("Cancel"' in body
+        assert body.index('button("Delete"') < body.index('button("Cancel"')
+
+    def test_it_is_not_a_native_confirm_dialog(self):
+        """A browser may suppress ``window.confirm``, and in an installed web app the modal looks
+        like the page has crashed. The confirmation is part of the row instead."""
+        code = TestTheAssetsThemselves.code("app.js")
+        assert "window.confirm" not in code
+        assert not re.search(r"(?<![.\w])confirm\(", code)
+
+    def test_the_request_is_a_body_not_a_path(self):
+        """``DELETE /library/{path}`` is the shape this deliberately is not: a library path holds
+        slashes and, in this household, CJK — and encoding one twice is how a delete names the wrong
+        file."""
+        code = TestTheAssetsThemselves.code("app.js")
+        assert 'api("/library", { method: "DELETE", body: { paths: [track.path] } })' in code
+        assert "`/library/" not in code
+
+    def test_both_halves_of_the_screen_are_redrawn_afterwards(self):
+        """The queue may have been holding the file that just disappeared, so the listing alone is
+        not enough — and the server is the only source of truth about playback."""
+        code = TestTheAssetsThemselves.code("app.js")
+        body = code[code.index("async function deleteTrack(") :]
+        assert "await loadLibrary()" in body
+        assert "await refreshPlayer()" in body
+
+
+class TestTheLibraryPanelDoesNotGoStale:
+    """The Library panel is re-read rather than cached once — the bug this class exists for.
+
+    Found in use, not in a test: after an ingest reached **done** in the Ingests list, the Library
+    panel still showed the library as it had been when the page was unlocked. The cause was a single
+    condition, ``if (name === "library" && !el("library").childElementCount) loadLibrary()``, and the
+    reason no assertion caught it is that both halves were individually reasonable — the guard avoided
+    a directory walk per tab switch, and the panel *was* loaded once at unlock. Its worst case was the
+    empty library, because ``fill()`` inserts an ``<li class="empty">`` placeholder that counts as a
+    child: the panel said "The library is empty — add something first", you added something, and it
+    went on saying so.
+
+    Reproduced and then verified in headless Chrome against a live ``tunebox serve`` with a fake
+    source: before the fix, two tracks on disk and "The library is empty" on screen through two tab
+    switches; after it, the track appears while the Library tab is open and untouched.
+    """
+
+    @staticmethod
+    def code() -> str:
+        return TestTheAssetsThemselves.code("app.js")
+
+    def test_selecting_the_tab_always_re_reads(self):
+        code = self.code()
+        assert 'if (name === "library") refreshLibrary();' in code
+        assert "childElementCount" not in code, (
+            "a listing drawn once is a listing that is wrong after the next ingest"
+        )
+
+    def test_a_finished_ingest_refreshes_it_without_a_tab_switch(self):
+        """Somebody watching the ingest finish should not have to know that the other panel needs
+        poking. ``refreshJobs`` already polls while anything is in flight, so this is free."""
+        code = self.code()
+        assert "noticeFinishedIngests(jobs)" in code
+        body = code[code.index("function noticeFinishedIngests(") :]
+        body = body[: body.index("\n  }")]
+        assert 'job.state === "done"' in body
+        assert "refreshLibrary()" in body
+
+    def test_the_first_poll_is_not_treated_as_news(self):
+        """Every past ingest is ``done`` on the first poll after unlocking. Reloading the library for
+        those would be a second, pointless walk on every page load."""
+        code = self.code()
+        body = code[code.index("function noticeFinishedIngests(") :]
+        body = body[: body.index("\n  }")]
+        assert "if (previous === null) return" in body
+        assert "finishedJobs: null" in code, "the sentinel has to start as null to be detectable"
+
+    def test_a_refresh_will_not_rebuild_the_list_under_an_open_delete_confirmation(self):
+        """The listing is newest-first, so an ingest landing mid-confirmation shifts every row down
+        by one — and the tap that was about to confirm a delete would land on the row that replaced
+        it. A deferred refresh costs a tab switch; a mis-aimed delete costs a file."""
+        code = self.code()
+        body = code[code.index("function refreshLibrary(") :]
+        body = body[: body.index("\n  }")]
+        assert '.row-confirm:not([hidden])' in body
+        assert "return" in body
+
+    def test_the_delete_path_redraws_directly(self):
+        """``deleteTrack`` calls ``loadLibrary`` rather than ``refreshLibrary``: the confirmation
+        panel that would block the guard is the one belonging to the row just deleted."""
+        code = self.code()
+        body = code[code.index("async function deleteTrack(") :]
+        assert "await loadLibrary()" in body
 
 
 class TestTheScriptsParse:

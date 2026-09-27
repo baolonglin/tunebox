@@ -28,14 +28,24 @@ so blocking a native submission costs nothing, and it means a broken script cann
 token into a URL — and therefore into uvicorn's access log — by falling back to a GET of the
 enclosing page.
 
-**Templated once, at startup.** Three placeholders are substituted — the version (which busts the
-phone's cache and names the service worker's cache) and two facts about where OwnTone's own web UI
-can be found. Doing it when the app is built rather than per request means the shell costs one
-dictionary lookup to serve, which is what a Raspberry Pi should spend on a static file.
+**Templated once, at startup.** Four placeholders are substituted — the version (displayed in the
+footer), the **build id** (which busts the phone's cache and names the service worker's cache) and
+two facts about where OwnTone's own web UI can be found. Doing it when the app is built rather than
+per request means the shell costs one dictionary lookup to serve, which is what a Raspberry Pi
+should spend on a static file.
+
+**The build id is a digest of the assets, not the version** — see :func:`build_id`. The version is
+what a release is called; the build id is what the *bytes* are, and the phone's cache has to be keyed
+on the bytes. Keying it on `__version__` was a bug found in use: an upgrade that edited ``app.js``
+without releasing a new version left every browser that had loaded the page in the previous hour
+running the old script, because ``/ui/app.js?v=0.1.0`` was still the same URL and still inside its
+``max-age``. The document itself is never cached (``no-cache`` below), so a new build id always
+reaches the phone on the next load, and it then asks for a URL it cannot have cached.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -157,12 +167,38 @@ def render(name: str, config: Config, *, cache_control: str) -> Asset:
 def _substitutions(config: Config) -> dict[str, str]:
     return {
         "__TUNEBOX_VERSION__": __version__,
+        # What the phone's cache is keyed on. See build_id, and the module docstring for the bug.
+        "__TUNEBOX_BUILD__": build_id(),
         # Empty is the normal answer and not a missing setting: the player is on loopback, so the
         # only address that could work for a phone is the one the phone used to reach *us*, which
         # only the browser knows. See Config.owntone_ui_link.
         "__OWNTONE_URL__": config.owntone_ui_link,
         "__PLAYER_PORT__": str(config.player_port),
     }
+
+
+def build_id() -> str:
+    """Short digest of the shell's own bytes, plus the version. The cache key for ``/ui/*``.
+
+    Content-addressed rather than version-addressed, because the thing a browser must not keep is a
+    *file* it no longer matches — and `__version__` does not change when a file does. Two properties
+    make it usable as a cache key:
+
+    * **Deterministic**, so two workers, a restart and an upgraded copy of the same code all serve the
+      same URL. Nothing per-process (a start timestamp, ``os.urandom``) would be, and a build id that
+      changed on every restart would re-download the shell for no reason.
+    * **Computed from the raw files**, before templating, so substituting it into them cannot change
+      it. The digest covers every shell asset rather than only the two that carry it, which means a
+      redrawn icon also bumps it — cheap, and the alternative is deciding which changes "count".
+
+    Eight hex characters: this keys a browser cache on a home network, not a content-addressed store,
+    and the failure mode of a collision is one stale reload rather than a wrong file.
+    """
+    digest = hashlib.sha256(__version__.encode("utf-8"))
+    for name in sorted({*ROOT_ASSETS.values(), *UI_ASSETS}):
+        digest.update(name.encode("utf-8"))
+        digest.update((WEB_ROOT / name).read_bytes())
+    return digest.hexdigest()[:8]
 
 
 def load_assets(config: Config) -> dict[str, Asset]:

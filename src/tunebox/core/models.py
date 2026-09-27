@@ -235,6 +235,27 @@ class LibraryTrack:
 
 
 @dataclass(frozen=True)
+class DeletedTrack:
+    """What one delete removed: the track, and the directories it left empty behind it.
+
+    ``removed_directories`` is reported rather than merely done, because it is the part nobody
+    asked for: deleting the last track in ``Artist/Singles/`` removes two directories, and a UI
+    that said "1 track deleted" while three things disappeared from OwnTone's browse view would be
+    hiding the interesting half. Both spellings are **relative** to the music root, for the same
+    reason as :attr:`LibraryTrack.path`.
+    """
+
+    path: str
+    removed_directories: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "removed_directories": list(self.removed_directories),
+        }
+
+
+@dataclass(frozen=True)
 class LibraryPage:
     """A page of :class:`LibraryTrack`, plus how much of the library it is speaking for.
 

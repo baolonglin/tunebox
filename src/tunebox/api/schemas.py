@@ -225,3 +225,30 @@ class LibraryView(BaseModel):
     total: int = 0
     #: The walk hit its file ceiling and stopped; the answer is incomplete, not merely paged.
     truncated: bool = False
+
+
+class LibraryDeleteRequest(BaseModel):
+    """``DELETE /library`` body — the only destructive request tunebox accepts.
+
+    A body rather than a path parameter, and the same ``{"paths": [...]}`` shape as
+    ``POST /player/queue``: a library path contains slashes and, in this household, CJK, and putting
+    one through URL encoding twice to build ``DELETE /library/{path}`` is how a delete ends up
+    naming the wrong file. It also makes "delete these three" one request that either resolves
+    entirely or changes nothing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    paths: list[str] = Field(min_length=1, max_length=100)
+
+
+class LibraryDeletedView(BaseModel):
+    """What was removed. Paths are relative to the music root, as everywhere else."""
+
+    deleted: list[str] = Field(default_factory=list)
+    #: Directories that emptied as a result and were removed — reported because they are visible in
+    #: OwnTone's browse view even though ``GET /library`` never showed them.
+    removed_directories: list[str] = Field(default_factory=list)
+    #: Non-fatal problems, currently only "the player could not be told to re-index". The file is
+    #: gone either way, which is why this is a field and not a status code.
+    warnings: list[str] = Field(default_factory=list)

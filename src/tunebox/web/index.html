@@ -28,8 +28,9 @@
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/ui/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="/ui/icon-180.png" />
-    <!-- ?v= so a tunebox upgrade cannot be served a cached script by the phone or the worker. -->
-    <link rel="stylesheet" href="/ui/app.css?v=__TUNEBOX_VERSION__" />
+    <!-- ?v= is the *build id* (a digest of these assets), not the version: a phone must stop using
+         a file when the file changes, and the version does not change every time one does. -->
+    <link rel="stylesheet" href="/ui/app.css?v=__TUNEBOX_BUILD__" />
   </head>
   <body
     data-version="__TUNEBOX_VERSION__"
@@ -229,6 +230,6 @@
       constants the page needs are `data-` attributes on <body> above; neither is a secret, since
       OwnTone announces itself over mDNS to the whole house anyway.
     -->
-    <script src="/ui/app.js?v=__TUNEBOX_VERSION__" defer></script>
+    <script src="/ui/app.js?v=__TUNEBOX_BUILD__" defer></script>
   </body>
 </html>

@@ -53,57 +53,49 @@ PLAN.md 3.1, alongside the gapless note the mirroring transport already rewrote.
 
 ---
 
-## Delete from the library
+## Delete from the library — **done, 2026-09-27**
 
-The Library panel offers **Play** (replace the queue and start) and **Queue** (append). It should
-also offer **Delete**, because the remote is currently a one-way door: a mistagged ingest, a wrong
-search result or a duplicate can be added from the phone and then only removed by finding a terminal.
+The Library panel offered **Play** (replace the queue and start) and **Queue** (append) and nothing
+else, so the remote was a one-way door: a mistagged ingest, a wrong search result or a duplicate could
+be added from the phone and then only removed by finding a terminal.
 
-- [ ] **Delete a track from the library** — from the Library panel, and over the API.
+- [x] **Delete a track from the library** — from the Library panel, and over the API.
 
-This is the first destructive operation tunebox would expose, and the thing it destroys is the only
-irreplaceable state the system has (PLAN.md Phase 5: the music tree is what `tunebox backup` exists
-for, and `--prune` is opt-in precisely because *"the accident a home backup most often has to survive
-is somebody deleting an album"*). So it carries decisions, not just code — see the questions below,
-and whatever is decided belongs in PLAN.md as well as here.
+`DELETE /library` with `{"paths": [...]}`, `library.delete_track`, and a confirmation strip behind
+each row's `⋯`. This is the first destructive operation tunebox exposes and the thing it destroys is
+the only irreplaceable state the system has, so all five open questions were decisions; they are
+recorded in PLAN.md Phase 4 as well as here, and in the README under *Deleting from the library*.
 
-What already exists and should not be rebuilt:
+**What was decided:**
 
-- **Path confinement.** `library.resolve_track_path` is already the only way a request body may name
-  a file: it reduces an absolute path to the relative form first, refuses `..` and symlinks that
-  leave the root, and rejects a non-audio extension. A delete route must go through it and must not
-  grow its own path handling.
-- **Ingest history needs no bookkeeping.** `jobs/store.py` has `forget_track`, and a history entry
-  whose file has disappeared is already dropped rather than blocking a re-ingest (PLAN.md Phase 2).
-  So deleting a file leaves re-ingesting it working, with no extra step. Calling `forget_track`
-  eagerly is tidier but not load-bearing.
-- **The rescan hook.** `player/hooks.py` already tells OwnTone to re-index after an ingest and is
-  built so it *cannot* fail the operation. A delete needs the same call for the same reason, and the
-  same indifference to the daemon being down — the file is gone either way.
+1. **Hard delete, no trash.** The backup is the undo. Which makes this and `TUNEBOX_BACKUP_PRUNE`
+   related in a way nothing previously said out loud — with prune on there is no undo left — so both
+   the README's backup section and its env-var table now say so, as does PLAN.md Phase 5.
+2. **Empty parents are pruned**, upward, stopping at the music root and only while genuinely empty —
+   `rmdir` failing *is* the emptiness check, so a parallel ingest writing into the directory between
+   a check and a remove cannot lose files. A root holding nothing else survives, and a directory with
+   a `cover.jpg` in it does too. Both are tests.
+3. **Playing or queued:** the track the daemon has *loaded* is a `409`; anything further down the
+   queue is deleted, because OwnTone discovers a missing file on its next `LOAD` and refusing for the
+   whole queue would make a queued album undeletable. A daemon that cannot be asked does not block the
+   delete — if it is not answering, it is not playing — which is the same indifference the rescan hook
+   already had.
+4. **Route shape as proposed:** a body, not a wildcard path parameter, and all-or-nothing. Every path
+   is resolved through `library.resolve_track_path` before anything is unlinked, so a typo in the
+   third entry costs nothing; two spellings of one file are one delete rather than a `400` about a
+   file the same request just removed.
+5. **Confirmation in the UI, not in the API**, and not as a third button beside Play: `⋯` on the row,
+   then a strip naming the track. No `window.confirm` — a browser may suppress it, and in an installed
+   web app the modal reads as a crash. No CLI verb, as planned.
 
-Open questions, each of which changes the code:
+Reused rather than rebuilt, as intended: `resolve_track_path` for every path, `player/hooks.rescan_library`
+for the "tell OwnTone but never fail because of it" call, and nothing new in the jobs database —
+`store.forget_path` drops the history row eagerly, but the worker already treated an entry whose file
+had vanished as no entry at all, so re-ingesting a deleted track worked either way.
 
-1. **Hard delete, or trash?** A hard `unlink` is honest and one line. A move into a dot-directory
-   under the music root would be recoverable from the phone and is invisible to `list_tracks`
-   already (dot-directories are skipped), but it is then inside the tree `tunebox backup` mirrors, so
-   deleted music keeps occupying the backup disk until something expires it. Leaning hard delete,
-   *because* the backup is the undo — but only while `TUNEBOX_BACKUP_PRUNE` is off, which makes the
-   two settings related in a way nothing currently says out loud.
-2. **Prune empty directories?** Deleting the last track leaves `Artist/Singles/` behind. Empty
-   directories are invisible in `GET /library` (it walks files) but visible in OwnTone's browse view,
-   so they accumulate as phantom artists. Removing empty parents upward, stopping at the music root
-   and only when genuinely empty, is the obvious answer and needs a test that a root containing
-   nothing else survives.
-3. **What if it is playing, or in the queue?** Deleting the file under the daemon's feet is the
-   interesting case. Refusing while it is the current track is the conservative option; skipping the
-   check and letting OwnTone discover a missing file on its next `LOAD` is the simpler one. Either
-   way, decide it rather than discover it.
-4. **Route shape.** `DELETE /library` with `{"paths": [...]}` matches `POST /player/queue`'s
-   all-or-nothing body and avoids putting a CJK path with slashes in it through URL encoding twice.
-   Not a forwarding route, and not a `DELETE` that takes a wildcard path parameter.
-5. **A confirmation step in the UI is not optional.** Delete must not be a third button sitting next
-   to Play where a thumb lands on a phone. No CLI verb is needed: from a terminal, `rm` is the tool,
-   and `tunebox` has no `library` command group today.
+Not verified by a test, because it cannot be: what OwnTone actually does if the file under the
+*current* track disappears anyway — the `409` is there so nobody finds out by accident, but the
+daemon's behaviour on a mid-song `ENOENT` is unmeasured. Tests 1056 → 1120.
 
 ---
 
@@ -175,9 +167,11 @@ enqueueable as if they were tracks — no code needed to exclude them. And the r
 3. **Concurrent edits.** Two phones editing one playlist is last-write-wins. Read-modify-write
    through `library.place`'s atomic replace is enough at one household's scale; say so rather than
    leaving it unstated.
-4. **Interaction with library delete** (previous item): deleting a track leaves a dangling entry.
-   OwnTone simply does not resolve it, so nothing breaks, but a playlist that silently shrinks is
-   worth either pruning on delete or reporting.
+4. **Interaction with library delete** (previous item, now implemented): deleting a track will leave a
+   dangling entry in any playlist that names it. OwnTone simply does not resolve it, so nothing breaks,
+   but a playlist that silently shrinks is worth either pruning on delete or reporting — and the place
+   to do it is `DELETE /library`, which already returns the directories it removed and could return the
+   playlists it left holes in.
 5. **`POST /api/queue/save` is a tempting one-tap "save this queue as a playlist"** and it is the one
    feature that genuinely needs the config flip. Worth it only if the flip is accepted; tunebox can
    produce the same result by writing the file from `Player.queue()` instead, with no flip at all.

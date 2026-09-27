@@ -41,6 +41,7 @@ ROUTES = (
     ("GET", "/healthz", "/healthz"),
     ("GET", "/search", "/search?q=x"),
     ("GET", "/library", "/library"),
+    ("DELETE", "/library", "/library"),
     ("POST", "/ingest", "/ingest"),
     ("GET", "/jobs", "/jobs"),
     ("GET", "/jobs/{job_id}", "/jobs/abc123"),

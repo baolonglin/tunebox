@@ -108,6 +108,7 @@ reachable from outside the house (PLAN.md 3.2).
 | `GET /jobs?state=…&limit=…` | recent jobs, newest first |
 | `DELETE /jobs/{id}` | cancel a job that has not started (`409` once it is running) |
 | `GET /library?q=…&limit=…` | music files under the music root, newest first, paths relative to it |
+| `DELETE /library` | delete tracks — `{"paths": [...]}`, all-or-nothing, and there is no trash |
 | `GET /player` | transport state, volume, now playing, queue and outputs, in one response |
 | `PUT /player/play`&nbsp;`pause`&nbsp;`toggle`&nbsp;`stop`&nbsp;`next`&nbsp;`previous` | transport; each answers with the new state |
 | `PUT /player/volume` | `{"volume": 0–100}` or `{"step": ±n}`, exactly one |
@@ -279,7 +280,10 @@ Three panels:
   is queued straight away, anything else is searched. Below it, every ingest with its progress,
   cancel while queued, and **Play** the moment it finishes.
 - **Library** — everything under the music root, newest first, with a filter. Play replaces the queue
-  and starts; Queue appends.
+  and starts; Queue appends. **⋯** on a row opens a confirmation strip that names the track and then
+  deletes it — see below, because that one is not undoable from the phone. The listing is re-read
+  whenever you open the tab and whenever an ingest finishes, so a track that says "done" above is
+  already here.
 
 The footer links to **OwnTone's own web UI** for browsing by artist and album, playlists and artwork
 — the expensive half of a music UI, which OwnTone already has and tunebox does not rebuild. The link
@@ -304,6 +308,51 @@ curl -s -H "X-Tunebox-Token: $T" -H 'Content-Type: application/json' \
 finished job reports; either way the path is rebuilt and re-checked against the music root, so no
 request body can name a file outside the library. A path outside it is `400`, not `500`.
 
+### Deleting from the library
+
+```bash
+curl -s -X DELETE -H "X-Tunebox-Token: $T" -H 'Content-Type: application/json' \
+     -d '{"paths":["Kraftwerk/Singles/Autobahn (Single version 1974).m4a"]}' \
+     http://127.0.0.1:8080/library
+# -> {"deleted":["Kraftwerk/Singles/Autobahn (Single version 1974).m4a"],
+#     "removed_directories":["Kraftwerk/Singles","Kraftwerk"],"warnings":[]}
+```
+
+**This unlinks the file. There is no trash directory, and the remote cannot put it back** — the
+backup is the undo, which is why `TUNEBOX_BACKUP_PRUNE` is off by default and why the two settings
+belong together in your head: with pruning on, tonight's backup forgets the track too.
+
+Details worth knowing before you point it at an album:
+
+- **Directories that empty are removed with it**, upward, stopping at the music root and only while
+  they are genuinely empty — a stray `cover.jpg` is enough to keep one. They are reported in
+  `removed_directories`. Without this, deleting the last track of an artist leaves a directory that
+  `GET /library` never shows (it walks files) and OwnTone's browse view does, as a phantom artist.
+- **The track the player currently has loaded is refused with `409`.** Skip past it or stop, then
+  delete. Tracks further down the queue are deleted without complaint: OwnTone finds out on its next
+  load, and a queue is not a claim on the library.
+- **All-or-nothing.** Every path is resolved before anything is unlinked, so a typo in the third entry
+  is a `400` that deleted nothing. The same path is accepted in either spelling, and naming one file
+  twice is one delete.
+- **OwnTone is told to re-index afterwards**, and a daemon that is down cannot fail the delete — the
+  file is gone either way, so it comes back as a string in `warnings`.
+- There is no CLI verb for this: on the host, `rm` is the tool. The API exists because a phone has no
+  terminal, which is the whole reason the remote was a one-way door before it.
+
+In the Library panel this lives behind the row's **⋯** and then behind a button naming the track,
+deliberately not as a third button beside Play — the two live where a thumb lands.
+
+### After an upgrade, one reload
+
+`./deploy/install.sh` restarts the service, and the page picks up the new version on its next load —
+including a home-screen icon, which does a fresh navigation when you reopen it. Nothing has to be
+cleared by hand: the document, the manifest and the service worker are served `no-cache`, and
+`/ui/app.js` and `/ui/app.css` are requested with `?v=<build id>`, where the build id is a digest of
+those files rather than the release version. Change an asset and the URL changes with it, so a browser
+cannot be holding a stale copy of it — which is a real trap rather than a hypothetical: keying the
+query on `__version__` meant an upgrade between releases left phones running the previous script for
+an hour while the host served the new one.
+
 ### What is and is not exposed
 
 The **app shell** — `/`, `/sw.js`, `/manifest.webmanifest` and `/ui/*` — is the only thing served
@@ -319,10 +368,14 @@ Some deliberate absences, each with a test:
   from a network it trusts, so a route that forwarded arbitrary paths would hand every caller the
   daemon's whole API — including one that switches *off* every speaker absent from its argument.
   What the remote may do is the fourteen routes listed above, all of them through the `Player` port.
+- **There is no `DELETE /library/{path}`**, and the one destructive route takes no shortcuts with the
+  path it is given: it goes through the same resolver `POST /player/queue` uses, so traversal, a
+  symlink out of the tree and a non-audio file are all refused there rather than filtered here. The
+  confirmation for it lives in the UI, where somebody is holding the phone; an API that asked twice
+  would be a protocol every client eventually skips.
 - **Nothing on the page is fetched from the internet** — no CDN, no font, and deliberately not
   YouTube's search thumbnails. A remote that loaded images from Google on every search would make
-  the house's own music browser phone home once per keystroke.
-- **No inline script and no cookies**, which is what lets the page be served under
+  the house's own music browser phone home once per keystroke.- **No inline script and no cookies**, which is what lets the page be served under
   `default-src 'none'; script-src 'self'` with no `unsafe-inline`. `form-action 'none'` is there so
   that a broken script cannot fall back to a native form submission and put the token in a URL.
 - **The service worker caches the shell and does not intercept API requests at all.** A cached
@@ -511,7 +564,9 @@ still working.
 
 `--delete` is **opt-in** (`--prune`, or `TUNEBOX_BACKUP_PRUNE=1`). The accident a home backup most
 often has to survive is somebody deleting an album, and `--delete` propagates exactly that within a
-day. The live SQLite queue is excluded and a consistent snapshot sent in its place — copying an open
+day — which is now more than a hypothetical, because the remote can delete tracks
+([Deleting from the library](#deleting-from-the-library)) and this mirror is the only undo it has.
+The live SQLite queue is excluded and a consistent snapshot sent in its place — copying an open
 WAL-mode database byte-wise is how a backup that restores into a corrupt database gets made. A
 destination on the same filesystem as the library is allowed and warned about: it protects against an
 accidental delete and does nothing whatsoever about the disk dying.
@@ -661,7 +716,7 @@ night, not a test.
 | `TUNEBOX_YTDLP_CHANNEL` | `stable` | or `nightly` (pip `--pre`); nightly is for while extraction is broken |
 | `TUNEBOX_AUTO_UPDATE` | `1` | `0` makes `tunebox maintain` a pure health check and never touches the venv |
 | `TUNEBOX_BACKUP_DEST` | — | **set this.** A path on another disk, or anything rsync understands (`pi@nas:/srv/music`) |
-| `TUNEBOX_BACKUP_PRUNE` | `0` | let the backup delete what the library no longer has; off, so a deleted album survives |
+| `TUNEBOX_BACKUP_PRUNE` | `0` | let the backup delete what the library no longer has; off, so a deleted album survives — and so the backup stays the undo for `DELETE /library` |
 | `TUNEBOX_BACKUP_MAX_AGE_HOURS` | `48` | older than this and the health check fails. Two days, so one failed night does not page anybody |
 | `TUNEBOX_MIN_FREE_GB` | `5` | free space on the music volume below which the health check fails; half of it warns |
 | `TUNEBOX_ALERT_COMMAND` | — | argv (split with `shlex`, no shell); gets the JSON report on stdin and the subject last |

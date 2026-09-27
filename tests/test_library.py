@@ -300,3 +300,163 @@ def test_a_symlink_out_of_the_library_is_refused(tmp_path: Path):
 
     with pytest.raises(LibraryError):
         library.resolve_track_path(root, "link.m4a")
+
+
+# ------------------------------------------------------------------ deleting a track
+#
+# The only destructive thing in the project, on the only irreplaceable state in the system. Two
+# groups of properties matter: that it deletes the file it was asked for and nothing else, and that
+# a *client-supplied* path cannot make it delete something outside the library — which is the same
+# requirement as queueing, and is met the same way, by going through ``resolve_track_path``.
+
+
+def test_delete_track_removes_the_file(tmp_path: Path):
+    path = track(tmp_path, "Kraftwerk/3-D Der Katalog/Das Model.m4a")
+
+    record = library.delete_track(tmp_path, "Kraftwerk/3-D Der Katalog/Das Model.m4a")
+
+    assert not path.exists()
+    assert record.path == "Kraftwerk/3-D Der Katalog/Das Model.m4a"
+
+
+def test_delete_track_accepts_the_absolute_path_a_job_reports(tmp_path: Path):
+    path = track(tmp_path, "Kraftwerk/Singles/Autobahn.m4a")
+    record = library.delete_track(tmp_path, str(path))
+    assert not path.exists()
+    assert record.path == "Kraftwerk/Singles/Autobahn.m4a"  # never an absolute path back
+
+
+def test_deleting_the_last_track_takes_the_empty_directories_with_it(tmp_path: Path):
+    """Empty directories are invisible in ``GET /library`` (it walks files) and visible in OwnTone's
+    browse view, so leaving them behind accumulates phantom artists."""
+    track(tmp_path, "Kraftwerk/Singles/Autobahn.m4a")
+
+    record = library.delete_track(tmp_path, "Kraftwerk/Singles/Autobahn.m4a")
+
+    assert record.removed_directories == ("Kraftwerk/Singles", "Kraftwerk")
+    assert not (tmp_path / "Kraftwerk").exists()
+
+
+def test_a_directory_with_another_track_in_it_survives(tmp_path: Path):
+    track(tmp_path, "Kraftwerk/Singles/Autobahn.m4a")
+    track(tmp_path, "Kraftwerk/Singles/The Model.m4a")
+
+    record = library.delete_track(tmp_path, "Kraftwerk/Singles/Autobahn.m4a")
+
+    assert record.removed_directories == ()
+    assert (tmp_path / "Kraftwerk" / "Singles" / "The Model.m4a").exists()
+
+
+def test_pruning_stops_at_the_album_when_the_artist_has_another(tmp_path: Path):
+    track(tmp_path, "Kraftwerk/Singles/Autobahn.m4a")
+    track(tmp_path, "Kraftwerk/3-D Der Katalog/Das Model.m4a")
+
+    record = library.delete_track(tmp_path, "Kraftwerk/Singles/Autobahn.m4a")
+
+    assert record.removed_directories == ("Kraftwerk/Singles",)
+    assert (tmp_path / "Kraftwerk").is_dir()
+
+
+def test_a_directory_holding_a_non_audio_file_is_left_alone(tmp_path: Path):
+    """``cover.jpg`` beside the last track is not nothing, and guessing that it is deletable is how
+    a delete of one track removes artwork somebody scanned."""
+    track(tmp_path, "Kraftwerk/Singles/Autobahn.m4a")
+    track(tmp_path, "Kraftwerk/Singles/cover.jpg")
+
+    record = library.delete_track(tmp_path, "Kraftwerk/Singles/Autobahn.m4a")
+
+    assert record.removed_directories == ()
+    assert (tmp_path / "Kraftwerk" / "Singles" / "cover.jpg").exists()
+
+
+def test_a_root_holding_nothing_else_survives(tmp_path: Path):
+    """The root is what OwnTone is configured to watch, and an empty library is a state ``tunebox
+    serve`` is allowed to be in — so the prune must stop there even when there is nothing left."""
+    root = tmp_path / "music"
+    track(root, "Autobahn.m4a")
+
+    record = library.delete_track(root, "Autobahn.m4a")
+
+    assert record.removed_directories == ()
+    assert root.is_dir()
+    assert list(root.iterdir()) == []
+
+
+def test_pruning_can_be_turned_off(tmp_path: Path):
+    track(tmp_path, "Kraftwerk/Singles/Autobahn.m4a")
+    record = library.delete_track(tmp_path, "Kraftwerk/Singles/Autobahn.m4a", prune=False)
+    assert record.removed_directories == ()
+    assert (tmp_path / "Kraftwerk" / "Singles").is_dir()
+
+
+def test_it_is_a_hard_delete_with_no_trash_directory(tmp_path: Path):
+    """Decided rather than defaulted: a dot-directory under the root would be recoverable from the
+    phone, but it sits inside the tree ``tunebox backup`` mirrors, so deleted music would occupy the
+    backup disk indefinitely. The backup is the undo instead — see PLAN.md Phase 5."""
+    track(tmp_path, "Kraftwerk/Singles/Autobahn.m4a")
+
+    library.delete_track(tmp_path, "Kraftwerk/Singles/Autobahn.m4a")
+
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.parametrize(
+    "given",
+    [
+        "../../../etc/passwd",
+        "Kraftwerk/../../outside.m4a",
+        "/etc/passwd",
+        "..\\..\\outside.m4a",
+        "",
+        "   ",
+    ],
+)
+def test_delete_track_refuses_a_path_outside_the_root(tmp_path: Path, given: str):
+    root = tmp_path / "music"
+    root.mkdir()
+    outside = tmp_path / "outside.m4a"
+    outside.write_bytes(b"audio")
+
+    with pytest.raises(LibraryError):
+        library.delete_track(root, given)
+
+    assert outside.exists()
+
+
+def test_delete_track_refuses_a_non_music_file(tmp_path: Path):
+    """The queue database lives under the music root, so "delete a file by path" must not be a way
+    to remove it."""
+    path = track(tmp_path, f"{STATE_DIRNAME}/jobs.db")
+    with pytest.raises(LibraryError):
+        library.delete_track(tmp_path, f"{STATE_DIRNAME}/jobs.db")
+    assert path.exists()
+
+
+def test_delete_track_refuses_a_symlink_that_leaves_the_library(tmp_path: Path):
+    outside = tmp_path / "outside" / "secret.m4a"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"x")
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "link.m4a").symlink_to(outside)
+
+    with pytest.raises(LibraryError):
+        library.delete_track(root, "link.m4a")
+
+    assert outside.exists()
+    assert (root / "link.m4a").is_symlink()
+
+
+def test_delete_track_refuses_a_file_that_is_not_there(tmp_path: Path):
+    with pytest.raises(LibraryError):
+        library.delete_track(tmp_path, "A/Singles/ghost.m4a")
+
+
+def test_a_deleted_track_is_gone_from_the_listing(tmp_path: Path):
+    """The two halves of the library agreeing is the whole point of both walking the filesystem."""
+    track(tmp_path, "A/Singles/one.m4a")
+    track(tmp_path, "A/Singles/two.m4a")
+
+    library.delete_track(tmp_path, "A/Singles/one.m4a")
+
+    assert [t.title for t in library.list_tracks(tmp_path).tracks] == ["two"]

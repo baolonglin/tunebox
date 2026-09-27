@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from tunebox import library
 from tunebox.config import Config
 from tunebox.jobs.store import JobStore
 
@@ -99,6 +100,7 @@ ROUTES = (
     ("POST", "/player/queue"),
     ("DELETE", "/player/queue"),
     ("GET", "/library"),
+    ("DELETE", "/library"),
 )
 
 
@@ -490,8 +492,215 @@ class TestLibraryRoute:
         assert TestClient(app).get("/library", headers=AUTH).json()["truncated"] is True
 
 
-# --------------------------------------------------- the round trip Phase 4 promises
+class TestLibraryDelete:
+    """``DELETE /library`` — the only destructive route, on the only irreplaceable state.
 
+    The remote is otherwise a one-way door: a mistagged ingest or a wrong search result can be added
+    from a phone and then only removed by finding a terminal. What that buys has to be paid for with
+    the properties below — chiefly that a path from a client cannot name anything outside the music
+    root, which is the same requirement ``POST /player/queue`` has and is met the same way.
+    """
+
+    def delete(self, client: TestClient, paths, **kwargs):
+        return client.request("DELETE", "/library", headers=AUTH, json={"paths": paths}, **kwargs)
+
+    def test_it_deletes_the_file(self, client: TestClient, config: Config):
+        path = add_track(config, AUTOBAHN)
+
+        response = self.delete(client, [AUTOBAHN])
+
+        assert response.status_code == 200
+        assert response.json()["deleted"] == [AUTOBAHN]
+        assert not path.exists()
+
+    def test_the_listing_agrees_immediately(self, client: TestClient, config: Config):
+        add_track(config, AUTOBAHN)
+        add_track(config, MODEL)
+
+        self.delete(client, [AUTOBAHN])
+
+        body = client.get("/library", headers=AUTH).json()
+        assert [t["path"] for t in body["tracks"]] == [MODEL]
+        assert body["total"] == 1
+
+    def test_the_absolute_path_a_job_reports_is_accepted(
+        self, client: TestClient, config: Config
+    ):
+        """``GET /jobs`` hands out the absolute path the ingest wrote, and the remote sends back
+        whatever it was given."""
+        absolute = add_track(config, AUTOBAHN)
+        assert self.delete(client, [str(absolute)]).status_code == 200
+        assert not absolute.exists()
+
+    def test_emptied_directories_are_removed_and_reported(
+        self, client: TestClient, config: Config
+    ):
+        """They are invisible in ``GET /library`` and visible in OwnTone's browse view, so leaving
+        them behind would accumulate phantom artists that only the daemon shows."""
+        add_track(config, AUTOBAHN)
+
+        body = self.delete(client, [AUTOBAHN]).json()
+
+        assert body["removed_directories"] == ["Kraftwerk/Singles", "Kraftwerk"]
+        assert not (config.music_root / "Kraftwerk").exists()
+        assert config.music_root.is_dir()
+
+    def test_several_at_once(self, client: TestClient, config: Config):
+        add_track(config, AUTOBAHN)
+        add_track(config, MODEL)
+
+        body = self.delete(client, [AUTOBAHN, MODEL]).json()
+
+        assert sorted(body["deleted"]) == sorted([AUTOBAHN, MODEL])
+        assert library.list_tracks(config.music_root).total == 0
+
+    def test_two_spellings_of_one_file_are_one_delete(self, client: TestClient, config: Config):
+        """Otherwise the second entry would be a 400 about a file the first entry had just removed,
+        and the request would report failure having done exactly what was asked."""
+        absolute = add_track(config, AUTOBAHN)
+
+        response = self.delete(client, [AUTOBAHN, str(absolute)])
+
+        assert response.status_code == 200
+        assert response.json()["deleted"] == [AUTOBAHN]
+
+    def test_the_player_is_told_to_re_index(
+        self, client: TestClient, player: FakePlayer, config: Config
+    ):
+        """Same hook as after an ingest, for the same reason: the daemon's index is the only other
+        place that thinks this file exists."""
+        add_track(config, AUTOBAHN)
+        before = player.rescans
+
+        assert self.delete(client, [AUTOBAHN]).json()["warnings"] == []
+        assert player.rescans == before + 1
+
+    def test_a_dead_daemon_does_not_block_a_delete(
+        self, client: TestClient, player: FakePlayer, config: Config
+    ):
+        """The file is on our disk, not OwnTone's. A rescan that cannot happen is a warning, never
+        a failure — the same rule the ingest hook follows."""
+        path = add_track(config, AUTOBAHN)
+        player.unavailable = True
+
+        response = self.delete(client, [AUTOBAHN])
+
+        assert response.status_code == 200
+        assert not path.exists()
+        assert response.json()["warnings"] != []
+
+    def test_the_loaded_track_is_refused(
+        self, client: TestClient, player: FakePlayer, config: Config
+    ):
+        """Pulling the file out from under the daemon mid-song is the one case with an audible
+        failure mode, so it is a 409 and not a surprise."""
+        path = add_track(config, AUTOBAHN)
+        player.enqueue_paths([path], start=True)
+
+        response = self.delete(client, [AUTOBAHN])
+
+        assert response.status_code == 409
+        assert path.exists()
+
+    def test_a_later_queue_entry_is_not_refused(
+        self, client: TestClient, player: FakePlayer, config: Config
+    ):
+        """A queue is not a claim on the library: OwnTone discovers a missing file on its next
+        ``LOAD``, and refusing here would make a queued album undeletable."""
+        loaded = add_track(config, AUTOBAHN)
+        queued = add_track(config, MODEL)
+        player.enqueue_paths([loaded, queued], start=True)
+
+        assert self.delete(client, [MODEL]).status_code == 200
+        assert not queued.exists()
+
+    def test_one_bad_path_deletes_nothing(
+        self, client: TestClient, player: FakePlayer, config: Config
+    ):
+        """All-or-nothing, like ``POST /player/queue``: every path is resolved before any file is
+        unlinked, so a typo in the second entry cannot cost the first track."""
+        first = add_track(config, AUTOBAHN)
+
+        response = self.delete(client, [AUTOBAHN, "../escape.m4a"])
+
+        assert response.status_code == 400
+        assert first.exists()
+
+    def test_a_refusal_deletes_nothing_either(
+        self, client: TestClient, player: FakePlayer, config: Config
+    ):
+        loaded = add_track(config, AUTOBAHN)
+        other = add_track(config, MODEL)
+        player.enqueue_paths([loaded], start=True)
+
+        assert self.delete(client, [MODEL, AUTOBAHN]).status_code == 409
+        assert other.exists()
+
+    def test_the_ingest_history_stops_pointing_at_it(
+        self, client: TestClient, store: JobStore, config: Config
+    ):
+        """So that re-ingesting the video downloads it again rather than being deduped against a
+        file that is not there. The worker survives a stale entry anyway; this is the tidy half."""
+        absolute = add_track(config, AUTOBAHN)
+        store.record_track(video_id="vid00000001", path=str(absolute), title="Autobahn")
+        assert store.find_track("vid00000001") is not None
+
+        self.delete(client, [AUTOBAHN])
+
+        assert store.find_track("vid00000001") is None
+
+    @pytest.mark.parametrize(
+        "given",
+        [
+            "../../../etc/passwd",
+            "Kraftwerk/../../escape.m4a",
+            "/etc/passwd",
+            "..\\..\\windows\\system32\\config\\sam",
+            "",
+            "   ",
+        ],
+    )
+    def test_a_path_outside_the_library_is_a_400(self, client: TestClient, given: str):
+        assert self.delete(client, [given]).status_code == 400, given
+
+    def test_a_non_music_file_in_the_library_is_a_400(self, client: TestClient, config: Config):
+        """The queue database lives under the music root, so this must not be a way to remove it."""
+        add_track(config, "notes.txt")
+        assert self.delete(client, ["notes.txt"]).status_code == 400
+        assert (config.music_root / "notes.txt").exists()
+
+    def test_a_missing_file_is_a_400_not_a_500(self, client: TestClient):
+        assert self.delete(client, ["A/Singles/ghost.m4a"]).status_code == 400
+
+    def test_a_directory_cannot_be_deleted(self, client: TestClient, config: Config):
+        add_track(config, AUTOBAHN)
+        assert self.delete(client, ["Kraftwerk"]).status_code == 400
+        assert (config.music_root / "Kraftwerk").is_dir()
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"paths": []},
+            {"paths": ["a.m4a"] * 101},
+            {"paths": "not-a-list"},
+            {},
+            {"paths": ["a.m4a"], "prune": False},
+        ],
+    )
+    def test_a_malformed_body_is_a_422(self, client: TestClient, payload: dict):
+        assert client.request("DELETE", "/library", headers=AUTH, json=payload).status_code == 422
+
+    def test_there_is_no_wildcard_path_route(self, client: TestClient, config: Config):
+        """``DELETE /library/{path:path}`` is the shape this is deliberately not: a library path
+        holds slashes and CJK, and URL-encoding one twice is how a delete names the wrong file."""
+        add_track(config, AUTOBAHN)
+        assert client.request(
+            "DELETE", f"/library/{AUTOBAHN}", headers=AUTH
+        ).status_code in (404, 405)
+        assert (config.music_root / AUTOBAHN).exists()
+
+
+# --------------------------------------------------- the round trip Phase 4 promises
 
 def test_ingest_then_play_it(client: TestClient, player: FakePlayer, config: Config):
     """The whole Phase 4 loop, minus yt-dlp: the library lists a track, the remote sends its

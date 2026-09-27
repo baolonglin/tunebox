@@ -370,6 +370,21 @@ class TestDedupe:
         store.forget_track("vid00000001")
         assert store.find_track("vid00000001") is None
 
+    def test_forgetting_by_path_is_what_a_library_delete_has(self, store: JobStore):
+        """``DELETE /library`` knows the file it removed, not the video that produced it."""
+        store.record_track(video_id="vid00000001", path="/music/A/Singles/T.m4a")
+        store.record_track(video_id="vid00000002", path="/music/A/Singles/U.m4a")
+
+        assert store.forget_path("/music/A/Singles/T.m4a") == 1
+
+        assert store.find_track("vid00000001") is None
+        assert store.find_track("vid00000002") is not None
+
+    def test_forgetting_a_path_that_was_never_recorded_is_not_an_error(self, store: JobStore):
+        """Most of the library arrived by ingest, but a file somebody copied in has no history
+        entry, and deleting it must not be a failure."""
+        assert store.forget_path("/music/A/Singles/copied-in-by-hand.m4a") == 0
+
 
 class TestRecovery:
     def test_a_job_left_running_by_a_crash_is_requeued(self, store: JobStore):

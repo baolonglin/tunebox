@@ -370,6 +370,8 @@ form.card {
   display: flex;
   align-items: center;
   gap: 0.6rem;
+  /* So a row can carry a second line below its buttons — see `.row-confirm`. */
+  flex-wrap: wrap;
 }
 
 .list li.current {
@@ -402,6 +404,35 @@ form.card {
 .row-actions button {
   padding: 0 0.6rem;
   font-size: 0.85rem;
+}
+
+/*
+ * The delete confirmation, on its own row below the track it is about (`flex-basis: 100%`, the same
+ * trick the token reveal uses in the footer).
+ *
+ * Delete is deliberately *not* a third button beside Play and Queue: those two are where a thumb
+ * lands, the operation is irreversible, and the thing it destroys is the only irreplaceable state in
+ * the system. It sits behind the row's `⋯` and then behind a button that says what it will remove.
+ */
+.row-confirm {
+  flex-basis: 100%;
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.row-warn {
+  margin: 0;
+  flex: 1;
+  min-width: 11rem;
+  font-size: 0.82rem;
+  color: var(--danger);
+  overflow-wrap: anywhere;
 }
 
 .empty {
