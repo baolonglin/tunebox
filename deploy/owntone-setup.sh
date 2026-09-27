@@ -72,12 +72,40 @@ done
 
 [ -f "$ENV_FILE" ] || die "no tunebox config at $ENV_FILE — run deploy/install.sh first"
 
-env_value() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -1; }
+# The env file is read by `set -a; . tunebox.env` in the service wrapper, so a value is shell source
+# code, not a string. A speaker called "Living Room speaker" written bare becomes the command `Room`
+# with an argument, the source fails, and because the wrapper runs under `set -e` it exits *before*
+# exec'ing tunebox — a service that never starts and a supervisor that restart-loops it. Quote.
+shell_quote() {
+  # Single quotes: everything inside is literal, which is what a name somebody typed into the Google
+  # Home app needs. An embedded quote gets the usual '\'' dance.
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# The inverse, for values this script reads back. Not `eval`: the value is quoted *by* us but the
+# file is hand-editable, and a stray backtick in a speaker name should stay a backtick.
+# Bare values are returned untouched, so a file written before quoting existed still reads.
+unquote() {
+  local v="$1"
+  case "$v" in
+    "'"*"'")
+      v="${v#\'}"; v="${v%\'}"
+      v="$(printf '%s' "$v" | sed "s/'\\\\''/'/g")"
+      ;;
+    '"'*'"')
+      v="${v#\"}"; v="${v%\"}"
+      ;;
+  esac
+  printf '%s' "$v"
+}
+
+env_value() { unquote "$(sed -n "s/^$1=//p" "$ENV_FILE" | tail -1)"; }
 
 set_env() {
-  local key="$1" value="$2"
+  local key="$1" value="$2" quoted
+  quoted="$(shell_quote "$value")"
   if [ "$DRY_RUN" = 1 ]; then
-    info "${DIM}[dry-run]${N} would set $key=$value in $ENV_FILE"
+    info "${DIM}[dry-run]${N} would set $key=$quoted in $ENV_FILE"
     return
   fi
   local tmp; tmp="$(mktemp "${ENV_FILE}.XXXXXX")"
@@ -85,7 +113,7 @@ set_env() {
   # Drop both the live key and the commented placeholder the installer wrote, so re-running does not
   # leave two contradictory-looking lines in a file people read.
   grep -v -e "^${key}=" -e "^#${key}=" "$ENV_FILE" >"$tmp" || true
-  printf '%s=%s\n' "$key" "$value" >>"$tmp"
+  printf '%s=%s\n' "$key" "$quoted" >>"$tmp"
   mv "$tmp" "$ENV_FILE"
   info "set $key in $ENV_FILE"
 }

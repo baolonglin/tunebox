@@ -462,6 +462,30 @@ form.card {
   align-items: center;
 }
 
+/* The revealed token. `flex-basis: 100%` puts it on its own row below the footer's other items, so
+   a 43-character string does not squeeze the links on a narrow phone. */
+.token-reveal {
+  flex-basis: 100%;
+  margin: 0.4rem 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.token-reveal code {
+  /* `user-select: all` makes one long-press select the whole token rather than a word of it, which
+     is the entire point of showing it. `break-all` because it has no spaces to wrap at. */
+  user-select: all;
+  -webkit-user-select: all;
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  background: var(--surface-2);
+}
+
 /* Respect a user who has asked for less motion; the progress bar is the only thing that animates. */
 @media (prefers-reduced-motion: reduce) {
   * {

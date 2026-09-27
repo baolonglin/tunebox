@@ -76,6 +76,51 @@ DEFAULT_OUTPUT_CHECK_INTERVAL = 15.0
 #: thread for minutes. The answer is truncated and says so rather than being slow.
 DEFAULT_LIBRARY_MAX_FILES = 50_000
 
+# ------------------------------------------------------------------ Phase 5: hardening
+
+#: The canary video. "Me at the zoo" — the first video ever uploaded to YouTube, 19 seconds long.
+#: Chosen for the two properties a canary needs and nothing else: it is *tiny*, so a daily download
+#: costs nothing, and it is the least likely video on the platform to be deleted, region-locked or
+#: made members-only. A canary that fails because the video went away teaches nothing and trains
+#: whoever reads the alert to ignore it.
+DEFAULT_CANARY_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+
+#: Below this, whatever came back is not audio. The real failure mode this catches is a "successful"
+#: download of an error page: yt-dlp exits 0 far less often than one would hope, but ffmpeg happily
+#: produces a 0-byte container, and a canary that only checked the exit code would pass.
+CANARY_MIN_BYTES = 8 * 1024
+
+#: yt-dlp's two release channels. ``nightly`` is what PLAN.md 3.3 suggests ("nightly channel"), but
+#: ``stable`` is the default here: the canary makes an update safe, it does not make it free, and a
+#: household that is not currently broken by a YouTube change gains nothing from being a day ahead.
+#: ``TUNEBOX_YTDLP_CHANNEL=nightly`` is the right setting *while* extraction is broken.
+YTDLP_CHANNELS = ("stable", "nightly")
+
+#: Free space on the music volume below which the health check fails (PLAN.md 3.3, "disk-space
+#: alarm on the music volume"). Absolute rather than a percentage because the number that matters is
+#: "can the next album be written", and 5 GiB is roughly a hundred of them at the AAC default.
+DEFAULT_MIN_FREE_GB = 5.0
+
+#: How stale a backup may get before the health check complains. Two days, not one: a nightly
+#: backup that fails once must not page anybody, and one that has failed twice must.
+DEFAULT_BACKUP_MAX_AGE_HOURS = 48.0
+
+#: How often the *same* ongoing failure is re-alerted. Alerting on every run turns a broken
+#: extractor into a stream of identical messages that get filtered, which is worse than not
+#: alerting; alerting only on the transition risks the one alert being missed.
+DEFAULT_ALERT_REPEAT_HOURS = 24.0
+
+#: Where the ops state (known-good yt-dlp version, last backup, last alert) and the health log live.
+#: Both under :data:`STATE_DIRNAME` next to the job database, for the reason that directory exists
+#: at all: the music volume is the one filesystem a deployment definitely has, and under systemd the
+#: music root is the only path this service may write to.
+OPS_STATE_FILENAME = "ops.json"
+HEALTH_LOG_FILENAME = "health.jsonl"
+
+#: The health log is rotated at this size, keeping one previous generation. PLAN.md 3.3 asks for
+#: "structured logs, retained" — retained, not unbounded, because this runs on an SD card.
+DEFAULT_HEALTH_LOG_MAX_BYTES = 1_000_000
+
 
 def binds_every_interface(host: str) -> bool:
     """Would binding ``host`` expose the service on every interface, including the router-facing
@@ -146,6 +191,24 @@ def _env_bool(env: Mapping[str, str], key: str, default: bool = False) -> bool:
     if value in ("0", "false", "no", "off"):
         return False
     raise ConfigError(f"{key} must be a boolean (1/0, true/false), got {raw!r}")
+
+
+#: Spellings of "I have thought about backups and do not want one". Accepted as values of
+#: ``TUNEBOX_BACKUP_DEST`` so that "no backup" can be *said* rather than merely left unsaid — see
+#: :attr:`Config.backup_optional` for why the two have to be different states.
+_NO_BACKUP_VALUES = frozenset({"none", "no", "off", "disabled", "false", "0"})
+
+
+def _backup_dest(env: Mapping[str, str]) -> str | None:
+    """The backup destination, with the "no thank you" spellings resolved to ``None``.
+
+    A path is returned as given — not resolved or expanded here, because it may be an rsync remote
+    spec (``pi@nas:/srv/music``) that no filesystem operation should be applied to.
+    """
+    raw = (env.get("TUNEBOX_BACKUP_DEST") or "").strip()
+    if not raw or raw.lower() in _NO_BACKUP_VALUES:
+        return None
+    return raw
 
 
 def resolve_ytdlp_command(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
@@ -269,6 +332,44 @@ class Config:
     #: Ceiling on the directory walk behind ``GET /library``.
     library_max_files: int = DEFAULT_LIBRARY_MAX_FILES
 
+    # ------------------------------------------------ Phase 5: keeping it alive
+    #: The video the canary ingest downloads. See :data:`DEFAULT_CANARY_URL` for why this one.
+    canary_url: str = DEFAULT_CANARY_URL
+    #: Which yt-dlp release channel ``tunebox update`` upgrades to: ``stable`` or ``nightly``.
+    ytdlp_channel: str = "stable"
+    #: Whether ``tunebox maintain`` is allowed to change the installed yt-dlp at all. Off makes the
+    #: nightly job a pure health check, which is the right setting on a host where the venv is
+    #: managed by something else (a container image, Nix, a distribution package).
+    auto_update: bool = True
+    #: Where ``tunebox backup`` mirrors the library: a local path, or anything rsync understands
+    #: (``user@host:/path``). Unset means no backup, which the health check reports rather than
+    #: silently accepting — the library is the only irreplaceable state in the system.
+    backup_dest: str | None = None
+    #: Deliberately *not* backing up — ``TUNEBOX_BACKUP_DEST=none``. This exists because of what the
+    #: alternative costs: with no destination set, the health check **fails**, because a system whose
+    #: only irreplaceable state has no copy is not in a healthy state, and reporting it as a mere
+    #: warning made the nightly job green forever on a host with no backup at all (found by an audit
+    #: of Phase 5). But nagging daily about a deliberate choice is the alert fatigue this module is
+    #: built to avoid, so there has to be a way to say "I know" — and it has to be a *different*
+    #: value from "unset", or it would be indistinguishable from never having read the message.
+    backup_optional: bool = False
+    #: Let the backup delete files the source no longer has. **Off by default**, and that is a
+    #: safety decision rather than a default-for-the-sake-of-one: the accident a backup most often
+    #: has to survive is somebody deleting an album, and ``--delete`` propagates exactly that.
+    backup_prune: bool = False
+    backup_max_age_hours: float = DEFAULT_BACKUP_MAX_AGE_HOURS
+    #: Free space on the music volume below which the health check fails, in GiB.
+    min_free_gb: float = DEFAULT_MIN_FREE_GB
+    #: Command line run when the health check fails, given the JSON report on stdin and a one-line
+    #: subject as its last argument. Split with :mod:`shlex`, executed as an argv list, never a
+    #: shell string (PLAN.md 3.2) — so a pipeline has to be written as ``sh -c '...'`` deliberately.
+    alert_command: str | None = None
+    #: URL to POST the JSON report to. ``repr=False``: a Slack or ntfy webhook *is* a credential.
+    alert_webhook: str | None = field(default=None, repr=False)
+    #: How often an unchanged failure is re-alerted. See :data:`DEFAULT_ALERT_REPEAT_HOURS`.
+    alert_repeat_hours: float = DEFAULT_ALERT_REPEAT_HOURS
+    health_log_max_bytes: int = DEFAULT_HEALTH_LOG_MAX_BYTES
+
     def __post_init__(self) -> None:
         if self.audio_format not in SUPPORTED_FORMATS:
             raise ConfigError(
@@ -302,6 +403,26 @@ class Config:
             raise ConfigError(f"output volume must be 0-100, got {self.output_volume}")
         if self.library_max_files < 1:
             raise ConfigError(f"library max files must be at least 1, got {self.library_max_files}")
+        if self.ytdlp_channel not in YTDLP_CHANNELS:
+            raise ConfigError(
+                f"unknown yt-dlp channel {self.ytdlp_channel!r}; "
+                f"expected one of {', '.join(YTDLP_CHANNELS)}"
+            )
+        if self.min_free_gb < 0:
+            raise ConfigError(f"minimum free space must not be negative, got {self.min_free_gb}")
+        if self.backup_max_age_hours <= 0:
+            raise ConfigError("backup max age must be positive")
+        if self.alert_repeat_hours < 0:
+            raise ConfigError("alert repeat interval must not be negative (0 means every run)")
+        if self.health_log_max_bytes < 0:
+            raise ConfigError("health log size limit must not be negative (0 disables the log)")
+        if self.alert_webhook is not None:
+            scheme = self.alert_webhook.split("://", 1)[0].lower()
+            if scheme not in ("http", "https"):
+                raise ConfigError(
+                    "alert webhook must start with http:// or https://, got "
+                    f"{self.alert_webhook!r}"
+                )
         if self.owntone_ui_url is not None:
             scheme = self.owntone_ui_url.split("://", 1)[0].lower()
             if scheme not in ("http", "https"):
@@ -359,9 +480,40 @@ class Config:
         return self.music_root / SCRATCH_DIRNAME
 
     @property
+    def state_dir(self) -> Path:
+        """Where tunebox keeps the state that is not audio: the queue, the ops state, the log.
+
+        Inside the music root on purpose, and it is the same reason :data:`SCRATCH_DIRNAME` is:
+        under the systemd unit the installer writes, the music root is the *only* path this service
+        is allowed to write to (``ProtectSystem=strict`` plus one ``ReadWritePaths``). State
+        somewhere tidier would be state the hardened service cannot save.
+        """
+        return self.music_root / STATE_DIRNAME
+
+    @property
     def database_path(self) -> Path:
         """SQLite file for jobs and ingest history. Tracks live on the filesystem (PLAN.md 3.1)."""
-        return self.db_path or self.music_root / STATE_DIRNAME / DB_FILENAME
+        return self.db_path or self.state_dir / DB_FILENAME
+
+    @property
+    def ops_state_path(self) -> Path:
+        """Known-good yt-dlp version, last backup, last alert. See :mod:`tunebox.ops.state`."""
+        return self.state_dir / OPS_STATE_FILENAME
+
+    @property
+    def health_log_path(self) -> Path:
+        """One JSON object per health check, appended. PLAN.md 3.3's "structured logs, retained"."""
+        return self.state_dir / HEALTH_LOG_FILENAME
+
+    @property
+    def canary_dir(self) -> Path:
+        """Scratch space for the canary download, thrown away after every run.
+
+        Under the scratch root rather than ``/tmp`` because ``/tmp`` is not guaranteed writable by
+        the hardened unit, and because a canary that fails for a reason unrelated to YouTube is a
+        canary nobody trusts.
+        """
+        return self.scratch_root / "canary"
 
     def retry_delay(self, attempts: int) -> float:
         """Backoff before attempt ``attempts + 1``: exponential, capped, never negative."""
@@ -449,5 +601,25 @@ class Config:
             owntone_ui_url=(env.get("TUNEBOX_OWNTONE_UI") or "").strip() or None,
             library_max_files=_env_int(
                 env, "TUNEBOX_LIBRARY_MAX_FILES", DEFAULT_LIBRARY_MAX_FILES
+            ),
+            canary_url=(env.get("TUNEBOX_CANARY_URL") or DEFAULT_CANARY_URL).strip(),
+            ytdlp_channel=(env.get("TUNEBOX_YTDLP_CHANNEL") or "stable").strip().lower(),
+            auto_update=_env_bool(env, "TUNEBOX_AUTO_UPDATE", True),
+            backup_dest=_backup_dest(env),
+            backup_optional=(env.get("TUNEBOX_BACKUP_DEST") or "").strip().lower()
+            in _NO_BACKUP_VALUES,
+
+            backup_prune=_env_bool(env, "TUNEBOX_BACKUP_PRUNE", False),
+            backup_max_age_hours=_env_float(
+                env, "TUNEBOX_BACKUP_MAX_AGE_HOURS", DEFAULT_BACKUP_MAX_AGE_HOURS
+            ),
+            min_free_gb=_env_float(env, "TUNEBOX_MIN_FREE_GB", DEFAULT_MIN_FREE_GB),
+            alert_command=(env.get("TUNEBOX_ALERT_COMMAND") or "").strip() or None,
+            alert_webhook=(env.get("TUNEBOX_ALERT_WEBHOOK") or "").strip() or None,
+            alert_repeat_hours=_env_float(
+                env, "TUNEBOX_ALERT_REPEAT_HOURS", DEFAULT_ALERT_REPEAT_HOURS
+            ),
+            health_log_max_bytes=_env_int(
+                env, "TUNEBOX_HEALTH_LOG_MAX_BYTES", DEFAULT_HEALTH_LOG_MAX_BYTES
             ),
         )

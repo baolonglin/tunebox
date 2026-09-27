@@ -647,6 +647,39 @@
     link.href = url;
     link.target = "_blank";
     el("btn-forget").addEventListener("click", () => forgetToken("Token removed from this device."));
+    wireTokenReveal();
+  }
+
+  /**
+   * "Show token" — the one-time bridge to a home-screen icon.
+   *
+   * Adding this page to the home screen cannot bring the token with it: `tokenFromFragment` strips
+   * it from the address bar the moment it reads it, so the captured URL has none, and iOS gives an
+   * installed web app its own storage container, so `readStoredToken` finds nothing either. The
+   * alternative to revealing it here is telling somebody to go and read tunebox.env on the machine
+   * in the cupboard.
+   *
+   * Hidden by default and cleared out of the DOM again on hide, so it is on screen only while
+   * somebody is deliberately looking at it.
+   */
+  function wireTokenReveal() {
+    const button = el("btn-show-token");
+    const panel = el("token-reveal");
+    const text = el("token-text");
+    button.addEventListener("click", () => {
+      const showing = !panel.hidden;
+      if (showing) {
+        panel.hidden = true;
+        // Emptied rather than merely hidden: a token sitting in the DOM is a token in the next
+        // screenshot of an inspector, and nothing needs it there.
+        text.textContent = "";
+      } else {
+        text.textContent = state.token || "";
+        panel.hidden = false;
+      }
+      button.textContent = showing ? "Show token" : "Hide token";
+      button.setAttribute("aria-expanded", String(!showing));
+    });
   }
 
   function registerWorker() {

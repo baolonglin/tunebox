@@ -1011,13 +1011,91 @@ unreachable without it — an icon on a phone needs something that is always run
   severity.
 
 **Phase 5 — Hardening**
-- [ ] Confirm nothing is bound to a public interface and no port is forwarded. *(Partly done by
-      Phase 4.5: the installer reads the LAN address off the default route and there is no code path
-      in it that can produce a wildcard bind, which `tests/test_deploy.py` asserts. The router side —
-      no port forwarding, no UPnP — is still unverified.)*
-- [ ] yt-dlp auto-update + canary + rollback.
-- [ ] Daily health-check ingest, alerting, backups of the music volume.
-- [ ] SSD-failure story: the music library is the only irreplaceable state.
+- [x] Confirm nothing is bound to a public interface and no port is forwarded. `tunebox exposure`
+      answers all three halves of the question and keeps them apart: the **configuration** (already
+      enforced at startup), the **kernel's socket table** (which is what catches a listener nobody
+      configured — the config and reality can disagree), and the **router**, over UPnP IGD.
+      Measured on this network: LAN bind, no wildcard listener, and the router (`RT-AX58U-6A00`)
+      reports one UDP mapping, to a set-top box at `.83`, and none to this host. The command is
+      **read-only by construction** — it calls `GetGenericPortMappingEntry`, `GetExternalIPAddress`
+      and nothing else, never `AddPortMapping` and specifically never `DeletePortMapping`, because a
+      forwarding rule is shared household infrastructure that may be somebody's console, and an
+      audit tool that silently rearranged the router would be more dangerous than what it audits.
+      A test asserts that (`test_it_never_changes_the_router`).
+- [x] yt-dlp auto-update + canary + rollback. `tunebox update`. The design decision worth recording
+      is that **the canary runs twice, before and after**, because the obvious "update, canary, roll
+      back on failure" is wrong in the case that matters most: when extraction is *already* broken,
+      the post-update canary also fails, and the obvious logic then reverts the release that was the
+      fix — leaving the house silent and having thrown away the cure. So four outcomes, all tested:
+      pass→pass keeps it, pass→**fail** rolls back *and re-canaries to prove the rollback worked*,
+      **fail**→pass is reported as a recovery, and **fail**→**fail** keeps the *new* version (the
+      old one is no better, and the next yt-dlp fix will be built on the newer extractor). A version
+      whose canary failed is remembered, or a bad release is installed and reverted again every
+      night forever. Refuses to `pip install` outside a virtualenv — on Debian that is PEP 668 and a
+      way to break `apt`.
+- [x] Daily health-check ingest, alerting, backups of the music volume. One command, `tunebox
+      maintain`, on one launchd agent / systemd timer, because the order matters and a scheduler
+      cannot express it (update before the day's canary, backup after both) and one bad night should
+      produce one alert. The canary **downloads media on purpose**: a metadata-only check would have
+      passed on the very host where 0.3 measured every media request answering 403, and it checks
+      the bytes and ffprobe's duration rather than the exit code, because yt-dlp and ffmpeg can
+      produce an empty container and exit 0. Alerting is throttled — transition, then at most once a
+      day, plus a recovery notice — because an identical message every night is a message that gets
+      filtered, and the filter is still there when something new breaks.
+- [x] SSD-failure story: the music library is the only irreplaceable state. `tunebox backup` mirrors
+      it with rsync and then **verifies by asking rsync again** (a second `--dry-run
+      --itemize-changes` pass with nothing left to send is a fact; "rsync exited 0" is not).
+      `--delete` is **opt-in**, because the accident a home backup most often has to survive is
+      somebody deleting an album. The live SQLite queue is excluded and a consistent snapshot sent
+      in its place — copying an open WAL database byte-wise is how a backup that restores into a
+      corrupt database is made. And the half that is normally never executed until the day it must
+      work, `tunebox restore`, exists, is a **dry run by default**, never passes `--delete`, and is
+      tested against real rsync on both directions.
+- **Two real bugs were found by running this on the actual hardware rather than by reading it.**
+  Both are the same shape — a platform difference that no amount of unit testing would surface.
+  First, macOS now ships **openrsync**, which announces itself as "rsync version 2.6.9 compatible"
+  and prints `Number of files transferred` where rsync 3.x (Debian, so the Pi) prints `Number of
+  **regular** files transferred`; matching only the modern wording reported "no files transferred"
+  for every backup on the development host. Second, `subprocess(text=True)` **crashed** on this
+  library: rsync does not promise UTF-8 output, and the CJK artist directories (`陳奕迅 Eason
+  Chan`) produced a `UnicodeDecodeError` on a tree rsync itself had copied perfectly. Every
+  subprocess in `ops/` now decodes with `errors="replace"`.
+- **What is verified, measured on this host:** a real canary download (309 156 bytes of "Me at the
+  zoo", ffprobe 19.06 s against the 19 s the metadata promised, 17.6 s wall clock); the health check
+  reporting disk, library, queue and `OwnTone 29.3` with the speaker selected; a real backup of the
+  live library including CJK paths, its verification pass, its staleness status and a restore dry
+  run; `tunebox update --dry-run` recording `known_good = 2026.08.19` after a passing canary; and
+  the UPnP audit against the real router. The installer's Linux timer path is exercised the same way
+  Phase 4.5 does it — shims on `PATH`, asserting `Persistent=true` (a Pi is unplugged, so a missed
+  nightly job must run at boot), `WantedBy=timers.target`, and that `ReadWritePaths` is wider than
+  the service's by the venv — pip has to be able to install into it and the long-running service must
+  not be able to rewrite its own code — plus the backup destination when that is local, each as a
+  separate *quoted* directive, because systemd splits an unquoted value on whitespace and "Backup
+  Disk" is an ordinary name for an external disk. 804 → 1056 tests; `pyflakes` clean,
+  `shellcheck` clean at `--severity=style`.
+- **An independent audit of this phase found four things worth recording, because each was a case of
+  code that would have behaved *quietly* wrongly.** (1) `tunebox backup --dest ~/Music` for a library
+  at `~/Music/tunebox` — a plausible typo — passed the safety checks, and with `--prune` rsync then
+  deleted every other file in `~/Music` **and the library itself**, because the library is inside the
+  tree being emptied. Reproduced, then guarded, then regression-tested with a sibling file that must
+  survive. (2) A failed `pip install` reported success on the grounds that "extraction still works",
+  which meant a host whose updater could never run stayed green forever — the exact failure shape this
+  phase exists to prevent. It is now a failure whose message says which half is broken. (3) An
+  unconfigured backup destination was a *warning*, so a system whose only irreplaceable state had no
+  copy anywhere reported itself healthy; it now fails, with `TUNEBOX_BACKUP_DEST=none` as the way to
+  say "I know" — because nagging daily about a deliberate choice is the alert fatigue this module is
+  built to avoid, and "unset" must not be spellable as "acknowledged". (4) The canary used one fixed
+  directory, so a hand-run `healthcheck` overlapping the nightly job could delete the other's download
+  — and inside `update` that spurious failure would roll back and blocklist a *good* release.
+- **What is *not* verified, stated plainly:** no rollback has ever been triggered by a real bad
+  yt-dlp release — the rollback path is exercised on every test run against a fake pip, which proves
+  the logic and not the packaging. Nothing has run on a Pi. The alert channels are tested through
+  injected transports, so "does `terminal-notifier` actually appear on this Mac" and "does that ntfy
+  topic arrive on the phone" are unanswered. `Persistent=true` and `StartCalendarInterval` have not
+  been observed *firing* — that takes a night, not a test. And the router half remains only as
+  trustworthy as UPnP: a rule typed in by hand on the admin page is invisible to it, which is why
+  the command always prints the two checks a human still has to do rather than claiming the question
+  is closed.
 
 **Phase 6 — Optional**
 - [ ] Navidrome alongside OwnTone over the same folder, if a native Subsonic client with
@@ -1033,13 +1111,13 @@ unreachable without it — an icon on a phone needs something that is always run
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Extraction breaks after a YouTube change | High | Nightly updates, canary, daily health check, rollback |
+| Extraction breaks after a YouTube change | High | ~~Planned~~ **Implemented in Phase 5**: `tunebox maintain` nightly — update, canary before *and* after, rollback on a regression (re-canaried to prove it worked), alert on failure. The canary downloads *media*, because 0.3 measured metadata extraction working perfectly while every media request answered 403 |
 | Rate limiting / bot challenge | Low–Medium | Home IP by design, sleep intervals, concurrency 1–2, caching |
 | iOS PWA background audio is inadequate | High (for Alt A) | Chose Alt B specifically to avoid this |
 | Poor tags make the library unusable | Medium | `--parse-metadata` rules, optional MusicBrainz, manual fix path |
 | **OwnTone can't drive the SN9YG reliably** | ~~Medium~~ **Resolved** | **The Phase 0 spike answered it on hardware 2026-09-27: it can.** Plays, honours volume, advances its own queue. What it cannot do is put a title on the display — tracked as its own row below |
 | Host is a single point of failure for all listening | Medium–High | Higher than before: the host now holds the playback session, so it must be genuinely always-on. Not a laptop |
-| SD-card or SSD failure loses the library | Medium | Library on USB SSD not SD; periodic backup. Tracks are re-ingestable but tags and playlists are not |
+| SD-card or SSD failure loses the library | Medium | ~~Periodic backup~~ **Implemented in Phase 5**: `tunebox backup` mirrors the tree with rsync and verifies it by asking rsync again; `--delete` is opt-in so a deleted album survives; the live SQLite queue is replaced by a consistent snapshot; and `tunebox restore` — the half usually never executed until it must work — exists, is a dry run by default, and is tested. Still true that tracks are re-ingestable and tags are not, which is *why* |
 | Soundbar can't play the file | ~~Low~~ **Resolved** | AAC/m4a verified playing on the device 2026-09-26. Opus still untested; AAC is the default so it does not matter unless we change it — **and OwnTone transcodes to Opus for Cast anyway, so the soundbar's Opus decoder is in fact exercised on every play** |
 | **Soundbar display shows filenames instead of track names** | ~~Medium~~ **Certain, on the OwnTone path** | Worse than predicted: it shows *nothing*, not filenames. OwnTone's Cast output is screen-mirroring and carries no media metadata at all (measured: zero `LOAD`s, `title: ""`). Unfixable from outside OwnTone. **Only fallback A can fix it**, by sending `MusicTrackMediaMetadata` ourselves — which is why the `Player` port exists |
 | **The host transcodes on every play** | **New, Certain** | Not foreseen: OwnTone re-encodes AAC → Opus 128 kbps/48 kHz for Cast, so 3.1's "a Pi does no transcoding" is true of ingest only. One Opus encode of one stereo stream is within a Pi 4's budget, but it is no longer free, and it is a second lossy generation |

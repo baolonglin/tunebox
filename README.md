@@ -20,8 +20,8 @@ and carries no track metadata. See [PLAN.md](PLAN.md) Phase 0.
 | a JavaScript runtime | with `yt-dlp-ejs`, required for YouTube signature deciphering — **without one, downloads fail with HTTP 403**. `deno` is best; `node` 22+, `quickjs` and `bun` also work |
 | [OwnTone](https://owntone.github.io/owntone-server/) 29+, built `--enable-chromecast` | playback only. Ingest works fine without it |
 
-`yt-dlp`, `yt-dlp-ejs`, `mutagen`, `fastapi` and `uvicorn` are pinned Python dependencies and
-install with the project. `deploy/install.sh` installs the rest.
+`yt-dlp`, `yt-dlp-ejs`, `mutagen`, `fastapi`, `uvicorn` and `segno` are pinned Python dependencies
+and install with the project. `deploy/install.sh` installs the rest.
 
 **On the JavaScript runtime.** yt-dlp enables only `deno` by default, and there is no official deno
 build for 32-bit ARM — so on a 32-bit Raspberry Pi that default means *no* runtime and every download
@@ -239,15 +239,35 @@ One page, served by the API at `/`. Open `http://<host>:8080/` on the phone, pas
 and use the browser's **Add to Home Screen** — from then on it is an icon that opens straight into
 the app, with no address bar.
 
+Nobody should be thumb-typing a 43-character token, so `tunebox pair` prints the link as a QR code.
+Point the phone's camera at it and the paste never happens. `deploy/install.sh` shows the same code
+at the end of a successful install.
+
 ```bash
-# Paste-once shortcut: the token in the URL *fragment*.
-echo "http://192.168.50.10:8080/#token=$TUNEBOX_TOKEN"
+tunebox pair            # QR code, plus the link underneath it
+tunebox pair --no-qr    # just the link, for AirDrop or a password manager
 ```
 
-The fragment specifically, never `?token=`: a fragment is not sent to the server, so the shared
-secret stays out of uvicorn's access log — which is the audit trail worth having on a home network
-(PLAN.md 3.2). The page removes it from the address bar as soon as it has read it and keeps it in
-`localStorage`; **Forget token** in the footer removes it again.
+Both refuse to write to anything but a terminal — the code and the link are each the credential
+itself, and redirecting a command into a log file is a normal thing to do. `--force` overrides it.
+
+**Adding it to the home screen needs the token once more, and that is not a bug.** The page strips
+the token from the address bar the moment it reads it, so the shortcut captures a clean `/`; and iOS
+gives an installed web app its own storage container, so it cannot see what Safari stored. The
+installed icon therefore starts at the token gate. **Show token** in the footer reveals it as
+selectable text while you are unlocked in Safari — long-press, copy, open the icon, paste, once per
+device. The gate input is `type="password"` with `autocomplete="current-password"`, so a password
+manager fills it instead if you have one.
+
+On Android the shortcut is only ever a shortcut: `http://` on a LAN address is not a secure context,
+so Chrome will not install it as a standalone app and `navigator.serviceWorker` does not exist, which
+costs the offline cache and nothing else. A real HTTPS origin — Tailscale is the clean route — is the
+only fix.
+
+The token travels in the URL fragment, never `?token=`: a fragment is not sent to the server, so the
+shared secret stays out of uvicorn's access log — which is the audit trail worth having on a home
+network (PLAN.md 3.2). The page removes it from the address bar as soon as it has read it and keeps
+it in `localStorage`; **Forget token** in the footer removes it again.
 
 Three panels:
 
@@ -337,10 +357,14 @@ What it creates:
 |---|---|
 | `~/.local/share/tunebox/venv` | the venv; `pip install`ed from the checkout, not editable, so the clone can be deleted afterwards |
 | `~/.local/share/tunebox/bin/tunebox-serve` | wrapper that loads the env file and execs `tunebox serve` |
+| `~/.local/share/tunebox/bin/tunebox-maintain` | the same, for the nightly `tunebox maintain` |
 | `~/.config/tunebox/tunebox.env` | the configuration, mode 600 in a mode 700 directory |
 | `~/Music/tunebox` | the library, unless `--music-root` says otherwise |
+| `~/Music/tunebox/.tunebox/` | queue database, ops state (`ops.json`), health log (`health.jsonl`) |
 | `~/Library/LaunchAgents/io.tunebox.serve.plist` *(macOS)* | starts at login, restarts on failure |
+| `~/Library/LaunchAgents/io.tunebox.maintain.plist` *(macOS)* | nightly at 04:17; `RunAtLoad` is false |
 | `/etc/systemd/system/tunebox.service` *(Linux)* | starts at boot, restarts on failure |
+| `/etc/systemd/system/tunebox-maintain.{service,timer}` *(Linux)* | nightly, `Persistent=true` so a machine that was off still runs it |
 
 Both service managers exec the same wrapper rather than reading the env file themselves: launchd
 cannot read one at all, and using systemd's `EnvironmentFile=` would leave two different answers to
@@ -362,7 +386,7 @@ removes that) and it **never** touches the music: the library is the only irrepl
 system — tracks can be re-ingested, tags and playlists cannot.
 
 Useful flags: `--music-root DIR` (on a Pi, point it at the USB SSD, not the SD card), `--host`,
-`--port`, `--no-deps`, `--no-service`.
+`--port`, `--no-deps`, `--no-service`, `--no-maintenance`.
 
 ### Playback: pointing OwnTone at the library
 
@@ -405,6 +429,203 @@ that the dependency on OwnTone is `Wants` and not `Requires`. Whether `apt-get` 
 whether OwnTone's Debian build enables Chromecast, cannot be established from here — the scripts
 check and report rather than assume.
 
+## Keeping it alive
+
+Six commands, and one timer that runs them. YouTube changes things, disks die, and both failures are
+silent by default — the point of everything in this section is that the house finds out before
+somebody reaches for their phone and nothing happens.
+
+```bash
+tunebox exposure      # is anything reachable from outside the house?
+tunebox update        # update yt-dlp, canary it, roll back if that made things worse
+tunebox healthcheck   # the daily check: one synthetic ingest, plus disk, library, queue, player
+tunebox backup        # mirror the library, and verify that it arrived
+tunebox restore       # bring it back (a dry run unless --yes)
+tunebox maintain      # what the nightly timer runs: update, check, back up, alert once
+```
+
+Each takes `--json`, and each exits non-zero **only for a failure** — never for an "unknown". That is
+a deliberate choice about human behaviour: several of these questions genuinely cannot be answered
+(no UPnP device replied; the service is not running, so nothing is listening), and a check that
+exited 1 for those is a check that gets commented out of the nightly job within a fortnight.
+
+### The canary
+
+Everything else here hangs off one operation: a real download of one known video ("Me at the zoo",
+19 seconds, the least likely video on the platform to be deleted or region-locked). It **downloads
+media on purpose**. A metadata-only check would be cheaper and nearly worthless — the failure this
+project has already measured is that metadata extraction keeps working perfectly while the media
+request answers `403` because no JavaScript runtime is available, so a canary that stopped short of
+the media stream would have passed cheerfully on the host where every real ingest failed.
+
+It also checks the bytes rather than the exit code: the file must be big enough to be audio, and
+ffprobe must agree that it *is* audio of roughly the promised length. yt-dlp and ffmpeg can produce an
+empty or truncated container and still exit 0. Nothing is written to the library — the canary fetches
+into the scratch directory and deletes it afterwards.
+
+### Updating yt-dlp
+
+`tunebox update` runs the canary **twice**, before and after, and that is the whole design. The
+obvious version — update, canary, roll back on failure — does the wrong thing in the case that
+matters most:
+
+| canary before | canary after | what happens |
+|---|---|---|
+| pass | pass | keep it, and record it as the known-good version |
+| pass | **fail** | **roll back**, remember the bad version, and re-canary to prove the rollback worked |
+| **fail** | pass | keep it — the update *fixed* extraction, and the report says so |
+| **fail** | **fail** | keep the **new** version and alert. The old one is no better, and yt-dlp's next fix will be built on the newer extractor |
+
+Row two is why the bad version is remembered: without that, a broken release is installed, canaried,
+rolled back — and installed again tomorrow, forever, with an alert every night. Row four is what the
+obvious design gets wrong; it would revert the release that was the cure.
+
+`TUNEBOX_YTDLP_CHANNEL=nightly` switches to yt-dlp's nightly builds (published to PyPI as
+pre-releases, so this is just `pip install --pre`). Stable is the default: the canary makes an update
+*safe*, not *free*, and a household that is not currently broken gains nothing from being a day
+ahead. Nightly is the right setting *while* extraction is broken.
+
+The command refuses to `pip install` outside a virtualenv unless given `--allow-system`. On Debian —
+which is what a Pi runs — that is blocked by PEP 668, and forcing it is a way to break `apt`.
+
+One interaction worth knowing about: `pyproject.toml` pins yt-dlp deliberately, so re-running the
+installer would *downgrade* a version this command installed and verified. The installer therefore
+finishes with `tunebox update --reapply`, which reinstalls the recorded known-good version and needs
+no network.
+
+### Backups, and the restore nobody usually tests
+
+The library is the only irreplaceable state in the system. The audio can be downloaded again; the
+`--parse-metadata` corrections, the artist names worked out from a CJK title, and the layout somebody
+rearranged by hand cannot. So set this and nothing else will need thinking about:
+
+```bash
+TUNEBOX_BACKUP_DEST=/Volumes/Backup/tunebox   # or pi@nas:/srv/music
+```
+
+`tunebox backup` mirrors the tree with rsync and then **verifies by asking rsync again**: a second
+`--dry-run --itemize-changes` pass with nothing left to send is a fact, whereas "rsync exited 0" is
+not — rsync exits 0 after skipping files it could not read. The destination is a plain readable tree
+rather than an archive, because the day this is needed the recovery must not depend on this program
+still working.
+
+`--delete` is **opt-in** (`--prune`, or `TUNEBOX_BACKUP_PRUNE=1`). The accident a home backup most
+often has to survive is somebody deleting an album, and `--delete` propagates exactly that within a
+day. The live SQLite queue is excluded and a consistent snapshot sent in its place — copying an open
+WAL-mode database byte-wise is how a backup that restores into a corrupt database gets made. A
+destination on the same filesystem as the library is allowed and warned about: it protects against an
+accidental delete and does nothing whatsoever about the disk dying.
+
+```bash
+tunebox backup --status     # age, file count, and the exact restore command
+tunebox restore             # dry run: shows every file it would write
+tunebox restore --yes       # do it
+```
+
+`restore` never passes `--delete` under any flag: a restore that removed files the backup does not
+know about would turn "get my album back" into "lose everything ingested since the last backup".
+
+### The daily check, and being told
+
+`tunebox healthcheck` runs the canary and then the things that fail slowly: free space on the music
+volume, the track count, the age of the last backup, failed jobs in the queue, whether OwnTone is
+answering and the speaker is selected, and the cheap half of `tunebox exposure`. Two of those deserve
+a note:
+
+- **The player is advisory.** Ingest works with no player installed, so a missing OwnTone is a
+  warning. Failing the nightly job for it would teach whoever reads the alert to ignore it.
+- **An empty library is a warning, not a shrug.** If an external disk is not mounted, the mount point
+  is usually still a perfectly writable directory — so ingest "works", the library appears empty, and
+  music quietly accumulates on the wrong disk. Free space and track count are reported together for
+  that reason.
+
+Every run appends one JSON object to `.tunebox/health.jsonl` (rotated at 1 MB, because this runs on an
+SD card), so the whole history is one `jq` away. `tunebox healthcheck --history 20` prints it.
+
+Alerts go to whichever of these is configured, and to the log regardless — under launchd and systemd
+stderr *is* the log file:
+
+```bash
+TUNEBOX_ALERT_COMMAND='/usr/local/bin/terminal-notifier -title tunebox -message'
+TUNEBOX_ALERT_WEBHOOK=https://ntfy.sh/your-private-topic
+```
+
+The command gets the JSON report on **stdin** and a one-line subject as its **last argument**, which
+is enough for `mail`, `terminal-notifier`, `ntfy` or a three-line script with no wrapper. It is split
+with `shlex` and executed as an argv list, never through a shell — so a pipeline has to be written as
+`sh -c '…'` on purpose. The webhook is the only outbound request tunebox makes to a third party, it
+happens only because somebody configured it, and the payload carries hostnames, versions, counts and
+error strings — never the token.
+
+Alerting is throttled: it fires on the **transition** into failure, repeats an unchanged failure at
+most once a day (`TUNEBOX_ALERT_REPEAT_HOURS`), and sends a **recovery** notice. An identical message
+every night is a message that gets filtered, and the filter is still in place the night something new
+breaks.
+
+### Checking nothing is exposed
+
+```bash
+tunebox exposure              # reads the socket table and asks the router over UPnP
+tunebox exposure --no-router  # skip the multicast, finish instantly
+```
+
+Three questions, three kinds of answer. What tunebox is *configured* to bind (already enforced at
+startup). What is *actually* listening, from the kernel's socket table via `lsof`/`ss` — which is the
+part that catches a listener nobody configured, because intent and reality can disagree. And whether
+the router forwards anything here, over UPnP IGD.
+
+That last answer is genuinely three-valued, and conflating the cases would miss the point: mappings
+found is a fact, no mappings is a fact, and *the router did not answer* is neither — it is consistent
+with UPnP being switched off, which is what we want, and equally consistent with a router that simply
+ignores us. So the command reports `unknown` there and always prints the two checks a human still has
+to do: look at the port-forwarding page once (a rule typed in by hand is invisible to UPnP), and
+confirm UPnP itself is off.
+
+**It only ever reads.** `GetGenericPortMappingEntry` and `GetExternalIPAddress`, never
+`AddPortMapping` and specifically never `DeletePortMapping` — a forwarding rule is shared household
+infrastructure and might be somebody's console or a colleague's VPN, so an audit tool that silently
+rearranged the router would be more dangerous than the thing it audits. A test asserts it.
+
+Measured on this network: LAN bind, no wildcard listener for tunebox, and the router reporting one UDP
+mapping to a set-top box and none to this host. OwnTone shows up as a warning: it binds every
+interface and cannot be told not to, which is why `deploy/owntone-setup.sh` closes the *authorisation*
+half instead.
+
+### What the nightly job does, and why it is one job
+
+`tunebox maintain` is what the launchd agent and the systemd timer run, at 04:17. One timer rather
+than three, for two reasons: the order matters and a scheduler cannot express it (the update must
+precede the day's canary, or the canary tests yesterday's yt-dlp; the backup must follow both, so what
+is copied is a library whose ingest path is known to work), and one bad night should produce one
+alert rather than three. The steps are otherwise independent — a step that throws becomes a failed
+finding instead of cancelling the ones after it, because the backup protects the only irreplaceable
+thing here and must still run on a night when the updater crashed.
+
+`TUNEBOX_AUTO_UPDATE=0` makes it a pure health check, which is right on a host whose venv is managed
+by something else. Run it by hand any time:
+`~/.local/share/tunebox/bin/tunebox-maintain`.
+
+The systemd timer carries `Persistent=true` — a Pi is unplugged without ceremony, and without that a
+missed nightly job is simply skipped. Its unit's `ReadWritePaths` is wider than the service's by the
+venv — pip has to be able to install into it, and the long-running service must not be able to
+rewrite its own code — plus the backup destination when that is a local path. Each is a separate,
+quoted directive, because systemd splits an unquoted value on whitespace and "Backup Disk" is an
+ordinary name for an external disk.
+
+### What is verified, and what is not
+
+Verified on this host: a real canary download (309 156 bytes, ffprobe 19.06 s against the 19 s the
+metadata promised); the health check reporting disk, library, queue and `OwnTone 29.3` with the
+speaker selected; a real backup of the live library including CJK paths, its verification pass, its
+status and a restore dry run; `tunebox update --dry-run` recording the known-good version after a
+passing canary; and the UPnP audit against the real router.
+
+Not verified: **no rollback has ever been triggered by a real bad yt-dlp release** — that path runs on
+every test run against a fake pip, which proves the logic and not the packaging. Nothing has run on a
+Pi. The alert channels are tested through injected transports, so whether that ntfy topic actually
+arrives on the phone is unanswered. And the timers have not been observed *firing*; that takes a
+night, not a test.
+
 ## Configuration
 
 | Variable | Default | Notes |
@@ -436,6 +657,17 @@ check and report rather than assume.
 | `TUNEBOX_UI` | `1` | serve the web remote; `0` removes the shell routes *and* their auth exemption |
 | `TUNEBOX_OWNTONE_UI` | derived | absolute URL for the "full library in OwnTone" link; by default the browser joins its own hostname to the player's port |
 | `TUNEBOX_LIBRARY_MAX_FILES` | `50000` | ceiling on the `GET /library` directory walk; the answer says when it was truncated |
+| `TUNEBOX_CANARY_URL` | "Me at the zoo" | the video the canary downloads; pick something tiny and permanent |
+| `TUNEBOX_YTDLP_CHANNEL` | `stable` | or `nightly` (pip `--pre`); nightly is for while extraction is broken |
+| `TUNEBOX_AUTO_UPDATE` | `1` | `0` makes `tunebox maintain` a pure health check and never touches the venv |
+| `TUNEBOX_BACKUP_DEST` | — | **set this.** A path on another disk, or anything rsync understands (`pi@nas:/srv/music`) |
+| `TUNEBOX_BACKUP_PRUNE` | `0` | let the backup delete what the library no longer has; off, so a deleted album survives |
+| `TUNEBOX_BACKUP_MAX_AGE_HOURS` | `48` | older than this and the health check fails. Two days, so one failed night does not page anybody |
+| `TUNEBOX_MIN_FREE_GB` | `5` | free space on the music volume below which the health check fails; half of it warns |
+| `TUNEBOX_ALERT_COMMAND` | — | argv (split with `shlex`, no shell); gets the JSON report on stdin and the subject last |
+| `TUNEBOX_ALERT_WEBHOOK` | — | URL to POST the JSON report to; never contains the token |
+| `TUNEBOX_ALERT_REPEAT_HOURS` | `24` | how often an *unchanged* failure is repeated; `0` means every run |
+| `TUNEBOX_HEALTH_LOG_MAX_BYTES` | `1000000` | size at which `health.jsonl` rotates to `.1`; `0` disables the log |
 
 ## Tests
 
@@ -466,12 +698,25 @@ silently stops a button working. None of that substitutes for opening the page: 
 Phase 4 that mattered was invisible to every DOM-level assertion and obvious in a browser
 (PLAN.md Phase 4 has the story).
 
+The Phase 5 machinery is tested by injecting every piece of I/O, which is not a style preference: a
+canary that could only be tested by downloading from YouTube, or a rollback that could only be tested
+by installing packages, would be a rollback nobody had ever run — precisely the failure those features
+exist to prevent. So `tests/test_update.py` drives all four rows of the update decision table
+against a fake pip, `tests/test_exposure.py` drives a fake UPnP router that answers with forwarded
+ports, and `tests/test_backup.py` runs **real rsync** on temporary directories, in both directions,
+because what matters there is that the files actually arrive and the restore actually restores.
+
 The deployment scripts are tested in `tests/test_deploy.py`, and the most useful test there runs the
 **Linux** branch of the installer on macOS by putting `uname`/`systemctl`/`sudo` shims on `PATH` —
 otherwise the systemd unit, the part a Pi depends on and a Mac never executes, would go unread until
 the hardware existed. `shellcheck` runs over both scripts if it is installed, and skips if not. The
 `owntone.conf` editor is exercised against realistic input, including the two cases that broke it
-while it was being written: a setting that is commented out, and a value spanning several lines.
+while it was being written: a setting that is commented out, and a value spanning several lines. The
+launchd plists are written for real by running the installer's own functions in isolation against a
+`launchctl` shim, since a `--dry-run` cannot show the contents of a file it does not write and the
+contents are the whole point.
+
+1056 tests at the end of Phase 5.
 
 ## Layout
 
@@ -485,7 +730,11 @@ src/tunebox/jobs/      SQLite job queue + the worker that drains it
 src/tunebox/player/    OwnTone adapter, output keeper, rescan hook — behind the Player port
 src/tunebox/api/       FastAPI app, token middleware, routes, the remote's routes, the app shell
 src/tunebox/web/       the one page: hand-written HTML/CSS/JS, manifest, service worker, icons
-src/tunebox/cli.py     search / ingest / doctor / serve / player
+src/tunebox/ops/       Phase 5: canary, yt-dlp update + rollback, backup/restore, health, alerts,
+                       exposure audit, and the one nightly job that composes them. Nothing in the
+                       request path imports it, so a bug here cannot break ingest or playback
+src/tunebox/cli.py     search / ingest / doctor / serve / player / exposure / update / healthcheck /
+                       backup / restore / maintain
 deploy/                install.sh (macOS + Raspberry Pi) and owntone-setup.sh
 tools/make_icons.py    regenerates the PNG icons from the same drawing as icon.svg
 ```

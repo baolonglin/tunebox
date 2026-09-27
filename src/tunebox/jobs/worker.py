@@ -45,7 +45,7 @@ from ..core.models import IngestResult, Progress, TrackTags
 from ..core.ports import MusicSource, Player, TagWriter
 from ..errors import InvalidURLError, LibraryError, SourceError, TuneboxError
 from ..player.hooks import rescan_library
-from .models import Job, JobState
+from .models import Job
 from .store import JobStore
 
 log = logging.getLogger(__name__)

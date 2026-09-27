@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Sequence, TextIO
 
 from . import __version__, ingest as ingest_module
-from .config import SUPPORTED_FORMATS, Config
+from .config import SUPPORTED_FORMATS, YTDLP_CHANNELS, Config
 from .core.models import Progress
 from .errors import PlayerError, TuneboxError
 from .sources.ytdlp import YtDlpSource
@@ -88,9 +88,166 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.set_defaults(func=_cmd_serve)
 
+    pair = sub.add_parser(
+        "pair",
+        help="show a QR code that hands the token to a phone",
+        description=(
+            "Prints the pairing link as a QR code. Scan it with the phone's camera and the shared "
+            "token is stored in the browser, once, without typing 43 characters. The token travels "
+            "in the URL fragment, so it never reaches the access log. Refuses to write to anything "
+            "but a terminal, because the code and the link are both the credential itself."
+        ),
+    )
+    pair.add_argument(
+        "--no-qr",
+        action="store_true",
+        help="print only the link (for AirDrop, a password manager, or a terminal without unicode)",
+    )
+    pair.add_argument(
+        "--force",
+        action="store_true",
+        help="print even when stdout is redirected — this writes the token into the destination",
+    )
+    pair.set_defaults(func=_cmd_pair)
+
     _add_player_parser(sub)
+    _add_ops_parsers(sub)
 
     return parser
+
+
+#: Phase 5 — hardening. Six commands that are all "check or repair the system", and they are CLI
+#: commands rather than API routes on purpose: every one of them is something a scheduler or a person
+#: at a terminal does, none of them belongs to the phone, and two of them (``update``, ``restore``)
+#: must keep working when the service itself will not start.
+def _add_ops_parsers(sub: argparse._SubParsersAction) -> None:
+    exposure = sub.add_parser(
+        "exposure",
+        help="check that nothing is reachable from outside the house (PLAN.md Phase 5)",
+        description=(
+            "Answers three questions: what did we configure, what is actually listening, and does "
+            "the router forward anything to this host. The router half is asked over UPnP and is "
+            "read-only — no mapping is ever added or deleted, because that is shared household "
+            "infrastructure and the rule may not be about tunebox at all."
+        ),
+    )
+    exposure.add_argument(
+        "--no-router",
+        action="store_true",
+        help="skip the UPnP query (no multicast, finishes instantly)",
+    )
+    exposure.add_argument("--json", action="store_true", help="machine-readable output")
+    exposure.set_defaults(func=_cmd_exposure)
+
+    update = sub.add_parser(
+        "update",
+        help="update yt-dlp, canary it, and roll back if that made things worse",
+        description=(
+            "Runs the canary before and after the update, because those two answers together are "
+            "what decide between 'keep', 'roll back' and 'this update fixed extraction'. See "
+            "tunebox/ops/update.py for the full table."
+        ),
+    )
+    update.add_argument(
+        "--channel",
+        choices=YTDLP_CHANNELS,
+        help="release channel (default $TUNEBOX_YTDLP_CHANNEL or stable)",
+    )
+    update.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="canary the current version and report, but install nothing",
+    )
+    update.add_argument(
+        "--allow-system",
+        action="store_true",
+        help="permit pip outside a virtualenv (on Debian this can break apt; see PEP 668)",
+    )
+    update.add_argument(
+        "--reapply",
+        action="store_true",
+        help="reinstall the recorded known-good version (used by deploy/install.sh so that "
+        "re-running the installer cannot undo a canaried update)",
+    )
+    update.add_argument("--json", action="store_true", help="machine-readable output")
+    update.set_defaults(func=_cmd_update)
+
+    health = sub.add_parser(
+        "healthcheck",
+        help="the daily check: canary ingest, disk, library, backup age, queue, player, exposure",
+    )
+    health.add_argument(
+        "--no-canary",
+        action="store_true",
+        help="skip the synthetic ingest (the only check that needs the network)",
+    )
+    health.add_argument(
+        "--alert",
+        action="store_true",
+        help="deliver an alert if this fails, subject to the usual throttling",
+    )
+    health.add_argument(
+        "--history",
+        type=int,
+        metavar="N",
+        help="print the last N entries from the health log instead of running a check",
+    )
+    health.add_argument("--json", action="store_true", help="machine-readable output")
+    health.set_defaults(func=_cmd_healthcheck)
+
+    backup = sub.add_parser(
+        "backup",
+        help="mirror the library somewhere else with rsync, and verify that it arrived",
+    )
+    backup.add_argument("--dest", help="destination (default $TUNEBOX_BACKUP_DEST)")
+    backup.add_argument(
+        "--prune",
+        action="store_true",
+        help="delete files at the destination that the library no longer has. Off by default: the "
+        "accident a backup most has to survive is deleting an album, and this propagates it",
+    )
+    backup.add_argument("--no-verify", action="store_true", help="skip the second rsync pass")
+    backup.add_argument("--dry-run", action="store_true", help="show what would be transferred")
+    backup.add_argument(
+        "--status",
+        action="store_true",
+        help="report the last backup's age and print the restore command",
+    )
+    backup.add_argument("--json", action="store_true", help="machine-readable output")
+    backup.set_defaults(func=_cmd_backup)
+
+    restore = sub.add_parser(
+        "restore",
+        help="copy a backup back over the library (a dry run unless --yes is given)",
+        description=(
+            "The other half of the backup, and the half that is usually never executed until the "
+            "day it has to be. A dry run by default so the itemised list can be read first; "
+            "--delete is never passed in this direction under any flag."
+        ),
+    )
+    restore.add_argument("--from", dest="source", help="backup to restore from")
+    restore.add_argument(
+        "--yes", action="store_true", help="actually write to the library"
+    )
+    restore.add_argument("--json", action="store_true", help="machine-readable output")
+    restore.set_defaults(func=_cmd_restore)
+
+    maintain = sub.add_parser(
+        "maintain",
+        help="the scheduled nightly job: update, health check, backup, one alert",
+        description=(
+            "What the launchd agent or the systemd timer runs. One command rather than three "
+            "timers: the order matters (update before the canary, backup after both) and one bad "
+            "night should produce one alert."
+        ),
+    )
+    maintain.add_argument("--no-update", action="store_true", help="do not touch yt-dlp")
+    maintain.add_argument("--no-backup", action="store_true", help="do not back up")
+    maintain.add_argument("--no-canary", action="store_true", help="do not download anything")
+    maintain.add_argument("--no-alert", action="store_true", help="report, but deliver nothing")
+    maintain.add_argument("--json", action="store_true", help="machine-readable output")
+    maintain.set_defaults(func=_cmd_maintain)
+
 
 
 #: ``tunebox player <verb>`` — the whole transport surface, and the thing the Phase 3 acceptance
@@ -187,6 +344,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             # would silently win and ``--output "Kitchen"`` would act on the living room.
             overrides["output_name"] = args.output.strip()
             overrides["output_id"] = None
+        if getattr(args, "channel", None):
+            overrides["ytdlp_channel"] = args.channel
         if overrides:
             config = replace(config, **overrides)
         return int(args.func(args, config))
@@ -333,6 +492,17 @@ def _cmd_doctor(args: argparse.Namespace, config: Config) -> int:
     for name, note in _probe_player(config):
         print(f"[--] {name.ljust(width)}  {note}")
 
+    # Phase 5, advisory for the same reason: `tunebox backup` needs rsync and nothing else does, so
+    # its absence must not fail a host that only ingests. Reported rather than assumed, because the
+    # first time anybody finds out otherwise would be the night the backup was needed.
+    from .ops.backup import have_rsync
+
+    print(
+        f"[--] {'rsync'.ljust(width)}  "
+        + ("present (needed by `tunebox backup`)" if have_rsync()
+           else "MISSING — `tunebox backup` cannot run. macOS ships it; Debian: apt-get install rsync")
+    )
+
     return 0 if all(ok for _, ok, _ in checks) else 1
 
 
@@ -428,6 +598,24 @@ def _cmd_serve(args: argparse.Namespace, config: Config) -> int:
         # on a network that contains devices nobody is proud of.
         access_log=True,
     )
+    return 0
+
+
+def _cmd_pair(args: argparse.Namespace, config: Config) -> int:
+    from . import pairing
+
+    # The same guard as ``deploy/install.sh``'s ``[ -t 1 ]``, and for the same reason: piping a
+    # command into a log file is a normal thing to do, and this output is the credential. Refusing
+    # by default is recoverable; a token in a log file that nobody noticed is not.
+    if not args.force and not sys.stdout.isatty():
+        print(
+            "error: refusing to write the pairing token to something that is not a terminal.\n"
+            "       It would end up in whatever you redirected to. Use --force if that is what "
+            "you want.",
+            file=sys.stderr,
+        )
+        return 1
+    print(pairing.render(config, with_qr=not args.no_qr))
     return 0
 
 
@@ -574,6 +762,181 @@ def _cmd_player_rescan(args: argparse.Namespace, config: Config) -> int:
     player = _player(config)
     player.rescan()
     return _emit(player.library_info())
+
+
+# ----------------------------------------------------------------- Phase 5 commands
+#
+# All six follow the same shape: build the report, print it for a human unless ``--json``, and exit
+# non-zero only for a *failure* — never for an "unknown". That last rule is load-bearing: several of
+# these checks cannot establish an answer (no UPnP device replied; the service is not running so
+# nothing is listening), and a command that exited 1 for those is a command that gets removed from
+# the nightly job within a fortnight. See tunebox/ops/report.py.
+
+
+def _emit_report(payload: dict, rendered: str, *, as_json: bool, notes: Sequence[str] = ()) -> None:
+    if as_json:
+        json.dump(payload, sys.stdout, indent=2, ensure_ascii=False, default=str)
+        sys.stdout.write("\n")
+        return
+    print(rendered)
+    for note in notes:
+        print(f"\n{note}")
+
+
+def _cmd_exposure(args: argparse.Namespace, config: Config) -> int:
+    from .ops import exposure as exposure_module
+
+    report = exposure_module.audit(config, check_router=not args.no_router)
+    notes = []
+    if report.manual_checks:
+        notes.append(
+            "Still to check by hand — neither of these can be established from this host:\n"
+            + "\n".join(f"  * {item}" for item in report.manual_checks)
+        )
+    _emit_report(report.as_dict(), report.render(), as_json=args.json, notes=notes)
+    return 0 if report.ok else 1
+
+
+def _cmd_update(args: argparse.Namespace, config: Config) -> int:
+    from .ops.update import reapply_known_good, update_ytdlp
+
+    if args.reapply:
+        result = reapply_known_good(config, allow_system=args.allow_system)
+    else:
+        result = update_ytdlp(
+            config, allow_system=args.allow_system, dry_run=args.dry_run
+        )
+    lines = [result.summary, *result.messages]
+    if result.error:
+        lines.append(f"error: {result.error}")
+    _emit_report(result.as_dict(), "\n".join(lines), as_json=args.json)
+    return 0 if result.ok else 1
+
+
+def _cmd_healthcheck(args: argparse.Namespace, config: Config) -> int:
+    from .ops import alerts as alerts_module
+    from .ops.health import check_health, history, record
+
+    if args.history is not None:
+        entries = history(config, limit=max(0, args.history))
+        if args.json:
+            return _emit(entries)
+        if not entries:
+            print(f"no health log yet at {config.health_log_path}", file=sys.stderr)
+            return 0
+        for entry in entries:
+            when = entry.get("at")
+            stamp = _timestamp(when)
+            print(f"{stamp}  {str(entry.get('status', '?')).ljust(7)}  {entry.get('subject', '')}")
+        return 0
+
+    report = check_health(config, run_canary_check=not args.no_canary)
+    record(config, report)
+    if args.alert:
+        alerts_module.dispatch(
+            config,
+            ok=report.ok,
+            subject=report.subject,
+            payload=report.as_dict(),
+            body=report.render(),
+        )
+    _emit_report(
+        report.as_dict(),
+        report.render(),
+        as_json=args.json,
+        notes=[f"health log: {config.health_log_path}"],
+    )
+    return 0 if report.ok else 1
+
+
+def _cmd_backup(args: argparse.Namespace, config: Config) -> int:
+    from .ops.backup import backup_status, restore_command, run_backup
+
+    if args.status:
+        status = backup_status(config)
+        if args.json:
+            return _emit({**status.as_dict(), "restore_command": restore_command(config)})
+        if not status.configured:
+            print(
+                "no backup destination configured (TUNEBOX_BACKUP_DEST).\n"
+                "The library is the only irreplaceable state in this system: the audio can be "
+                "downloaded again, the tags and the layout cannot."
+            )
+            return 1
+        if status.at is None:
+            print(f"destination {status.dest} is configured, but no backup has ever run")
+            return 1
+        print(
+            f"last backup: {_timestamp(status.at)} "
+            f"({status.age_hours or 0:.1f}h ago, {status.files or 0} files)\n"
+            f"destination: {status.dest}\n"
+            f"stale:       {'YES' if status.stale else 'no'} "
+            f"(limit {config.backup_max_age_hours:.0f}h)\n"
+            f"\nto restore:  {restore_command(config)}"
+        )
+        return 0 if not status.stale else 1
+
+    result = run_backup(
+        config,
+        dest=args.dest,
+        prune=True if args.prune else None,
+        verify=not args.no_verify,
+        dry_run=args.dry_run,
+    )
+    lines = [result.summary, *(f"warning: {text}" for text in result.warnings)]
+    if result.dry_run and result.changes:
+        lines.extend(f"  {change}" for change in result.changes[:40])
+    if result.error:
+        lines.append(f"error: {result.error}")
+    _emit_report(result.as_dict(), "\n".join(lines), as_json=args.json)
+    return 0 if result.ok else 1
+
+
+def _cmd_restore(args: argparse.Namespace, config: Config) -> int:
+    from .ops.backup import restore
+
+    result = restore(config, source=args.source, confirm=args.yes)
+    lines = [result.summary]
+    if result.changes:
+        lines.append(f"{len(result.changes)} change(s):")
+        lines.extend(f"  {change}" for change in result.changes[:60])
+        if len(result.changes) > 60:
+            lines.append(f"  ... and {len(result.changes) - 60} more")
+    lines.extend(f"warning: {text}" for text in result.warnings)
+    if result.error:
+        lines.append(f"error: {result.error}")
+    _emit_report(result.as_dict(), "\n".join(lines), as_json=args.json)
+    return 0 if result.ok else 1
+
+
+def _cmd_maintain(args: argparse.Namespace, config: Config) -> int:
+    from .ops.maintain import maintain
+
+    result = maintain(
+        config,
+        do_update=False if args.no_update else None,
+        do_backup=not args.no_backup,
+        do_canary=not args.no_canary,
+        alert=not args.no_alert,
+    )
+    notes = [f"health log: {config.health_log_path}"]
+    if result.alert is not None:
+        notes.append(f"alert: {result.alert.decision.reason}")
+    _emit_report(result.as_dict(), result.render(), as_json=args.json, notes=notes)
+    return 0 if result.ok else 1
+
+
+def _timestamp(value: object) -> str:
+    """A local, sortable timestamp. Local rather than UTC because every reader of this output is in
+    the house the machine is in, and "was that last night?" is the question being asked."""
+    try:
+        import datetime
+
+        return datetime.datetime.fromtimestamp(float(value)).strftime(  # type: ignore[arg-type]
+            "%Y-%m-%d %H:%M"
+        )
+    except (TypeError, ValueError, OSError):
+        return "?"
 
 
 # -------------------------------------------------------------------- helpers

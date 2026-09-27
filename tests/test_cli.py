@@ -789,6 +789,32 @@ class TestDoctorPlayerCheck:
         monkeypatch.setattr("tunebox.cli._probe_version", lambda argv: "2026.08.19")
         monkeypatch.setattr("tunebox.cli.shutil.which", lambda name: f"/usr/local/bin/{name}")
 
+    def test_rsync_is_reported_advisory_because_only_backups_need_it(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        """Phase 5's backup is rsync and nothing else in the system is, so its absence must not fail
+        a host that only ingests — but it has to be *said*, because the first time anybody would
+        otherwise find out is the night the library needed copying."""
+        monkeypatch.setattr("tunebox.cli._player", lambda config: FakePlayer(unavailable=True))
+        # ``have_rsync``, not ``shutil.which``: patching the latter would patch the *shared*
+        # shutil module and take ffmpeg and ffprobe down with it, which is a different test.
+        monkeypatch.setattr("tunebox.ops.backup.have_rsync", lambda: False)
+
+        code = main(["--music-root", str(tmp_path / "music"), "doctor"])
+        out = capsys.readouterr().out
+
+        assert code == 0, "no rsync is not a broken ingest"
+        assert "[--] rsync" in out
+        assert "apt-get install rsync" in out
+
+    def test_rsync_present_says_what_it_is_for(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setattr("tunebox.cli._player", lambda config: FakePlayer(unavailable=True))
+        monkeypatch.setattr("tunebox.ops.backup.have_rsync", lambda: True)
+
+        main(["--music-root", str(tmp_path / "music"), "doctor"])
+        out = capsys.readouterr().out
+        assert "[--] rsync" in out and "tunebox backup" in out
+
     def test_a_reachable_player_and_speaker_are_reported(self, monkeypatch, capsys, tmp_path):
         player = FakePlayer(selected=True)
         monkeypatch.setattr("tunebox.cli._player", lambda config: player)

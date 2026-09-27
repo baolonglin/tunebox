@@ -189,7 +189,7 @@ class TestTheLinuxPath:
             "RestrictSUIDSGID=yes",
         ):
             assert directive in out, directive
-        assert f"ReadWritePaths={tmp_path / 'music'}" in out
+        assert f'ReadWritePaths="{tmp_path / "music"}"' in out
         assert f"User={os.environ.get('USER', '')}" in out or "User=" in out
 
     def test_the_unit_starts_at_boot_without_a_login(self, tmp_path: Path, linux_path: str):
@@ -378,6 +378,257 @@ class TestTheConfigIsHandledSafely:
         assert "<string>$WRAPPER</string>" in source
 
 
+# --------------------------------------------------------- Phase 5: the nightly job
+
+
+class TestTheNightlyJob:
+    """The scheduled maintenance job — PLAN.md Phase 5's "yt-dlp auto-update + canary + rollback"
+    and "daily health-check ingest, alerting, backups" — has to be *installed* to be any of those.
+
+    One timer rather than three. The order of the steps matters and a scheduler cannot express it
+    (the update must precede the day's canary, the backup must follow both), and one bad night should
+    produce one alert rather than three.
+    """
+
+    def test_the_wrapper_is_written_next_to_the_service_one(self, tmp_path: Path):
+        out = install(tmp_path).stdout
+        assert "bin/tunebox-maintain" in out
+
+    def test_the_wrapper_loads_the_same_config_as_the_service(self):
+        """So the nightly canary downloads with the same yt-dlp and the backup copies the same music
+        root. Two wrappers rather than one argument because the two are run by different things with
+        different lifetimes — a supervised daemon and a job that exits."""
+        source = code(INSTALL)
+        assert 'exec "$VENV/bin/tunebox" maintain' in source
+        assert source.count('. "$ENV_FILE"') >= 2
+
+    def test_it_can_be_skipped(self, tmp_path: Path):
+        out = install(tmp_path, "--no-maintenance").stdout
+        assert "skipping the nightly maintenance job" in out
+        assert "io.tunebox.maintain.plist (nightly" not in out
+
+    def test_the_installer_cannot_undo_a_canaried_update(self):
+        """The interaction that is easy to miss: ``pyproject.toml`` pins yt-dlp deliberately, so
+        ``pip install --upgrade "$REPO_ROOT"`` *downgrades* a version that ``tunebox update``
+        installed and verified — silently putting back one that may not be able to download
+        anything. The installer is the upgrade path, so it must not reintroduce a fixed bug."""
+        source = code(INSTALL)
+        assert "tunebox\" update --reapply" in source or "tunebox update --reapply" in source
+        assert source.index("update --reapply") > source.index("install_tunebox")
+
+    def test_uninstall_removes_the_schedule_too(self, tmp_path: Path):
+        """Otherwise a removed tunebox keeps waking up every night to fail."""
+        env = {**os.environ, "HOME": str(tmp_path / "home")}
+        (tmp_path / "home").mkdir(exist_ok=True)
+        completed = run(
+            [
+                str(INSTALL), "--uninstall", "--dry-run",
+                "--prefix", str(tmp_path / "prefix"),
+                "--config-dir", str(tmp_path / "config"),
+            ],
+            env=env,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert "io.tunebox.maintain" in completed.stdout
+        assert "io.tunebox.maintain.plist" in completed.stdout
+
+
+class TestTheNightlyJobOnLinux:
+    def test_it_installs_a_timer_and_a_oneshot_service(self, tmp_path: Path, linux_path: str):
+        out = install(tmp_path, path=linux_path).stdout
+        assert "/etc/systemd/system/tunebox-maintain.timer" in out
+        assert "Type=oneshot" in out
+        assert "WantedBy=timers.target" in out
+
+    def test_the_timer_survives_a_machine_that_was_switched_off(
+        self, tmp_path: Path, linux_path: str
+    ):
+        """``Persistent=true`` is the difference between a health check that runs and one that only
+        runs on machines that are never unplugged — and a Raspberry Pi is unplugged."""
+        out = install(tmp_path, path=linux_path).stdout
+        assert "Persistent=true" in out
+        assert "OnCalendar=*-*-* 04:17:00" in out
+        assert "RandomizedDelaySec=" in out
+
+    def test_the_timer_is_enabled_rather_than_the_service(self):
+        """Enabling a ``Type=oneshot`` service would also run it at every boot, which is not what
+        "nightly" means."""
+        source = code(INSTALL)
+        assert 'systemctl enable --now "$MAINTENANCE_NAME.timer"' in source
+        assert 'systemctl enable "$MAINTENANCE_NAME"' not in source
+
+    def test_the_update_can_write_the_venv_and_the_service_still_cannot(
+        self, tmp_path: Path, linux_path: str
+    ):
+        """The one place these two units differ, and it is load-bearing in both directions: pip has
+        to be able to install a new yt-dlp into the venv, and the long-running service must not be
+        able to rewrite its own code."""
+        out = install(tmp_path, path=linux_path).stdout
+        service, _, maintenance = out.partition("tunebox nightly maintenance")
+        assert f'ReadWritePaths="{tmp_path / "music"}"' in service
+        assert str(tmp_path / "prefix") not in service.split("ReadWritePaths=")[1].split("\n")[0]
+        assert f'ReadWritePaths="{tmp_path / "music"}"' in maintenance
+        assert f'ReadWritePaths="{tmp_path / "prefix"}"' in maintenance
+
+    def test_a_path_with_a_space_in_it_is_one_path(self, tmp_path: Path, linux_path: str):
+        """systemd splits a directive's value on whitespace unless it is quoted, so an external disk
+        called "Backup Disk" would otherwise become two invalid paths and a unit that refuses to
+        start — discovered by an audit, and entirely ordinary on macOS."""
+        out = install(tmp_path, path=linux_path).stdout
+        for line in out.splitlines():
+            if "ReadWritePaths=" in line:
+                value = line.split("ReadWritePaths=", 1)[1].strip()
+                assert value.startswith('"') and value.endswith('"'), line
+
+    def test_the_hardening_is_not_relaxed_for_the_nightly_job(
+        self, tmp_path: Path, linux_path: str
+    ):
+        out = install(tmp_path, path=linux_path).stdout
+        _, _, maintenance = out.partition("tunebox nightly maintenance")
+        for directive in (
+            "NoNewPrivileges=yes",
+            "ProtectSystem=strict",
+            "ProtectHome=read-only",
+            "PrivateTmp=yes",
+            "RestrictSUIDSGID=yes",
+        ):
+            assert directive in maintenance, directive
+
+    def test_a_remote_backup_destination_is_not_a_writable_path(self, tmp_path: Path):
+        """``pi@nas:/srv/music`` is rsync-over-ssh: it needs no filesystem permission at all, and
+        listing it as one would make systemd refuse to start the unit."""
+        source = code(INSTALL)
+        start = source.index("maintenance_rw_paths() {")
+        end = source.index("\n}\n", start) + 3
+        harness = tmp_path / "rw.sh"
+        harness.write_text(
+            "set -euo pipefail\n"
+            f'CONFIGURED_MUSIC="{tmp_path}/music"\n'
+            f'TUNEBOX_HOME="{tmp_path}/prefix"\n'
+            f'ENV_FILE="{tmp_path}/env"\n'
+            "env_value() { sed -n \"s/^$1=//p\" \"$ENV_FILE\" | tail -1; }\n"
+            'env_value_or() { local f; f="$(env_value "$1")" || f=""; '
+            'if [ -n "$f" ]; then printf %s "$f"; else printf %s "$2"; fi; }\n'
+            + source[start:end]
+            + "\nmaintenance_rw_paths\n",
+            encoding="utf-8",
+        )
+
+        for destination, expected in (
+            ("", False),
+            ("/Volumes/Backup/tunebox", True),
+            ("/Volumes/Backup Disk/tunebox", True),
+            ("pi@nas:/srv/music", False),
+            ("rsync://nas/music", False),
+            # "deliberately no backup" grants no write access to anything.
+            ("none", False),
+        ):
+            (tmp_path / "env").write_text(
+                f"TUNEBOX_BACKUP_DEST={destination}\n" if destination else "", encoding="utf-8"
+            )
+            lines = run(["bash", str(harness)]).stdout.splitlines()
+            assert (destination in lines) is expected, (destination, lines)
+            assert str(tmp_path / "music") in lines
+            assert str(tmp_path / "prefix") in lines
+
+
+class TestTheNightlyJobOnMacos:
+    """The plist is written for real here, by running the installer's own function in isolation —
+    the same technique as :class:`TestTheLaunchdUpgradeRace`, because a ``--dry-run`` cannot show the
+    contents of a file it does not write, and the contents are the whole point."""
+
+    @staticmethod
+    def write_plist(tmp_path: Path) -> Path:
+        source = code(INSTALL)
+        start = source.index("install_maintenance_launchd() {")
+        end = source.index("\n}\n", start) + 3
+
+        bin_dir = tmp_path / "shims"
+        bin_dir.mkdir()
+        calls = tmp_path / "calls"
+        calls.write_text("", encoding="utf-8")
+        # Nothing loaded, so this is the first-install path: print fails, bootstrap succeeds.
+        shim(bin_dir, "launchctl", f'echo "$1" >>"{calls}"\n[ "$1" = print ] && exit 1\nexit 0')
+
+        agent = tmp_path / "io.tunebox.maintain.plist"
+        script = tmp_path / "harness.sh"
+        script.write_text(
+            "set -euo pipefail\n"
+            "DRY_RUN=0\n"
+            "LAUNCHD_MAINT_LABEL=io.tunebox.maintain\n"
+            f'MAINT_AGENT="{agent}"\n'
+            f'MAINT_WRAPPER="{tmp_path}/prefix/bin/tunebox-maintain"\n'
+            f'TUNEBOX_HOME="{tmp_path}/prefix"\n'
+            'MAINTENANCE_HOUR=4\nMAINTENANCE_MINUTE=17\n'
+            'say() { echo "==> $*"; }\ninfo() { echo "    $*"; }\nok() { echo "ok $*"; }\n'
+            'die() { echo "die: $*" >&2; exit 1; }\nrun() { "$@"; }\n'
+            + source[start:end]
+            + "\ninstall_maintenance_launchd\n",
+            encoding="utf-8",
+        )
+        completed = run(
+            ["bash", str(script)],
+            env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        return agent
+
+    def test_it_runs_on_a_calendar_rather_than_an_interval(self, tmp_path: Path):
+        """``StartInterval`` drifts, and a job that drifts eventually runs in the middle of the
+        evening — during the one activity this machine exists for."""
+        plist = self.write_plist(tmp_path).read_text(encoding="utf-8")
+        assert "<key>StartCalendarInterval</key>" in plist
+        assert "<key>StartInterval</key>" not in plist
+        assert "<key>Hour</key><integer>4</integer>" in plist
+        assert "<key>Minute</key><integer>17</integer>" in plist
+
+    def test_it_does_not_run_at_load(self, tmp_path: Path):
+        """Otherwise every login — and every re-run of the installer — downloads a video and rsyncs
+        the whole library."""
+        plist = self.write_plist(tmp_path).read_text(encoding="utf-8")
+        assert "<key>RunAtLoad</key><false/>" in plist
+
+    def test_it_gets_a_usable_path_and_its_own_log(self, tmp_path: Path):
+        plist = self.write_plist(tmp_path).read_text(encoding="utf-8")
+        assert "/opt/homebrew/bin:/usr/local/bin" in plist, "ffmpeg lives in one of these"
+        assert "log/maintain.log" in plist
+        assert "LowPriorityIO" in plist
+
+    def test_it_waits_out_the_same_bootout_race_as_the_service(self, tmp_path: Path):
+        """The bug measured in Phase 4.5 applies to every agent, not just the service one: bootout
+        returns 0 before the unload finishes, and the bootstrap that follows fails — leaving nothing
+        scheduled, silently."""
+        source = code(INSTALL)
+        start = source.index("install_maintenance_launchd() {")
+        end = source.index("\n}\n", start) + 3
+        body = source[start:end]
+        assert 'launchctl print "gui/$(id -u)/$LAUNCHD_MAINT_LABEL"' in body
+        assert body.count("launchctl print") >= 2, "must poll, not bootout-and-hope"
+        assert "did not unload" in body
+
+
+class TestTheConfigTemplate:
+    """What a fresh install leaves in ``tunebox.env``. The backup destination is the one thing in
+    this project that cannot be discovered by looking, so the file has to ask for it by name."""
+
+    def test_it_names_the_backup_destination_and_says_why(self):
+        source = INSTALL.read_text(encoding="utf-8")
+        assert "TUNEBOX_BACKUP_DEST=" in source
+        assert "only irreplaceable state" in source
+
+    def test_it_offers_both_alert_channels(self):
+        source = INSTALL.read_text(encoding="utf-8")
+        assert "TUNEBOX_ALERT_COMMAND=" in source
+        assert "TUNEBOX_ALERT_WEBHOOK=" in source
+
+    def test_the_summary_tells_the_operator_the_one_manual_step(self, tmp_path: Path):
+        """A backup nobody configured is the failure mode that matters most, and the end of a
+        successful install is the only moment anybody is definitely reading."""
+        source = INSTALL.read_text(encoding="utf-8")
+        assert "set TUNEBOX_BACKUP_DEST in" in source
+        assert "tunebox exposure" in source
+
+
 # --------------------------------------------------------------- the owntone.conf editor
 
 #: Shaped like the real thing, including the three details that matter: tab indentation, a
@@ -524,3 +775,144 @@ class TestOwnToneSetup:
         source = code(OWNTONE)
         assert "for _ in 1 2 3" in source
         assert "sleep 2" in source
+
+
+# ------------------------------------------------------- what gets written into tunebox.env
+
+
+def discover(tmp_path: Path, outputs: str) -> tuple[subprocess.CompletedProcess, Path]:
+    """Run ``owntone-setup.sh --discover`` against a stubbed player, and hand back the env file.
+
+    ``curl`` is shimmed rather than a real socket opened: the assertion is about what the script
+    writes, and the JSON is the only thing it needs from the daemon.
+
+    ``systemctl`` is shimmed for a reason that is not cosmetic. The macOS branch of the restart step
+    runs ``launchctl print gui/$(id -u)/io.tunebox.serve``, which on a developer's own machine
+    matches the *real* loaded agent and would kickstart the service the developer is using. Making
+    the systemd branch match first keeps the test off it.
+    """
+    env_file = tmp_path / "tunebox.env"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    env_file.write_text(
+        f"TUNEBOX_MUSIC_ROOT={tmp_path / 'music'}\nTUNEBOX_PLAYER_URL=http://127.0.0.1:3689\n",
+        encoding="utf-8",
+    )
+    bin_dir = tmp_path / "shims"
+    bin_dir.mkdir(exist_ok=True)
+    shim(bin_dir, "curl", f"cat <<'JSON'\n{outputs}\nJSON")
+    shim(bin_dir, "systemctl", "exit 0")
+    shim(bin_dir, "sudo", 'exec "$@"')
+    completed = run(
+        [str(OWNTONE), "--discover"],
+        env={
+            **os.environ,
+            "HOME": str(tmp_path),
+            "TUNEBOX_ENV_FILE": str(env_file),
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        },
+    )
+    return completed, env_file
+
+
+def sourced(env_file: Path, key: str) -> subprocess.CompletedProcess:
+    """Read one key back the way the service actually reads it: by sourcing the file under ``set -e``.
+
+    This is the whole point. The service wrapper written by ``install.sh`` does ``set -a; . tunebox.env``
+    with ``set -euo pipefail`` in force, so a value is shell source code and not a string.
+    """
+    return run(
+        [
+            "bash",
+            "-c",
+            f'set -euo pipefail; set -a; . "{env_file}"; set +a; printf "%s" "${key}"',
+        ]
+    )
+
+
+class TestTheEnvFileStaysSourceable:
+    """A speaker is called "Living Room speaker", with spaces, because that is what the Google Home
+    app suggests. Written bare, ``TUNEBOX_OUTPUT=Living Room speaker`` makes bash run ``Room`` with
+    an argument; the source fails, and because the wrapper runs under ``set -e`` it exits *before*
+    exec'ing tunebox. The service then never starts and the supervisor restart-loops it — a total
+    outage produced by a space, whose only symptom is ``Room: command not found``.
+    """
+
+    ONE_CAST = (
+        '{"outputs":[{"id":"2080974779","name":"%s","type":"Chromecast",'
+        '"selected":true,"volume":20}]}'
+    )
+
+    def test_a_name_with_spaces_survives_being_sourced(self, tmp_path: Path):
+        completed, env_file = discover(tmp_path, self.ONE_CAST % "Living Room speaker")
+        assert completed.returncode == 0, completed.stderr
+        assert sourced(env_file, "TUNEBOX_OUTPUT").stdout == "Living Room speaker"
+
+    def test_a_name_with_an_apostrophe_survives_being_sourced(self, tmp_path: Path):
+        """``Rob's Kitchen`` is the case that a naive quoting fix reintroduces, because the fix and
+        the hazard are the same character."""
+        completed, env_file = discover(tmp_path, self.ONE_CAST % "Rob's Kitchen")
+        assert completed.returncode == 0, completed.stderr
+        assert sourced(env_file, "TUNEBOX_OUTPUT").stdout == "Rob's Kitchen"
+
+    def test_sourcing_it_is_silent(self, tmp_path: Path):
+        """The original bug announced itself only as a line number on stderr. Nothing should be
+        written there at all."""
+        _, env_file = discover(tmp_path, self.ONE_CAST % "Living Room speaker")
+        assert sourced(env_file, "TUNEBOX_OUTPUT").stderr == ""
+
+    def test_the_script_reads_back_what_it_wrote(self, tmp_path: Path):
+        """``env_value`` is how the script finds the music root and the password it generated on an
+        earlier run. Writing quotes without stripping them on read would point the library at
+        ``'/srv/my music'`` — quotes included — and the fix for one bug would have created another.
+        """
+        env_file = tmp_path / "tunebox.env"
+        env_file.write_text("TUNEBOX_MUSIC_ROOT='/srv/my music'\n", encoding="utf-8")
+        bin_dir = tmp_path / "shims"
+        bin_dir.mkdir()
+        shim(bin_dir, "curl", f"cat <<'JSON'\n{self.ONE_CAST % 'Living Room speaker'}\nJSON")
+        shim(bin_dir, "systemctl", "exit 0")
+        shim(bin_dir, "sudo", 'exec "$@"')
+        completed = run(
+            [str(OWNTONE), "--discover"],
+            env={
+                **os.environ,
+                "HOME": str(tmp_path),
+                "TUNEBOX_ENV_FILE": str(env_file),
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            },
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert "library:   /srv/my music" in completed.stdout
+
+    def test_the_commented_template_shows_the_quoted_form(self):
+        """The placeholder in ``install.sh`` is what an operator copies when setting the speaker by
+        hand, so it has to model quoting rather than demonstrate the bug."""
+        assert "#TUNEBOX_OUTPUT='Living Room speaker'" in INSTALL.read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
+    def test_both_scripts_unquote_on_read(self, script: Path):
+        """Both read this file with the same ``sed``, so both need the same inverse. A file written
+        by one and read by the other is the normal case, not an edge case."""
+        assert "unquote" in code(script)
+
+    def test_a_bare_value_still_reads(self, tmp_path: Path):
+        """Files written before quoting existed are on real machines already, and an upgrade that
+        could not read them would relocate the library or lose the token."""
+        env_file = tmp_path / "tunebox.env"
+        env_file.write_text("TUNEBOX_MUSIC_ROOT=/srv/music\n", encoding="utf-8")
+        bin_dir = tmp_path / "shims"
+        bin_dir.mkdir()
+        shim(bin_dir, "curl", "exit 7")
+        completed = run(
+            [str(OWNTONE), "--discover"],
+            env={
+                **os.environ,
+                "HOME": str(tmp_path),
+                "TUNEBOX_ENV_FILE": str(env_file),
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            },
+        )
+        # It fails, because the stub player is unreachable — but on the player, never on the path,
+        # which proves the bare value was read intact.
+        assert "not answering" in completed.stderr
+        assert "no TUNEBOX_MUSIC_ROOT" not in completed.stderr

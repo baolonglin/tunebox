@@ -202,8 +202,24 @@
 
       <footer class="foot">
         <a id="owntone-link" href="#" rel="noreferrer">Full library in OwnTone ↗</a>
+        <!--
+          The token, on request, as selectable text. Adding this page to the home screen cannot
+          carry the token across: the fragment is stripped from the address bar as soon as it is
+          read, and iOS gives a home-screen web app its own storage container, so the installed
+          icon starts with nothing. Long-press this to copy it and paste it in there once.
+
+          Selectable text rather than a copy button on purpose — `navigator.clipboard` is
+          secure-context only, and this page is served over plain http on a LAN address.
+        -->
+        <button type="button" id="btn-show-token" class="link" aria-expanded="false" aria-controls="token-reveal">
+          Show token
+        </button>
         <button type="button" id="btn-forget" class="link">Forget token</button>
         <span class="muted small">tunebox __TUNEBOX_VERSION__</span>
+        <p id="token-reveal" class="token-reveal" hidden>
+          <code id="token-text"></code>
+          <span class="muted small">Long-press to copy, then paste it into the home-screen app.</span>
+        </p>
       </footer>
     </div>
 

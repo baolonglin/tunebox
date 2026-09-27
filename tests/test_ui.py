@@ -376,6 +376,71 @@ class TestTheAssetsThemselves:
         assert re.search(r"\[hidden\]\s*\{\s*display:\s*none\s*!important", css)
 
 
+class TestTheTokenReveal:
+    """"Show token" in the footer — the bridge to a home-screen icon.
+
+    Adding the page to the home screen cannot carry the token across, for two reasons that compound:
+    ``tokenFromFragment`` strips it from the address bar as soon as it reads it, so the URL the
+    shortcut captures has none, and iOS gives an installed web app its own storage container, so
+    ``readStoredToken`` finds nothing there either. Without this control the only way to fill the
+    gate in the installed app is to go and read ``tunebox.env`` on the host.
+
+    It puts the shared secret on screen, so the assertions below are mostly about it being on screen
+    *only* when asked.
+    """
+
+    @staticmethod
+    def read(name: str) -> str:
+        return (ui.WEB_ROOT / name).read_text(encoding="utf-8")
+
+    def test_the_reveal_ships_hidden(self):
+        """The default state of a footer that displays a credential is "not displaying it"."""
+        markup = self.read("index.html")
+        reveal = re.search(r'<p id="token-reveal"[^>]*>', markup)
+        assert reveal, "the reveal element should be in the markup"
+        assert "hidden" in reveal.group(0)
+
+    def test_the_button_starts_collapsed(self):
+        markup = self.read("index.html")
+        button = re.search(r'<button[^>]*id="btn-show-token"[^>]*>', markup, flags=re.S)
+        assert button
+        assert 'aria-expanded="false"' in button.group(0)
+
+    def test_no_token_is_baked_into_the_shipped_markup(self):
+        """The reveal is filled in by script from the token already on the device. If a real token
+        were ever pasted into the template it would be served to anyone on the LAN, because the
+        shell is the one thing exempt from auth."""
+        assert re.search(r'<code id="token-text"></code>', self.read("index.html"))
+
+    def test_hiding_it_again_empties_the_element(self):
+        """Not merely ``hidden``: a token left in the DOM is a token in the next screenshot of an
+        inspector, and nothing needs it there once the panel is closed."""
+        script = TestTheAssetsThemselves.code("app.js")
+        assert 'text.textContent = ""' in script
+
+    def test_it_reveals_the_token_in_use_not_one_it_fetched(self):
+        """``state.token`` is what the page authenticated with, so what is shown is by construction
+        the value that works. There is no endpoint that hands out the token, and there must not be."""
+        script = TestTheAssetsThemselves.code("app.js")
+        assert "text.textContent = state.token" in script
+        assert "/api/token" not in script
+
+    def test_it_is_selectable_in_one_gesture(self):
+        """``user-select: all`` is the entire point: a long-press has to take the whole 43-character
+        token, not the word the browser guesses at."""
+        css = self.read("app.css")
+        block = css[css.index(".token-reveal code") :]
+        assert "user-select: all" in block
+        assert "-webkit-user-select: all" in block, "Safari is the browser this exists for"
+        assert "word-break: break-all" in block, "the token has no spaces to wrap at"
+
+    def test_the_footer_still_offers_the_way_out(self):
+        """Revealing a credential and forgetting it belong next to each other."""
+        markup = self.read("index.html")
+        assert 'id="btn-forget"' in markup
+        assert 'id="btn-show-token"' in markup
+
+
 class TestTheScriptsParse:
     """Syntax-check the JavaScript with the JS runtime this project already depends on.
 
@@ -420,24 +485,30 @@ class TestTheMarkupAndTheScriptAgree:
     """
 
     @staticmethod
-    def parse() -> tuple[set[str], list[tuple[str, str]]]:
-        """Returns ``(ids, references)`` from the markup, where a reference is (attribute, id)."""
+    def parse() -> tuple[set[str], list[tuple[str, str, str]]]:
+        """Returns ``(ids, references)``, where a reference is (attribute, id, role of the source).
+
+        The role travels with the reference because ``aria-controls`` means different things on a
+        ``role="tab"`` and on a disclosure button, and the tablist assertions below are about the
+        former only.
+        """
 
         class Collector(HTMLParser):
             def __init__(self) -> None:
                 super().__init__()
                 self.ids: set[str] = set()
-                self.refs: list[tuple[str, str]] = []
+                self.refs: list[tuple[str, str, str]] = []
 
             def handle_starttag(self, tag, attrs):
                 values = dict(attrs)
                 if values.get("id"):
                     self.ids.add(values["id"])
+                role = values.get("role") or ""
                 for attribute in ("aria-controls", "aria-labelledby", "for"):
                     target = values.get(attribute)
                     if target:
                         # `for` on a <label> and on an <output> both name element ids.
-                        self.refs.append((attribute, target))
+                        self.refs.append((attribute, target, role))
 
         collector = Collector()
         collector.feed((ui.WEB_ROOT / "index.html").read_text(encoding="utf-8"))
@@ -458,15 +529,30 @@ class TestTheMarkupAndTheScriptAgree:
     def test_every_aria_reference_resolves(self):
         ids, refs = self.parse()
         assert refs, "the page should have labelled controls"
-        dangling = {(attribute, target) for attribute, target in refs if target not in ids}
+        dangling = {(attribute, target) for attribute, target, _ in refs if target not in ids}
         assert not dangling, dangling
 
     def test_the_tabs_and_panels_point_at_each_other(self):
         """A tablist where ``aria-controls`` and ``aria-labelledby`` disagree announces the wrong
-        section, which is worse than announcing none."""
+        section, which is worse than announcing none.
+
+        Scoped to ``role="tab"`` elements. ``aria-controls`` is also the correct attribute for a
+        disclosure button elsewhere on the page — "Show token" is one — so asserting over every
+        occurrence on the page would make adding one look like a tablist bug.
+        """
         ids, refs = self.parse()
-        controls = {target for attribute, target in refs if attribute == "aria-controls"}
+        controls = {target for attribute, target, role in refs if role == "tab"}
         assert controls == {"panel-now", "panel-add", "panel-library"}
-        labelled = {target for attribute, target in refs if attribute == "aria-labelledby"}
+        labelled = {target for attribute, target, _ in refs if attribute == "aria-labelledby"}
         assert labelled == {"tab-now", "tab-add", "tab-library"}
+
+    def test_a_disclosure_button_controls_something_that_exists(self):
+        """``aria-expanded`` without a resolvable ``aria-controls`` tells a screen reader that
+        something expanded and gives it nowhere to look."""
+        ids, refs = self.parse()
+        disclosures = {
+            target for attribute, target, role in refs if attribute == "aria-controls" and role != "tab"
+        }
+        assert "token-reveal" in disclosures, "the Show token button should control the reveal"
+        assert disclosures <= ids
 

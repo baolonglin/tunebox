@@ -22,6 +22,10 @@ dependencies = [
     # deployment should get the versions this was tested against, not today's release.
     "fastapi==0.115.12",
     "uvicorn==0.34.2",
+    # Phase 4 pairing. Pure Python, no transitive dependencies of its own — which is what makes it
+    # acceptable on a 32-bit Raspberry Pi, where anything needing a C extension needs a compiler.
+    # It exists so nobody has to thumb-type a 43-character token into a phone.
+    "segno==1.6.6",
 ]
 
 [project.optional-dependencies]
