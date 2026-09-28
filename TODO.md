@@ -5,10 +5,10 @@ already decided; if an item turns out to need a *decision*, it belongs in `PLAN.
 
 ---
 
-## Playback modes
+## Playback modes — **done, 2026-09-28** (the hardware check is still outstanding)
 
-OwnTone owns the queue (PLAN.md 2), so all three of these are daemon features that tunebox simply
-does not expose yet. **Verified against the running daemon on this host, 2026-09-27:**
+OwnTone owns the queue (PLAN.md 2), so all three of these were daemon features that tunebox simply
+did not expose. **Verified against the running daemon on this host, 2026-09-27:**
 
 ```
 PUT /api/player/repeat?state=single   -> 204, repeat=single
@@ -18,38 +18,57 @@ PUT /api/player/shuffle?state=true    -> 204, shuffle=true
 PUT /api/player/shuffle?state=false   -> 204, shuffle=false
 ```
 
-The read half already exists end to end: `PlayerStatus` carries `repeat`, `shuffle` and `consume`
+The read half already existed end to end: `PlayerStatus` carries `repeat`, `shuffle` and `consume`
 (`core/models.py`), `player/owntone.py` populates them from `/api/player`, and `GET /player` returns
-them (`api/remote.py`, `api/schemas.py`). What is missing is the write half and a control on the page.
+them (`api/remote.py`, `api/schemas.py`). What was missing was the write half and a control on the page.
 
-- [ ] **Repeat one song** — `repeat=single`.
-- [ ] **Repeat the queue** — `repeat=all`.
-- [ ] **Shuffle** — `shuffle=true|false`.
+- [x] **Repeat one song** — `repeat=single`.
+- [x] **Repeat the queue** — `repeat=all`.
+- [x] **Shuffle** — `shuffle=true|false`.
 
-One change, not three: `set_repeat` / `set_shuffle` on the `Player` port in `core/ports.py`, the
-matching pair in `player/owntone.py`, `PUT /player/repeat` and `PUT /player/shuffle` added to the
-enumerated route list in `api/remote.py`, a tri-state repeat button and a shuffle toggle on the
-now-playing panel, and the route list in README's *What is and is not exposed* kept truthful.
+One change, not three, and it landed as scoped: `set_repeat` / `set_shuffle` on the `Player` port in
+`core/ports.py`, the matching pair in `player/owntone.py`, `PUT /player/repeat` and
+`PUT /player/shuffle` added to the enumerated route list in `api/remote.py` (fifteen `/player/*`
+routes now, up from thirteen), a tri-state repeat button and a shuffle toggle on the now-playing
+panel, and the route list in README's *What is and is not exposed* kept truthful. No CLI verb, as
+planned.
 
-Three things worth getting right, each of which is a real trap rather than a style note:
+The three traps, and what was done about each:
 
-- **Validate in our adapter, not in the daemon.** `state=bogus` returns `204` on both routes and is
-  silently taken as "off"/"false" — measured above. So a typo in a client would look like success and
-  quietly change the mode. Reject anything outside `off|all|single` and a real boolean, and test it.
-- **Do not add a forwarding route.** `tests/test_remote.py` asserts that none exists, because tunebox
-  holds OwnTone's credentials and talks to it from a network OwnTone trusts (PLAN.md Phase 4). These
-  go through the `Player` port like the thirteen `/player/*` routes already in that file, which is
-  also what keeps fallback A a drop-in.
-- **`consume` stays read-only for now.** It is reported because it is part of the daemon's state, but
-  a queue that eats itself is not a mode anybody asked for, and exposing a control is easier to add
-  later than to take away.
+- **Validation is in our adapter, not in the daemon.** `state=bogus` returns `204` on both routes and
+  is silently taken as "off"/"false" — measured above — so a typo in a client would have looked like
+  success and quietly changed the mode. There are now two checks and both are tested: pydantic at the
+  edge (`RepeatRequest`, `ShuffleRequest`, so a bad mode is a `422` and never reaches the player), and
+  `_repeat_state` / `_bool_state` in the adapter for callers that are not HTTP. The `Literal` in the
+  schema is built from `core.models.REPEAT_MODES` rather than spelled a second time, so the API and
+  the adapter cannot drift into accepting different words. `set_shuffle` insists on a real `bool`:
+  `set_shuffle("false")` is truthy in Python and false to the daemon, which is the one way to get a
+  mode that is the opposite of the one asked for. The schema uses pydantic's `StrictBool` for the same
+  reason — the ordinary `bool` also accepts `"yes"`, `"on"` and `1`, which would have made the edge
+  looser than the adapter behind it and the rule two rules.
+- **No forwarding route was added.** `tests/test_remote.py` still asserts that none exists, and its
+  `test_the_router_exposes_only_the_port` is derived from the enumerated list, so both new routes had
+  to be declared there to pass. Everything goes through the `Player` port, which is what keeps
+  fallback A a drop-in.
+- **`consume` stays read-only.** Reported by `GET /player`, no route, no control — and now a test
+  saying so, so removing the omission is a deliberate act rather than an oversight.
 
-Acceptance: set repeat-one on the phone, let a track reach its end, and hear it start again on the
-soundbar. That last part is a **hardware** check and cannot be a test. Plain queue advancement was
-measured working across a track boundary (PLAN.md Phase 3), and repeat is the same mechanism feeding
-the same continuous mirroring stream, so it is expected to work — but it is unverified, and the Cast
-path in use has already produced one surprise per phase. If it does misbehave, that is a finding for
-PLAN.md 3.1, alongside the gapless note the mirroring transport already rewrote.
+One thing that was a decision rather than a detail: **the route takes a mode, not a cycle.** The UI
+draws one tri-state button because off → queue → one song is the order anybody wants, but it sends
+the absolute mode its own label implied. A `/player/repeat/cycle` would have been relative to a
+two-second-old poll on a session two phones and OwnTone's own web UI can touch (PLAN.md 2), so two
+taps could land somewhere neither phone asked for; an absolute mode is idempotent instead. Both
+controls carry their state in their *text* ("Repeat the queue", "Shuffle on") with the border as a
+second signal, because a three-way control is the hardest case for this stylesheet's rule that
+nothing conveys state by colour alone.
+
+Tests 1120 → 1198. What they cannot cover is the acceptance check: set repeat-one on the phone, let a
+track reach its end, and hear it start again on the soundbar. That last part is **hardware** and is
+**still unverified** — nothing in this change has been run against the real daemon or the real
+speaker. Plain queue advancement was measured working across a track boundary (PLAN.md Phase 3), and
+repeat is the same mechanism feeding the same continuous mirroring stream, so it is expected to work.
+If it misbehaves, that is a finding for PLAN.md 3.1, alongside the gapless note the mirroring
+transport already rewrote.
 
 ---
 

@@ -518,6 +518,99 @@ class TestTheTokenReveal:
         assert 'id="btn-show-token"' in markup
 
 
+class TestPlaybackModeControls:
+    """The tri-state repeat button and the shuffle toggle (TODO.md, *Playback modes*).
+
+    Three properties, each of which has a failure mode a browser would show and a Python unit test
+    would not: the state has to be in the *text* (this stylesheet's own rule is that nothing conveys
+    state by colour alone, and a three-way control is the hardest case for it), the repeat cycle has
+    to cover all three modes and come back, and the command has to send an absolute mode rather than
+    asking the server to advance one.
+    """
+
+    @staticmethod
+    def code(name: str) -> str:
+        return TestTheAssetsThemselves.code(name)
+
+    def test_both_controls_are_on_the_now_playing_panel(self):
+        markup = self.code("index.html")
+        panel = markup[markup.index('id="panel-now"') : markup.index('id="panel-add"')]
+        assert 'id="btn-repeat"' in panel
+        assert 'id="btn-shuffle"' in panel
+
+    def test_the_repeat_button_ships_in_a_known_state(self):
+        """``data-mode`` is what the stylesheet highlights on, so an absent one would draw "off" as
+        if it were on until the first poll arrived."""
+        button = re.search(r'<button[^>]*id="btn-repeat"[^>]*>', self.code("index.html"))
+        assert button and 'data-mode="off"' in button.group(0)
+
+    def test_the_shuffle_toggle_says_it_is_a_toggle(self):
+        """``aria-pressed`` on the two-state control and *not* on the tri-state one: "pressed" cannot
+        express which of three modes is on, so repeat carries its state in its label instead."""
+        markup = self.code("index.html")
+        shuffle = re.search(r'<button[^>]*id="btn-shuffle"[^>]*>', markup)
+        repeat = re.search(r'<button[^>]*id="btn-repeat"[^>]*>', markup)
+        assert shuffle and 'aria-pressed="false"' in shuffle.group(0)
+        assert repeat and "aria-pressed" not in repeat.group(0)
+
+    def test_every_mode_has_a_label_and_the_cycle_closes(self):
+        script = self.code("app.js")
+        labels = dict(re.findall(r'(\w+): "(Repeat[^"]*)"', script))
+        assert set(labels) == {"off", "all", "single"}
+        # The three labels must differ, or the button would report two modes with one word.
+        assert len(set(labels.values())) == 3
+        cycle = dict(re.findall(r'(\w+): "(off|all|single)"', script))
+        assert cycle == {"off": "all", "all": "single", "single": "off"}
+
+    def test_each_label_names_the_mode_it_belongs_to(self):
+        """Swapping two labels is the mistake this catches, and it is invisible to every other test
+        here: the key set is still the three modes, the three words are still distinct, and the
+        button then confidently says "Repeat one song" while the queue is what repeats. ``all`` and
+        ``single`` are the two TODO.md items, so getting them the wrong way round would ship exactly
+        the feature that was not asked for."""
+        script = self.code("app.js")
+        labels = dict(re.findall(r'(\w+): "(Repeat[^"]*)"', script))
+        assert labels["off"] == "Repeat off"
+        assert labels["all"] == "Repeat the queue"
+        assert labels["single"] == "Repeat one song"
+
+    def test_the_highlight_follows_the_mode_rather_than_the_initial_markup(self):
+        """``data-mode`` is written on every render, not only shipped in the HTML. Without that
+        assignment the label would change and the border would stay stuck on "off" forever — a state
+        cue that is wrong is worse than one that is absent, and the stylesheet's whole justification
+        for the highlight is that it agrees with the text."""
+        script = self.code("app.js")
+        assert "repeat.dataset.mode = mode" in script
+
+    def test_the_state_is_in_the_text_not_only_the_style(self):
+        """Both labels name their state, and the CSS highlight is additive — a phone in a bright
+        kitchen, and a screen reader, both get the answer from the same words."""
+        script = self.code("app.js")
+        assert 'player.shuffle ? "Shuffle on" : "Shuffle off"' in script
+        assert "repeat.textContent = REPEAT_LABEL[mode]" in script
+
+    def test_it_sends_a_mode_and_never_asks_the_server_to_cycle(self):
+        """The session is shared (PLAN.md 2), so an absolute mode is what makes two phones converge.
+        A ``/player/repeat/cycle`` route would also be a second place that knows the order."""
+        script = self.code("app.js")
+        assert '"/player/repeat", { mode: REPEAT_NEXT[repeatMode(state.player)] }' in script
+        assert "/player/repeat/cycle" not in script
+        assert '"/player/shuffle", { enabled: !(state.player && state.player.shuffle) }' in script
+
+    def test_an_unexpected_mode_from_the_daemon_does_not_wedge_the_button(self):
+        """``repeat`` is nullable in the API and the daemon is the one filling it in. An unknown value
+        draws as "off" and advances to "all", which costs one tap; a lookup that returned
+        ``undefined`` would leave a button whose label was blank and whose command was invalid."""
+        script = self.code("app.js")
+        assert "hasOwnProperty.call(REPEAT_NEXT, mode)" in script
+
+    def test_the_highlight_is_a_second_signal_rather_than_the_only_one(self):
+        css = self.code("app.css")
+        block = css[css.index(".modes") :]
+        assert '[data-mode]:not([data-mode="off"])' in block
+        assert 'button[aria-pressed="true"]' in block
+
+
 class TestAddCannotBeTappedTwice:
     """The Add button on a search result greys itself out the moment it is tapped.
 

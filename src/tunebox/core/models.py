@@ -141,6 +141,15 @@ class QueueItem:
         }
 
 
+#: The three repeat modes, in the daemon's own spelling: nothing, the whole queue, one song.
+#:
+#: Here rather than in the adapter because it is the *vocabulary* of a playback mode and three
+#: layers need it — the adapter validates against it, ``tunebox.api.schemas`` builds its ``Literal``
+#: from it, and :attr:`PlayerStatus.repeat` reports one of them. A second spelling of this list
+#: would be a mode the API accepted and the player rejected, or worse, the reverse.
+REPEAT_MODES = ("off", "all", "single")
+
+
 @dataclass(frozen=True)
 class PlayerStatus:
     """What the host's playback session is doing right now.
@@ -152,6 +161,8 @@ class PlayerStatus:
 
     state: str  # "play", "pause" or "stop"
     volume: int | None = None
+    #: One of :data:`REPEAT_MODES`, or ``None`` from a daemon that did not say. Read *and* written
+    #: (``Player.set_repeat``); ``consume`` below is read-only on purpose.
     repeat: str | None = None
     shuffle: bool = False
     consume: bool = False

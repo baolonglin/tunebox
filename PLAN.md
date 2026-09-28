@@ -889,7 +889,9 @@ acceptance criterion not met, and it is not fixable with OwnTone**
   advance: *"do not expose its API unauthenticated just because our UI proxies to it."* So what the
   remote may do is enumerated as fourteen routes, all of them going through the `Player` port, and
   `tests/test_remote.py` asserts that no forwarding route exists. That also keeps fallback A a
-  drop-in: nothing above the adapter knows which daemon is playing.
+  drop-in: nothing above the adapter knows which daemon is playing. (Thirteen of those were
+  `/player/*`; fifteen since 2026-09-28, when `repeat` and `shuffle` were added the same way —
+  TODO.md, *Playback modes*. The enumeration is the property; the number is not.)
 - **The app shell is the first and only exemption from "the token, checked on every route".** A
   browser cannot put a header on the document request it makes on your behalf, so a page that needed
   the token could never load. What is exempted is therefore exactly the bytes already in this

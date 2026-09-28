@@ -154,6 +154,21 @@
             </div>
           </div>
 
+          <!--
+            Playback modes. Both controls carry their state in their *text*, not only in a fill:
+            "Repeat one song" says what is on, which is the same rule the play/pause button follows
+            and the reason a tri-state control is workable at all without a legend.
+
+            Repeat is one button that cycles rather than three radio buttons, because off → queue →
+            one song is the order anybody wants them in and three targets cost the width of the row.
+            Shuffle is a genuine two-state toggle, so it gets `aria-pressed`; repeat does not, since
+            "pressed" cannot express which of three modes is on.
+          -->
+          <div class="card modes" role="group" aria-label="Playback modes">
+            <button type="button" id="btn-repeat" data-mode="off">Repeat off</button>
+            <button type="button" id="btn-shuffle" aria-pressed="false">Shuffle off</button>
+          </div>
+
           <div class="card speaker">
             <p id="speaker-state" class="muted">Speaker: unknown</p>
             <button type="button" id="btn-select" hidden>Turn the speaker on</button>

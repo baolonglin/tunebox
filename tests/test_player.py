@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from tunebox.config import Config
-from tunebox.core.models import Output
+from tunebox.core.models import REPEAT_MODES, Output
 from tunebox.errors import (
     ConfigError,
     OutputNotFound,
@@ -331,6 +331,93 @@ class TestClientTransport:
             player = OwnTonePlayer(replace(config, player_url=raw.url))
             assert player.outputs() == []
             assert player.library_info() == {}
+
+
+# ------------------------------------------------------------------------ modes
+
+
+class TestPlaybackModes:
+    """``repeat`` and ``shuffle``: the write half of state the adapter has always read.
+
+    What is worth testing here is the *validation*, and the reason is measured rather than assumed:
+    ``PUT /api/player/repeat?state=bogus`` and ``…/shuffle?state=bogus`` are both answered ``204``
+    by the running daemon and silently taken as "off"/"false" (2026-09-27). So a check that lives in
+    OwnTone does not exist, and a typo in a caller would look like success while quietly changing
+    the mode. Hence: nothing invalid may reach the wire, and that is an assertion, not a docstring.
+    """
+
+    @pytest.mark.parametrize("mode", ["off", "all", "single"])
+    def test_each_mode_is_sent_as_the_daemon_spells_it(
+        self, player: OwnTonePlayer, stub: StubOwnTone, mode: str
+    ):
+        player.set_repeat(mode)
+        assert stub.calls() == ["PUT /api/player/repeat"]
+        assert stub.params("PUT", "/api/player/repeat")["state"] == [mode]
+
+    def test_repeat_one_and_repeat_the_queue_are_different_requests(
+        self, player: OwnTonePlayer, stub: StubOwnTone
+    ):
+        """The two features TODO.md asks for are one method and two values, and ``single`` is the
+        daemon's word for "this song again" — not ``one``, which is the obvious guess."""
+        player.set_repeat("single")
+        player.set_repeat("all")
+        states = [params["state"] for _, path, params, _ in stub.requests if path.endswith("/repeat")]
+        assert states == [["single"], ["all"]]
+
+    @pytest.mark.parametrize("given,sent", [(True, "true"), (False, "false")])
+    def test_shuffle_sends_a_lowercase_json_boolean(
+        self, player: OwnTonePlayer, stub: StubOwnTone, given: bool, sent: str
+    ):
+        """``str(True)`` is ``"True"``, which OwnTone cannot parse and would therefore take as
+        false — so the spelling is asserted rather than left to Python's."""
+        player.set_shuffle(given)
+        assert stub.params("PUT", "/api/player/shuffle")["state"] == [sent]
+
+    @pytest.mark.parametrize("mode", ["bogus", "one", "ALL", "", "single ", None, 1, True])
+    def test_an_unknown_repeat_mode_never_reaches_the_daemon(
+        self, player: OwnTonePlayer, stub: StubOwnTone, mode
+    ):
+        with pytest.raises(ValueError) as caught:
+            player.set_repeat(mode)
+        assert "off, all, single" in str(caught.value)
+        assert stub.calls() == []
+
+    @pytest.mark.parametrize("enabled", ["true", "false", "", 1, 0, None, "yes"])
+    def test_shuffle_takes_a_bool_and_not_something_truthy(
+        self, player: OwnTonePlayer, stub: StubOwnTone, enabled
+    ):
+        """``set_shuffle("false")`` is the trap: a non-empty string is truthy in Python, so a lax
+        adapter would read it as "on" and the daemon would read the word as "off"."""
+        with pytest.raises(ValueError):
+            player.set_shuffle(enabled)
+        assert stub.calls() == []
+
+    def test_the_modes_are_read_back_from_the_player_state(
+        self, player: OwnTonePlayer, stub: StubOwnTone
+    ):
+        """The read half already existed; this pins that the two halves use one vocabulary, so a UI
+        can round-trip what it just set."""
+        stub.on("GET", "/api/player", {"state": "play", "repeat": "single", "shuffle": True})
+        stub.on("GET", "/api/outputs", {"outputs": []})
+        status = player.status()
+        assert status.repeat == "single"
+        assert status.shuffle is True
+        assert status.consume is False
+
+    def test_every_mode_the_model_names_is_accepted_by_the_adapter(
+        self, player: OwnTonePlayer, stub: StubOwnTone
+    ):
+        """One vocabulary, from the other end: this is the test that fails if
+        :data:`tunebox.core.models.REPEAT_MODES` ever gains a mode the adapter does not accept.
+
+        It proves nothing about the three modes themselves — the parametrised test above does that —
+        but the API's ``Literal`` is built from that tuple, so a member the adapter refuses would be a
+        value the edge waves through and the player then rejects with a ``ValueError``: a 500 on a
+        request that was, by our own declaration, valid.
+        """
+        for mode in REPEAT_MODES:
+            player.set_repeat(mode)
+        assert len(stub.requests) == len(REPEAT_MODES)
 
 
 # ---------------------------------------------------------------------- outputs

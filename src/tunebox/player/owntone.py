@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from ..config import Config
-from ..core.models import Output, PlayerStatus, QueueItem
+from ..core.models import REPEAT_MODES, Output, PlayerStatus, QueueItem
 from ..errors import OutputNotFound, PlayerError, PlayerUnavailable
 
 log = logging.getLogger(__name__)
@@ -333,6 +333,27 @@ class OwnTonePlayer:
     def seek(self, position_ms: int) -> None:
         self._client.put("/api/player/seek", position_ms=max(0, int(position_ms)))
 
+    # --------------------------------------------------------------------- modes
+
+    def set_repeat(self, mode: str) -> None:
+        """``PUT /api/player/repeat?state=off|all|single``.
+
+        Validated here, and that is the whole point of the method rather than a detail of it:
+        ``state=bogus`` is answered ``204`` and silently read as ``off`` (measured against the
+        running daemon, 2026-09-27). A typo in a caller would therefore look like success *and*
+        change the mode — so the check has to be on this side of the wire.
+        """
+        self._client.put("/api/player/repeat", state=_repeat_state(mode))
+
+    def set_shuffle(self, enabled: bool) -> None:
+        """``PUT /api/player/shuffle?state=true|false``.
+
+        ``bool`` strictly, for the same reason: the daemon takes anything it cannot parse as
+        ``false``, so ``set_shuffle("false")`` — a string, truthy in Python — would have turned
+        shuffle *off* through a code path that looks like it turns it on.
+        """
+        self._client.put("/api/player/shuffle", state="true" if _bool_state(enabled) else "false")
+
     # --------------------------------------------------------------------- queue
 
     def queue(self) -> list[QueueItem]:
@@ -532,6 +553,27 @@ def _as_str(value: Any) -> str | None:
 
 def _clamp_volume(volume: int) -> int:
     return max(0, min(100, int(volume)))
+
+
+def _repeat_state(mode: Any) -> str:
+    """``mode`` as OwnTone spells it, or a :class:`ValueError`.
+
+    ``ValueError`` rather than a :class:`~tunebox.errors.TuneboxError`: by the time anything reaches
+    here the HTTP edge has already rejected an unknown mode with a ``422``
+    (:class:`tunebox.api.schemas.RepeatRequest`), so the only way to trip this is a call site with a
+    bad literal in it — a bug in our code, which is exactly the thing PLAN.md 3.4's exception tree is
+    there to *not* look like a handled failure.
+    """
+    if not isinstance(mode, str) or mode not in REPEAT_MODES:
+        raise ValueError(f"repeat mode must be one of {', '.join(REPEAT_MODES)}, not {mode!r}")
+    return mode
+
+
+def _bool_state(enabled: Any) -> bool:
+    """``enabled`` if it is genuinely a ``bool``. See :meth:`OwnTonePlayer.set_shuffle`."""
+    if not isinstance(enabled, bool):
+        raise ValueError(f"shuffle takes a bool, not {type(enabled).__name__} ({enabled!r})")
+    return enabled
 
 
 def _names(outputs: Sequence[Output]) -> str:

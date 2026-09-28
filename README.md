@@ -113,6 +113,8 @@ reachable from outside the house (PLAN.md 3.2).
 | `PUT /player/play`&nbsp;`pause`&nbsp;`toggle`&nbsp;`stop`&nbsp;`next`&nbsp;`previous` | transport; each answers with the new state |
 | `PUT /player/volume` | `{"volume": 0–100}` or `{"step": ±n}`, exactly one |
 | `PUT /player/seek` | `{"position_ms": n}` |
+| `PUT /player/repeat` | `{"mode": "off" \| "all" \| "single"}` — nothing, the whole queue, or one song |
+| `PUT /player/shuffle` | `{"enabled": true \| false}` |
 | `PUT /player/output/select` | enable the configured speaker (no id is taken from the caller) |
 | `GET`&nbsp;`POST`&nbsp;`DELETE /player/queue` | list, add library files, or empty it |
 
@@ -273,9 +275,11 @@ it in `localStorage`; **Forget token** in the footer removes it again.
 Three panels:
 
 - **Now playing** — title and artist of the current track, a progress bar, previous/play-pause/next/stop,
-  a volume slider with ± buttons, the queue, and the state of the speaker. When the speaker is visible
+  a volume slider with ± buttons, a **repeat** button that cycles off → the queue → one song, a
+  **shuffle** toggle, the queue, and the state of the speaker. When the speaker is visible
   but switched off, a button appears to turn it back on; that is the one case the output keeper
-  deliberately will not handle for you (see above).
+  deliberately will not handle for you (see above). `consume` — the mode where the queue eats itself
+  — is reported by `GET /player` but has no control, deliberately.
 - **Add music** — one field that does the right thing: a YouTube link or a bare 11-character video id
   is queued straight away, anything else is searched. Below it, every ingest with its progress,
   cancel while queued, and **Play** the moment it finishes.
@@ -367,7 +371,10 @@ Some deliberate absences, each with a test:
 - **There is no pass-through to OwnTone.** tunebox holds the daemon's credentials and talks to it
   from a network it trusts, so a route that forwarded arbitrary paths would hand every caller the
   daemon's whole API — including one that switches *off* every speaker absent from its argument.
-  What the remote may do is the fourteen routes listed above, all of them through the `Player` port.
+  What the remote may do is the fifteen `/player/*` routes listed above, all of them through the
+  `Player` port. Validation is on this side too, and not only as good manners: `state=bogus` on
+  OwnTone's own repeat and shuffle routes is answered `204` and silently taken as "off", so a mode
+  outside `off|all|single` is a `422` here rather than a success that changed the mode.
 - **There is no `DELETE /library/{path}`**, and the one destructive route takes no shortcuts with the
   path it is given: it goes through the same resolver `POST /player/queue` uses, so traversal, a
   symlink out of the tree and a non-audio file are all refused there rather than filtered here. The

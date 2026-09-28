@@ -95,6 +95,8 @@ ROUTES = (
     ("PUT", "/player/previous"),
     ("PUT", "/player/volume"),
     ("PUT", "/player/seek"),
+    ("PUT", "/player/repeat"),
+    ("PUT", "/player/shuffle"),
     ("PUT", "/player/output/select"),
     ("GET", "/player/queue"),
     ("POST", "/player/queue"),
@@ -250,6 +252,121 @@ class TestVolume:
     ):
         assert client.put("/player/volume", headers=AUTH, json=payload).status_code == 422
         assert player.volume == 30
+
+
+class TestPlaybackModes:
+    """``PUT /player/repeat`` and ``PUT /player/shuffle`` — TODO.md's "playback modes".
+
+    The acceptance test for repeat-one is a hardware one (a track reaching its end and starting
+    again on the soundbar) and cannot live here. What can is the half that would silently swallow a
+    mistake: the daemon answers ``204`` to a mode it cannot parse and treats it as "off", so these
+    assert that nonsense is refused at *our* edge and that the player is left alone when it is.
+    """
+
+    @pytest.mark.parametrize("mode", ["off", "all", "single"])
+    def test_each_mode_is_one_command_and_answers_with_the_new_state(
+        self, client: TestClient, player: FakePlayer, mode: str
+    ):
+        body = client.put("/player/repeat", headers=AUTH, json={"mode": mode}).json()
+        assert body["repeat"] == mode
+        assert player.commands == [f"repeat:{mode}"]
+
+    def test_repeat_one_song(self, client: TestClient, player: FakePlayer):
+        """TODO.md's first item. ``single`` is the daemon's word for it, and the remote uses the same
+        one rather than inventing ``one`` and translating in the adapter."""
+        assert client.put("/player/repeat", headers=AUTH, json={"mode": "single"}).json()["repeat"] == "single"
+        assert player.repeat == "single"
+
+    def test_repeat_the_queue(self, client: TestClient, player: FakePlayer):
+        """TODO.md's second item, and the one that makes an album play round in the evening."""
+        assert client.put("/player/repeat", headers=AUTH, json={"mode": "all"}).json()["repeat"] == "all"
+        assert player.repeat == "all"
+
+    def test_repeat_off_again(self, client: TestClient, player: FakePlayer):
+        player.repeat = "single"
+        assert client.put("/player/repeat", headers=AUTH, json={"mode": "off"}).json()["repeat"] == "off"
+
+    def test_the_mode_is_absolute_so_two_phones_converge(
+        self, client: TestClient, player: FakePlayer
+    ):
+        """There is deliberately no ``/player/repeat/cycle``. A relative command from a phone holding
+        a two-second-old poll would land wherever the *other* phone left it, so the UI's tri-state
+        button sends the mode its own label implied and the response redraws it."""
+        client.put("/player/repeat", headers=AUTH, json={"mode": "all"})
+        client.put("/player/repeat", headers=AUTH, json={"mode": "all"})
+        assert player.repeat == "all"
+        assert player.commands == ["repeat:all", "repeat:all"]
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_shuffle_is_set_explicitly_rather_than_toggled(
+        self, client: TestClient, player: FakePlayer, enabled: bool
+    ):
+        body = client.put("/player/shuffle", headers=AUTH, json={"enabled": enabled}).json()
+        assert body["shuffle"] is enabled
+        assert player.commands == [f"shuffle:{'true' if enabled else 'false'}"]
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},
+            {"mode": "bogus"},
+            {"mode": "one"},
+            {"mode": "ALL"},
+            {"mode": None},
+            {"mode": "all", "extra": 1},
+            {"state": "all"},
+        ],
+    )
+    def test_a_bad_repeat_body_is_a_422_and_changes_nothing(
+        self, client: TestClient, player: FakePlayer, payload: dict
+    ):
+        """The daemon would answer ``204`` to every one of these and set repeat to "off", which is
+        the trap this route exists to close."""
+        assert client.put("/player/repeat", headers=AUTH, json=payload).status_code == 422
+        assert player.commands == []
+        assert player.repeat == "off"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},
+            {"enabled": "maybe"},
+            {"enabled": None},
+            {"enabled": True, "extra": 1},
+            {"shuffle": True},
+            # Accepted by pydantic's ordinary ``bool`` and refused here on purpose: an edge looser
+            # than the adapter behind it is an edge that is not the rule.
+            {"enabled": "true"},
+            {"enabled": "false"},
+            {"enabled": "yes"},
+            {"enabled": "on"},
+            {"enabled": 1},
+            {"enabled": 0},
+        ],
+    )
+    def test_a_bad_shuffle_body_is_a_422_and_changes_nothing(
+        self, client: TestClient, player: FakePlayer, payload: dict
+    ):
+        assert client.put("/player/shuffle", headers=AUTH, json=payload).status_code == 422
+        assert player.commands == []
+        assert player.shuffle is False
+
+    def test_only_a_json_boolean_is_a_boolean(self, client: TestClient, player: FakePlayer):
+        """The pair to the test above, so "everything is a 422" cannot be how it passes."""
+        assert client.put("/player/shuffle", headers=AUTH, json={"enabled": True}).status_code == 200
+        assert player.shuffle is True
+
+    def test_consume_is_reported_but_has_no_route(self, client: TestClient):
+        """Deliberate (TODO.md): it is part of the daemon's state, but a queue that eats itself is
+        not a mode anybody asked for, and a control is easier to add later than to take away."""
+        assert "consume" in client.get("/player", headers=AUTH).json()
+        for method in ("GET", "PUT", "POST"):
+            assert client.request(method, "/player/consume", headers=AUTH).status_code in (404, 405)
+
+    def test_a_dead_daemon_is_503_not_a_bad_request(self, client: TestClient, player: FakePlayer):
+        player.unavailable = True
+        assert client.put("/player/repeat", headers=AUTH, json={"mode": "all"}).status_code == 503
+        assert client.put("/player/shuffle", headers=AUTH, json={"enabled": True}).status_code == 503
 
 
 class TestOutputSelection:

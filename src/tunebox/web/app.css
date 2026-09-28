@@ -340,6 +340,31 @@ form.card {
   color: var(--muted);
 }
 
+/*
+ * Playback modes: two equal-width buttons on one row.
+ *
+ * The "on" states get a border and a slightly lifted surface, never colour as the only signal —
+ * both buttons already say which state they are in ("Repeat the queue", "Shuffle on"), and this is
+ * the second, non-textual cue for somebody scanning the screen rather than reading it.
+ */
+.modes {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.modes button {
+  flex: 1;
+  font-size: 0.9rem;
+}
+
+.modes button[data-mode]:not([data-mode="off"]),
+.modes button[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--surface-2);
+  font-weight: 600;
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
 .speaker {
   display: flex;
   align-items: center;

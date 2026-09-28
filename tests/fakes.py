@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from tunebox.core.models import (
+    REPEAT_MODES,
     FetchedMedia,
     Output,
     PlayerStatus,
@@ -146,6 +147,9 @@ class FakePlayer:
     fail_select: bool = False
     state: str = "stop"
     volume: int = 30
+    #: One of :data:`tunebox.core.models.REPEAT_MODES`, as the daemon would report it.
+    repeat: str = "off"
+    shuffle: bool = False
     items: list[QueueItem] = field(default_factory=list)
     rescans: int = 0
     scan_waits: int = 0
@@ -186,6 +190,8 @@ class FakePlayer:
         return PlayerStatus(
             state=self.state,
             volume=self.volume,
+            repeat=self.repeat,
+            shuffle=self.shuffle,
             item_id=now.id if now else None,
             now_playing=now,
             outputs=tuple(self._outputs()),
@@ -264,6 +270,28 @@ class FakePlayer:
     def seek(self, position_ms: int) -> None:
         self._guard()
         self.commands.append(f"seek:{position_ms}")
+
+    # -------------------------------------------------------------------- modes
+
+    def set_repeat(self, mode: str) -> None:
+        """As strict as :class:`~tunebox.player.owntone.OwnTonePlayer`, deliberately.
+
+        A permissive fake would let a route test pass a mode the real adapter refuses, which is the
+        one thing a shared test double must not do — the daemon is the permissive one here (it takes
+        ``state=bogus`` as "off"), so the fake being permissive too would leave nobody strict.
+        """
+        self._guard()
+        if mode not in REPEAT_MODES:
+            raise ValueError(f"repeat mode must be one of {', '.join(REPEAT_MODES)}, not {mode!r}")
+        self.commands.append(f"repeat:{mode}")
+        self.repeat = mode
+
+    def set_shuffle(self, enabled: bool) -> None:
+        self._guard()
+        if not isinstance(enabled, bool):
+            raise ValueError(f"shuffle takes a bool, not {type(enabled).__name__}")
+        self.commands.append(f"shuffle:{'true' if enabled else 'false'}")
+        self.shuffle = enabled
 
     # -------------------------------------------------------------------- queue
 

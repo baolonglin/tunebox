@@ -296,6 +296,26 @@
 
   // ------------------------------------------------------------- now playing
 
+  /**
+   * The repeat cycle and its labels.
+   *
+   * `off → all → single → off` is the order the modes are wanted in, and the label is the *current*
+   * mode rather than the next one: a button that reads "Repeat one song" and turns repeat off when
+   * pressed is confusing, while one that reads the state and advances it is how every music player
+   * on the phone this runs on behaves.
+   *
+   * Anything the daemon reports that is not one of the three — including the `null` of a daemon that
+   * did not say — is drawn as "off" and advances to "all", so an unexpected value costs one tap and
+   * not a dead button.
+   */
+  const REPEAT_NEXT = { off: "all", all: "single", single: "off" };
+  const REPEAT_LABEL = { off: "Repeat off", all: "Repeat the queue", single: "Repeat one song" };
+
+  function repeatMode(player) {
+    const mode = player && player.repeat;
+    return Object.prototype.hasOwnProperty.call(REPEAT_NEXT, mode) ? mode : "off";
+  }
+
   function renderPlayer(player) {
     state.player = player;
     state.progressMs = player.item_progress_ms || 0;
@@ -318,6 +338,17 @@
       el("vol").value = String(player.volume);
       el("vol-out").textContent = String(player.volume);
     }
+
+    const mode = repeatMode(player);
+    const repeat = el("btn-repeat");
+    repeat.textContent = REPEAT_LABEL[mode];
+    // The stylesheet highlights `[data-mode]:not([data-mode="off"])`, so the border follows the text
+    // rather than replacing it as the state signal.
+    repeat.dataset.mode = mode;
+
+    const shuffle = el("btn-shuffle");
+    shuffle.textContent = player.shuffle ? "Shuffle on" : "Shuffle off";
+    shuffle.setAttribute("aria-pressed", player.shuffle ? "true" : "false");
 
     const speaker = el("speaker-state");
     const select = el("btn-select");
@@ -373,6 +404,16 @@
     el("btn-next").addEventListener("click", () => command("/player/next"));
     el("btn-stop").addEventListener("click", () => command("/player/stop"));
     el("btn-select").addEventListener("click", () => command("/player/output/select"));
+
+    // The *absolute* next mode, not "advance": the session is shared, so a relative command from a
+    // phone holding a two-second-old poll could land somewhere neither phone asked for. Sending the
+    // mode this button's own label implied is idempotent, and the response redraws the label.
+    el("btn-repeat").addEventListener("click", () =>
+      command("/player/repeat", { mode: REPEAT_NEXT[repeatMode(state.player)] })
+    );
+    el("btn-shuffle").addEventListener("click", () =>
+      command("/player/shuffle", { enabled: !(state.player && state.player.shuffle) })
+    );
 
     el("btn-volup").addEventListener("click", () => command("/player/volume", { step: 5 }));
     el("btn-voldown").addEventListener("click", () => command("/player/volume", { step: -5 }));

@@ -47,7 +47,9 @@ from .schemas import (
     QueueAddedView,
     QueueItemView,
     QueueRequest,
+    RepeatRequest,
     SeekRequest,
+    ShuffleRequest,
     VolumeRequest,
 )
 
@@ -197,6 +199,41 @@ def seek(payload: SeekRequest, request: Request) -> PlayerView:
             detail="this player cannot seek",
         )
     action(payload.position_ms)
+    return _view(player, _config(request))
+
+
+@router.put(
+    "/repeat",
+    response_model=PlayerView,
+    summary="Repeat nothing, the whole queue, or one song",
+)
+def set_repeat(payload: RepeatRequest, request: Request) -> PlayerView:
+    """``{"mode": "off" | "all" | "single"}`` — the mode wanted, not a cycle.
+
+    A tri-state *button* is what the UI draws, but a cycle is not what it sends: this session is
+    shared (PLAN.md 2), and "advance the mode" from a phone holding a two-second-old poll would
+    depend on what anything else did in the meantime. An absolute mode is idempotent, so two phones
+    pressing it converge rather than chase each other.
+
+    ``consume`` has no route on purpose. It is reported by ``GET /player`` because it is part of the
+    daemon's state, but a queue that eats itself is not a mode anybody asked for, and a control is
+    easier to add later than to take away.
+    """
+    player = _player(request)
+    player.set_repeat(payload.mode)
+    return _view(player, _config(request))
+
+
+@router.put("/shuffle", response_model=PlayerView, summary="Shuffle the queue, or stop shuffling")
+def set_shuffle(payload: ShuffleRequest, request: Request) -> PlayerView:
+    """``{"enabled": true | false}``, explicitly — there is no toggle here.
+
+    Unlike ``/player/toggle``, which is one round trip precisely *because* play/pause is the button
+    whose label would otherwise lie, shuffle is a setting: sending the state wanted costs nothing and
+    cannot land inverted.
+    """
+    player = _player(request)
+    player.set_shuffle(payload.enabled)
     return _view(player, _config(request))
 
 

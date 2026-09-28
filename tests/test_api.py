@@ -57,6 +57,8 @@ ROUTES = (
     ("PUT", "/player/previous", "/player/previous"),
     ("PUT", "/player/volume", "/player/volume"),
     ("PUT", "/player/seek", "/player/seek"),
+    ("PUT", "/player/repeat", "/player/repeat"),
+    ("PUT", "/player/shuffle", "/player/shuffle"),
     ("PUT", "/player/output/select", "/player/output/select"),
     ("GET", "/player/queue", "/player/queue"),
     ("POST", "/player/queue", "/player/queue"),

@@ -85,6 +85,20 @@ class Player(Protocol):
 
     def previous_track(self) -> None: ...
 
+    def set_repeat(self, mode: str) -> None:
+        """Repeat nothing, the whole queue, or one song — one of :data:`~tunebox.core.models.REPEAT_MODES`.
+
+        A *mode*, not a toggle, because the caller is stateless: two phones and the daemon's own web
+        UI share this session (PLAN.md 2), so "set single" converges where "cycle" would ping-pong.
+
+        Must reject anything outside :data:`~tunebox.core.models.REPEAT_MODES` rather than passing it
+        on. OwnTone answers ``204`` to ``state=bogus`` and quietly takes it as ``off`` (measured
+        2026-09-27), so a daemon-side check is not a check at all.
+        """
+
+    def set_shuffle(self, enabled: bool) -> None:
+        """Shuffle on or off. Takes a real ``bool``, for the reason :meth:`set_repeat` gives."""
+
     def queue(self) -> Sequence[QueueItem]: ...
 
     def clear_queue(self) -> None: ...

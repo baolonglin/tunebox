@@ -14,9 +14,10 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 from ..config import SUPPORTED_FORMATS
+from ..core.models import REPEAT_MODES
 
 
 class IngestRequest(BaseModel):
@@ -182,6 +183,30 @@ class SeekRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     position_ms: int = Field(ge=0)
+
+
+class RepeatRequest(BaseModel):
+    """``PUT /player/repeat`` body.
+
+    The ``Literal`` is built from :data:`tunebox.core.models.REPEAT_MODES` rather than spelled again,
+    so the API and the adapter cannot disagree about what a mode is. This is the *first* of the two
+    checks and the only one a client sees: the daemon itself answers ``204`` to ``state=bogus`` and
+    takes it as ``off``, so an unvalidated typo would read as success and change the mode.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal[REPEAT_MODES]  # type: ignore[valid-type]
+
+
+class ShuffleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    #: ``StrictBool``, not ``bool``. pydantic's ordinary boolean also accepts ``"yes"``, ``"on"``,
+    #: ``1`` and ``"True"``, which would make this edge *looser* than the adapter behind it — and the
+    #: adapter is strict for a measured reason (``Player.set_shuffle``). One rule stated once: a JSON
+    #: ``true`` or ``false``, anything else a 422.
+    enabled: StrictBool
 
 
 class QueueRequest(BaseModel):
