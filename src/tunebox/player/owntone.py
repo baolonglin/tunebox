@@ -364,6 +364,35 @@ class OwnTonePlayer:
     def clear_queue(self) -> None:
         self._client.put("/api/queue/clear")
 
+    def play_item(self, item_id: str) -> None:
+        """``PUT /api/player/play?item_id=N`` — start at one item already in the queue.
+
+        **Measured against the running daemon, 2026-09-28**, because none of it was obvious from the
+        route table alone (``^/api/player/play$`` takes ``item_id`` *and* ``position``; this uses the
+        id, see :meth:`~tunebox.core.ports.Player.play_item` for why):
+
+        ```
+        PUT /api/player/play?item_id=<in the queue>  -> 204, and GET /api/player reports that item_id
+        PUT /api/player/play?item_id=99999           -> 400 (HTML body)
+        PUT /api/player/play?item_id=bogus           -> 400 (HTML body)
+        PUT /api/player/play?item_id=                -> 400 (HTML body)
+        ```
+
+        Two consequences worth writing down.
+
+        **The id is validated here**, unlike ``repeat`` and ``shuffle`` where the daemon's ``204`` to
+        nonsense forced it — this route does refuse. But it refuses in HTML, so an unchecked bad id
+        would reach a caller as a ``502`` carrying a paragraph of markup; and OwnTone's ids are
+        unsigned integers, which is a fact about *this* daemon and therefore this adapter's business.
+
+        **The jump settles asynchronously.** For ~2.5 s afterwards ``GET /api/player`` answers
+        ``state=pause, item_progress_ms=0`` while the Cast output starts, then flips to ``play`` on
+        its own with no further command (sampled every 0.5 s on the real soundbar). So a caller that
+        reads the state immediately gets "paused", and that is the daemon telling the truth rather
+        than a failed command — the same lag ``playback=start`` on a queue add already has.
+        """
+        self._client.put("/api/player/play", item_id=_item_id(item_id))
+
     def enqueue_paths(
         self, paths: Sequence[Path], *, clear: bool = False, start: bool = False
     ) -> list[QueueItem]:
@@ -574,6 +603,28 @@ def _bool_state(enabled: Any) -> bool:
     if not isinstance(enabled, bool):
         raise ValueError(f"shuffle takes a bool, not {type(enabled).__name__} ({enabled!r})")
     return enabled
+
+
+def _item_id(item_id: Any) -> str:
+    """A queue item id in the only spelling OwnTone has, or a :class:`ValueError`.
+
+    Its ids are unsigned integers — ``_as_str`` normalises them on the way in because the daemon
+    sends some of them as JSON numbers, so on the way out the digits are all that can be legal.
+
+    ``ValueError`` for the same reason as :func:`_repeat_state`: the HTTP edge has already answered
+    ``404`` for an id that is not in the queue (:func:`tunebox.api.remote.play_queue_item`), so
+    nothing reaching here with a bad id came from a client — it came from a bug in our own code.
+
+    ``isascii()`` as well as ``isdigit()``: the latter is true of "٣" and of "²", and Python's own
+    ``int()`` accepts the first of those, so a digit-shaped string that no C ``strtol`` will read is
+    exactly the input this has to refuse rather than forward.
+    """
+    if isinstance(item_id, bool) or not isinstance(item_id, (str, int)):
+        raise ValueError(f"queue item id must be a positive integer, not {item_id!r}")
+    text = str(item_id).strip()
+    if not text or not (text.isascii() and text.isdigit()):
+        raise ValueError(f"queue item id must be a positive integer, not {item_id!r}")
+    return text
 
 
 def _names(outputs: Sequence[Output]) -> str:

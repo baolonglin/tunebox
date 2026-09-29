@@ -611,6 +611,96 @@ class TestPlaybackModeControls:
         assert 'button[aria-pressed="true"]' in block
 
 
+class TestTappingTheQueuePlaysTheSong:
+    """The queue's rows are the play button (TODO.md, *Tapping the queue plays the song*).
+
+    The bug this replaces was not a crash: the rows rendered, showed the right titles and highlighted
+    the current track — and did nothing when tapped, so reaching track seven meant ⏭ six times. What
+    a Python test can hold to account is the part a browser would otherwise be the only witness to:
+    that the tappable thing is a real ``<button>`` (a click handler on a ``<div>`` is unreachable by
+    keyboard and silent to a screen reader), that it sends the item's **id** rather than its position,
+    and that the row for the track already loaded is not exempt.
+    """
+
+    @staticmethod
+    def code(name: str) -> str:
+        return TestTheAssetsThemselves.code(name)
+
+    def test_the_row_itself_is_the_control(self):
+        script = self.code("app.js")
+        assert "queue.map((item) => queueRow(item, player.item_id))" in script
+        assert "function queueRow(" in script
+
+    def test_the_tappable_row_is_a_real_button(self):
+        """The whole accessibility story of this feature. A ``<div>`` with a click handler is not in
+        the tab order, is not announced as a control and ignores Enter and Space — and it looks
+        identical in a screenshot, which is why this is asserted rather than eyeballed."""
+        script = self.code("app.js")
+        assert 'activate ? make("button", "row-main") : make("div", "row-main")' in script
+        body = script[script.index("function row(") : script.index("function fill(")]
+        assert 'main.type = "button"' in body
+        assert 'main.addEventListener("click", activate)' in body
+
+    def test_it_sends_the_item_id_and_not_a_position(self):
+        """The queue is shared (PLAN.md 2), so a position is only true of the poll it came from while
+        an id either names the track that was tapped or is answered 404."""
+        script = self.code("app.js")
+        assert "`/player/queue/${encodeURIComponent(itemId)}/play`" in script
+        assert "playQueueItem(item.id)" in script
+        assert "/position" not in script
+
+    def test_the_id_is_escaped_on_its_way_into_the_path(self):
+        """It comes from the daemon, which is not the same as being safe to interpolate: the one
+        rule of this file is that nothing from elsewhere is trusted, and a path segment is a place
+        where a ``/`` or a ``?`` would change which route is called."""
+        assert "encodeURIComponent(itemId)" in self.code("app.js")
+
+    def test_a_row_with_no_id_is_not_pretending_to_be_playable(self):
+        """``QueueItem.id`` is an empty string when the daemon sent none. There is nothing to send
+        for such a row, so it must not draw as a button that silently fails."""
+        assert "item.id ? () => playQueueItem(item.id) : undefined" in self.code("app.js")
+
+    def test_the_current_row_is_still_tappable_and_says_what_it_will_do(self):
+        """A dead row is the bug being fixed, so the loaded track is not exempt — but the daemon
+        restarts it rather than resuming, and the label is where that is admitted."""
+        script = self.code("app.js")
+        assert 'current ? `Restart “${title}”` : `Play “${title}”`' in script
+        assert 'main.setAttribute("aria-current", "true")' in script
+
+    def test_every_row_carries_an_accessible_name(self):
+        """The button's own text is the title and artist, which reads as a label by accident rather
+        than by design; an explicit one is what makes "Play" audible at all."""
+        script = self.code("app.js")
+        body = script[script.index("function queueRow(") : script.index("function playQueueItem(")]
+        assert 'main.setAttribute("aria-label"' in body
+
+    def test_it_redraws_from_the_response_rather_than_guessing(self):
+        """Rule 2 of app.js. Optimistic local state would be wrong regularly here — two phones and
+        OwnTone's own web UI touch this queue."""
+        script = self.code("app.js")
+        body = script[script.index("function playQueueItem(") :]
+        assert "return command(" in body[: body.index("}")]
+
+    def test_the_button_does_not_look_like_a_button(self):
+        """A filled, bordered control the full width of every row would read as a wall of buttons.
+        What is kept is the behaviour, not the chrome — and the focus ring, which is not negotiable."""
+        css = self.code("app.css")
+        block = css[css.index("button.row-main") : css.index(".row-sub")]
+        assert "border: 0" in block
+        assert "background: none" in block
+        assert "text-align: left" in block, "a button centres its text; a list of titles must not"
+        assert "min-height: var(--tap)" in block, "a row is still a thumb target"
+        assert ":focus-visible" not in block, "the page-wide focus ring already covers it"
+
+    def test_the_focus_ring_still_applies_to_it(self):
+        """It is a ``button``, so the page-wide rule covers it — asserted because the temptation when
+        un-styling a button is to remove its outline along with its border."""
+        css = self.code("app.css")
+        assert ":is(a, button, input, [tabindex]):focus-visible" in css
+        block = css[css.index("button.row-main") :]
+        assert "outline: none" not in block
+
+
 class TestAddCannotBeTappedTwice:
     """The Add button on a search result greys itself out the moment it is tapped.
 
@@ -923,3 +1013,120 @@ class TestTheMarkupAndTheScriptAgree:
         assert "token-reveal" in disclosures, "the Show token button should control the reveal"
         assert disclosures <= ids
 
+
+
+class TestAPollKeepsFocusOnTheQueue:
+    """A poll must not take keyboard or screen-reader focus off a queue row.
+
+    The rows became ``<button>``s so that a keyboard and VoiceOver could reach them — and every poll
+    (every two seconds) redraws the queue. A rebuilt list destroys the focused node, a browser sends
+    focus to ``<body>`` when that happens, and so the feature's own users were thrown back to the top
+    of the page before they could press anything.
+
+    This one is behavioural, not a reading of the source: the real ``renderQueue`` and the helpers it
+    calls are lifted out of ``app.js`` and run under deno against a fake DOM just big enough to have
+    a focused element and to lose it the way a browser does.
+    """
+
+    FUNCTIONS = ("clear", "make", "row", "fill", "queueRow", "renderQueue")
+
+    HARNESS = r"""
+class FakeNode {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase();
+    this.children = [];
+    this.parentNode = null;
+    this.dataset = {};
+    this.attributes = {};
+    this.className = "";
+    this.textContent = "";
+  }
+  get firstChild() { return this.children[0] || null; }
+  appendChild(child) { child.parentNode = this; this.children.push(child); return child; }
+  removeChild(child) {
+    this.children.splice(this.children.indexOf(child), 1);
+    child.parentNode = null;
+    // What a browser does: focus inside a removed subtree falls back to <body>.
+    if (child.contains(document.activeElement)) document.activeElement = document.body;
+    return child;
+  }
+  contains(node) { for (; node; node = node.parentNode) if (node === this) return true; return false; }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  addEventListener() {}
+  focus() { document.activeElement = this; }
+  *walk() { for (const c of this.children) { yield c; yield* c.walk(); } }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  querySelectorAll(selector) {
+    const test = selector === "[data-item-id]"
+      ? (n) => n.dataset.itemId !== undefined
+      : (n) => n.className.split(" ").includes(selector.slice(1));
+    return [...this.walk()].filter(test);
+  }
+}
+
+const document = { body: new FakeNode("body"), createElement: (tag) => new FakeNode(tag) };
+document.activeElement = document.body;
+const nodes = { queue: new FakeNode("ul"), "queue-count": new FakeNode("span"), "btn-clear": new FakeNode("button") };
+Object.values(nodes).forEach((n) => document.body.appendChild(n));
+const el = (id) => nodes[id];
+const state = { queueKey: null };
+const playQueueItem = () => {};
+
+__FUNCTIONS__
+
+const item = (id) => ({ id, title: `Song ${id}`, artist: "A", album: "B", path: `/${id}.mp3` });
+const rowFor = (id) => nodes.queue.querySelectorAll("[data-item-id]").find((n) => n.dataset.itemId === id);
+const focusedId = () => document.activeElement.dataset.itemId || document.activeElement.tagName;
+
+const result = {};
+renderQueue({ item_id: "1", queue: [item("1"), item("2"), item("3")] });
+const before = rowFor("2");
+before.focus();
+
+renderQueue({ item_id: "1", queue: [item("1"), item("2"), item("3")] });
+result.unchanged = { focused: focusedId(), sameNode: document.activeElement === before };
+
+renderQueue({ item_id: "3", queue: [item("2"), item("3")] });
+result.changed = { focused: focusedId(), sameNode: document.activeElement === before };
+
+renderQueue({ item_id: "3", queue: [item("3")] });
+result.removed = { focused: focusedId() };
+
+console.log(JSON.stringify(result));
+"""
+
+    @classmethod
+    def run(cls) -> dict:
+        deno = shutil.which("deno")
+        if deno is None:  # pragma: no cover - deno is a declared requirement, but not here
+            pytest.skip("deno is not installed")
+        code = TestTheAssetsThemselves.code("app.js")
+        sources = []
+        for name in cls.FUNCTIONS:
+            start = code.index(f"  function {name}(")
+            sources.append(code[start : code.index("\n  }\n", start) + 4])
+        script = cls.HARNESS.replace("__FUNCTIONS__", "\n".join(sources))
+        completed = subprocess.run(
+            [deno, "eval", script], capture_output=True, text=True, timeout=60
+        )
+        assert completed.returncode == 0, completed.stderr
+        return json.loads(completed.stdout)
+
+    def test_an_unchanged_poll_leaves_the_focused_row_alone(self):
+        """The same node, not merely the same id: moving focus at all makes a screen reader
+        announce the row again, so VoiceOver would re-read "Play …" every two seconds."""
+        assert self.run()["unchanged"] == {"focused": "2", "sameNode": True}
+
+    def test_a_changed_queue_puts_focus_back_on_the_same_track(self):
+        """The row above it went away and the current track moved, so the list really was rebuilt
+        — and focus followed the item id to its new button rather than falling to ``<body>``."""
+        assert self.run()["changed"] == {"focused": "2", "sameNode": False}
+
+    def test_a_row_that_is_gone_takes_its_focus_with_it(self):
+        """Nothing to restore to, and nothing else is guessed at: focus is where a browser puts it."""
+        assert self.run()["removed"] == {"focused": "BODY"}
+
+    def test_every_playable_row_carries_its_id(self):
+        code = TestTheAssetsThemselves.code("app.js")
+        body = code[code.index("function queueRow(") : code.index("function playQueueItem(")]
+        assert "main.dataset.itemId = item.id" in body

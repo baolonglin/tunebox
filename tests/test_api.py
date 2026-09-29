@@ -63,6 +63,7 @@ ROUTES = (
     ("GET", "/player/queue", "/player/queue"),
     ("POST", "/player/queue", "/player/queue"),
     ("DELETE", "/player/queue", "/player/queue"),
+    ("PUT", "/player/queue/{item_id}/play", "/player/queue/1/play"),
 )
 
 #: Added by FastAPI itself, outside our router — and therefore the reason auth is middleware.

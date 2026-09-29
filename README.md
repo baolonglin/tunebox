@@ -117,6 +117,7 @@ reachable from outside the house (PLAN.md 3.2).
 | `PUT /player/shuffle` | `{"enabled": true \| false}` |
 | `PUT /player/output/select` | enable the configured speaker (no id is taken from the caller) |
 | `GET`&nbsp;`POST`&nbsp;`DELETE /player/queue` | list, add library files, or empty it |
+| `PUT /player/queue/{id}/play` | jump to an item already in the queue — `404` if it has since gone |
 
 ```bash
 T=$TUNEBOX_TOKEN
@@ -276,7 +277,9 @@ Three panels:
 
 - **Now playing** — title and artist of the current track, a progress bar, previous/play-pause/next/stop,
   a volume slider with ± buttons, a **repeat** button that cycles off → the queue → one song, a
-  **shuffle** toggle, the queue, and the state of the speaker. When the speaker is visible
+  **shuffle** toggle, the queue, and the state of the speaker. **Tapping a track in the queue plays
+  it** — the row is the button, so track seven is one tap and not six presses of ⏭; the row already
+  playing restarts it, and its label says so. When the speaker is visible
   but switched off, a button appears to turn it back on; that is the one case the output keeper
   deliberately will not handle for you (see above). `consume` — the mode where the queue eats itself
   — is reported by `GET /player` but has no control, deliberately.
@@ -371,10 +374,12 @@ Some deliberate absences, each with a test:
 - **There is no pass-through to OwnTone.** tunebox holds the daemon's credentials and talks to it
   from a network it trusts, so a route that forwarded arbitrary paths would hand every caller the
   daemon's whole API — including one that switches *off* every speaker absent from its argument.
-  What the remote may do is the fifteen `/player/*` routes listed above, all of them through the
+  What the remote may do is the sixteen `/player/*` routes listed above, all of them through the
   `Player` port. Validation is on this side too, and not only as good manners: `state=bogus` on
   OwnTone's own repeat and shuffle routes is answered `204` and silently taken as "off", so a mode
-  outside `off|all|single` is a `422` here rather than a success that changed the mode.
+  outside `off|all|single` is a `422` here rather than a success that changed the mode. The one
+  route that takes an id in its path checks the queue for it first, so an id that is no longer
+  there is a `404` rather than the daemon's own `400`-with-an-HTML-body.
 - **There is no `DELETE /library/{path}`**, and the one destructive route takes no shortcuts with the
   path it is given: it goes through the same resolver `POST /player/queue` uses, so traversal, a
   symlink out of the tree and a non-audio file are all refused there rather than filtered here. The

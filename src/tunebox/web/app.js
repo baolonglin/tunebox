@@ -36,6 +36,8 @@
     token: null,
     tab: "now",
     player: null,
+    /** What the queue was last drawn from, so an unchanged poll leaves its nodes (and focus) alone. */
+    queueKey: null,
     /** Locally ticked between polls so the progress bar moves at one frame a second, not one per poll. */
     progressMs: 0,
     /** True while a volume drag is in flight, so a poll cannot yank the slider out from under a thumb. */
@@ -67,10 +69,22 @@
     return node;
   }
 
-  /** One list row: a title, a subtitle, and some buttons. Every list on this page is this shape. */
-  function row(title, subtitle, actions, className) {
+  /**
+   * One list row: a title, a subtitle, and some buttons. Every list on this page is this shape.
+   *
+   * ``activate`` makes the title itself the control, and when it is given the row's main area is a
+   * real ``<button>`` rather than a ``<div>`` with a click handler on it. That is not a detail: a
+   * handler on a div is unreachable by keyboard, invisible to a screen reader and does not respond
+   * to Enter or Space, which is the standard way this exact pattern is got wrong. The caller is
+   * expected to label it — see `queueRow`, where the label differs for the track already playing.
+   */
+  function row(title, subtitle, actions, className, activate) {
     const li = make("li", className);
-    const main = make("div", "row-main");
+    const main = activate ? make("button", "row-main") : make("div", "row-main");
+    if (activate) {
+      main.type = "button";
+      main.addEventListener("click", activate);
+    }
     main.appendChild(make("span", "row-title", title));
     if (subtitle) main.appendChild(make("span", "row-sub", subtitle));
     li.appendChild(main);
@@ -82,7 +96,18 @@
     return li;
   }
 
+  /**
+   * Replace a list's rows, keeping keyboard focus on the row it was on.
+   *
+   * Rebuilding destroys the focused node, and a browser sends focus to ``<body>`` when that
+   * happens — so without this, a keyboard or screen-reader user on a queue row is thrown back to
+   * the top of the page by the next poll. A row opts in by carrying ``data-item-id``; if the same
+   * id is drawn again, its new node gets the focus. The id is compared rather than put into a
+   * selector because it came from the daemon (rule 1).
+   */
   function fill(list, items, emptyText) {
+    const active = document.activeElement;
+    const focusedId = active && list.contains(active) ? active.dataset.itemId : undefined;
     clear(list);
     if (!items.length) {
       const li = make("li", "empty", emptyText);
@@ -90,6 +115,12 @@
       return;
     }
     items.forEach((item) => list.appendChild(item));
+    if (focusedId) {
+      const again = Array.from(list.querySelectorAll("[data-item-id]")).find(
+        (node) => node.dataset.itemId === focusedId
+      );
+      if (again) again.focus();
+    }
   }
 
   function duration(seconds) {
@@ -363,21 +394,88 @@
       select.hidden = false;
     }
 
+    renderQueue(player);
+  }
+
+  /**
+   * Redraw the queue — but only when something in it changed.
+   *
+   * Every poll lands here, and most polls bring the same queue back. Rebuilding it anyway would be
+   * harmless to look at and bad to use: even with `fill` putting focus back on the same row, moving
+   * focus to a new node makes a screen reader announce it, so VoiceOver would re-read "Play …"
+   * every two seconds. Skipping an unchanged queue keeps the very same nodes, so nothing is
+   * announced and nothing moves.
+   */
+  function renderQueue(player) {
     const queue = player.queue || [];
+    const key = JSON.stringify([
+      player.item_id,
+      queue.map((item) => [item.id, item.title, item.artist, item.album, item.path]),
+    ]);
+    if (key === state.queueKey) return;
+    state.queueKey = key;
+
     el("queue-count").textContent = queue.length ? `(${queue.length})` : "";
     el("btn-clear").disabled = queue.length === 0;
     fill(
       el("queue"),
-      queue.map((item) =>
-        row(
-          item.title || item.path || "(untitled)",
-          [item.artist, item.album].filter(Boolean).join(" · "),
-          [],
-          item.id === player.item_id ? "current" : ""
-        )
-      ),
+      queue.map((item) => queueRow(item, player.item_id)),
       "The queue is empty."
     );
+  }
+
+  /**
+   * One queue row, where the row *is* the play button.
+   *
+   * Tapping a track in a queue is the gesture everybody arrives already knowing, and it used to do
+   * nothing at all here: the rows were drawn with no actions, so reaching track seven meant ⏭ six
+   * times. The title is the control rather than a "Play" button beside it, for two reasons — a queue
+   * is a list of things to play, so a verb repeated on every row is noise, and the row is a
+   * comfortable thumb target where a small button in a corner is not.
+   *
+   * What it sends is the item's **id**. Not its position: two phones and OwnTone's own web UI share
+   * this queue (PLAN.md 2), so a position is only true of the poll it came from, while an id either
+   * names the track that was tapped or names nothing and is answered `404`.
+   *
+   * The row already loaded is not exempt — a row that does nothing is the bug being fixed — but its
+   * label says what the tap will actually do, because the daemon restarts that track rather than
+   * resuming it.
+   */
+  function queueRow(item, currentId) {
+    const title = item.title || item.path || "(untitled)";
+    const current = Boolean(item.id) && item.id === currentId;
+    const li = row(
+      title,
+      [item.artist, item.album].filter(Boolean).join(" · "),
+      [],
+      current ? "current" : "",
+      // An item with no id is not playable and must not look it: nothing can be sent for it.
+      item.id ? () => playQueueItem(item.id) : undefined
+    );
+    const main = li.querySelector(".row-main");
+    if (item.id) {
+      main.setAttribute("aria-label", current ? `Restart “${title}”` : `Play “${title}”`);
+      // What `fill` follows focus by across a redraw.
+      main.dataset.itemId = item.id;
+    }
+    if (current) main.setAttribute("aria-current", "true");
+    return li;
+  }
+
+  /**
+   * Jump to a queue item.
+   *
+   * No optimistic redraw, and no local guess at what is now playing — `command` redraws from the
+   * response, which is rule 2 of this file. Worth knowing when reading the screen afterwards: for
+   * about two seconds the daemon answers `state: "pause"` with no progress while the Cast output
+   * starts (measured on the real speaker), so the transport button shows ▶ until the next poll. That
+   * is the daemon being honest, not a command that failed.
+   *
+   * A `404` means the row went away between the poll and the tap — someone else's phone cleared the
+   * queue. `attempt` puts that in the banner and the next poll removes the row.
+   */
+  function playQueueItem(itemId) {
+    return command(`/player/queue/${encodeURIComponent(itemId)}/play`);
   }
 
   function drawProgress() {

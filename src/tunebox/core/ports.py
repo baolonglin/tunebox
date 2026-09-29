@@ -101,6 +101,26 @@ class Player(Protocol):
 
     def queue(self) -> Sequence[QueueItem]: ...
 
+    def play_item(self, item_id: str) -> None:
+        """Start playback at the queue item with this id, wherever it sits in the queue.
+
+        The one method here whose vocabulary is an id rather than a path, and deliberately so: the
+        caller is naming something *already in the queue*, which this protocol has always identified
+        by :attr:`~tunebox.core.models.QueueItem.id` and reported as
+        :attr:`~tunebox.core.models.PlayerStatus.item_id`. Nothing about which daemon is playing
+        leaks out that was not already out, and a path would be worse than indirect — the same file
+        can legitimately be in the queue twice, so a path names no single item.
+
+        An id and not a position, for the reason :meth:`set_repeat` takes a mode and not a cycle:
+        this session is shared (PLAN.md 2), so a position is relative to a queue snapshot another
+        phone can invalidate between the poll and the tap, while an id either names the track
+        somebody meant or names nothing at all.
+
+        Callers are expected to have the item in hand. What a player does with an id that has since
+        been removed is its own business — see :mod:`tunebox.api.remote`, which checks the queue
+        first so that a stale remote is answered ``404`` rather than whatever the daemon says.
+        """
+
     def clear_queue(self) -> None: ...
 
     def enqueue_paths(

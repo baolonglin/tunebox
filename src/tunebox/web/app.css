@@ -408,6 +408,35 @@ form.card {
   min-width: 0;
 }
 
+/*
+ * A row whose main area is the play button — the queue's rows, and only those.
+ *
+ * It has to undo the `button` rule above rather than inherit it: a row is not a control-shaped
+ * thing, it is a line of text that happens to be tappable, and a border plus a filled background
+ * across the full width of every row would read as a wall of buttons. What is kept is the part that
+ * matters — it is a real `<button>`, so it is in the tab order, it takes Enter and Space, and the
+ * `:focus-visible` ring below applies to it unchanged. `text-align: left` because a button centres
+ * its text by default and a list of centred titles is unreadable; `min-height` stays at the tap
+ * size, which the row's own padding already exceeds.
+ */
+button.row-main {
+  border: 0;
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  text-align: left;
+  color: inherit;
+  min-width: 0;
+  min-height: var(--tap);
+  display: block;
+}
+
+/* The title, not the whole row, is what the hover cue belongs on: the row already has a border of
+   its own and moving it would make "current" and "hovered" hard to tell apart. */
+button.row-main:hover .row-title {
+  color: var(--accent);
+}
+
 .row-title {
   display: block;
   overflow-wrap: anywhere;

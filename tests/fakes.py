@@ -151,6 +151,9 @@ class FakePlayer:
     repeat: str = "off"
     shuffle: bool = False
     items: list[QueueItem] = field(default_factory=list)
+    #: The queue item the fake considers loaded. ``None`` means "the first one", which is what a
+    #: daemon that has never been told otherwise does; :meth:`play_item` sets it.
+    current: str | None = None
     rescans: int = 0
     scan_waits: int = 0
     #: ``None`` means "every path is already indexed". A set makes anything outside it unknown to
@@ -186,7 +189,9 @@ class FakePlayer:
 
     def status(self) -> PlayerStatus:
         self._guard()
-        now = self.items[0] if self.items else None
+        now = next((item for item in self.items if item.id == self.current), None)
+        if now is None:
+            now = self.items[0] if self.items else None
         return PlayerStatus(
             state=self.state,
             volume=self.volume,
@@ -299,9 +304,26 @@ class FakePlayer:
         self._guard()
         return list(self.items)
 
+    def play_item(self, item_id: str) -> None:
+        """Jump to one queue item, and refuse an id that is not in the queue.
+
+        As strict as the real adapter, for the reason :meth:`set_repeat` gives: OwnTone answers a
+        bad id with ``400``, so a fake that shrugged would let a route test pass against a request
+        the daemon rejects. The route is supposed to have looked in the queue first.
+        """
+        self._guard()
+        if not any(item.id == item_id for item in self.items):
+            from tunebox.errors import PlayerError
+
+            raise PlayerError(f"no queue item with id {item_id!r}")
+        self.commands.append(f"play_item:{item_id}")
+        self.current = item_id
+        self.state = "play"
+
     def clear_queue(self) -> None:
         self._guard()
         self.items = []
+        self.current = None
 
     def enqueue_paths(
         self, paths, *, clear: bool = False, start: bool = False

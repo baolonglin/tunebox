@@ -101,6 +101,10 @@ ROUTES = (
     ("GET", "/player/queue"),
     ("POST", "/player/queue"),
     ("DELETE", "/player/queue"),
+    # The only parameterised route in this router. Listed by its *template*, which is what
+    # ``test_the_router_exposes_only_the_port`` compares against — and it still answers 401
+    # unauthenticated, because the token middleware runs before anything is routed.
+    ("PUT", "/player/queue/{item_id}/play"),
     ("GET", "/library"),
     ("DELETE", "/library"),
 )
@@ -454,6 +458,127 @@ class TestQueue:
         assert (
             client.post("/player/queue", headers=AUTH, json={"paths": [AUTOBAHN]}).status_code == 503
         )
+
+
+class TestPlayingAQueueItem:
+    """``PUT /player/queue/{item_id}/play`` — tapping a row in the remote's queue.
+
+    The queue panel used to be a display: the rows were drawn with no action on them, so the only
+    way to reach track seven was ⏭ six times. This is the route behind making the row itself the
+    button, and what is worth testing is the two things that are *not* the happy path: an id the
+    caller read two seconds ago may already be gone, and the queue must come out of this reordered by
+    nothing and shortened by nothing — a jump is not a skip.
+    """
+
+    def queued(self, client: TestClient, config: Config) -> list[dict]:
+        add_track(config, AUTOBAHN)
+        add_track(config, MODEL)
+        response = client.post(
+            "/player/queue", headers=AUTH, json={"paths": [AUTOBAHN, MODEL], "mode": "replace"}
+        )
+        assert response.status_code == 201
+        return response.json()["queue"]
+
+    def test_it_plays_the_item_that_was_asked_for(
+        self, client: TestClient, player: FakePlayer, config: Config
+    ):
+        items = self.queued(client, config)
+        second = items[1]["id"]
+
+        body = client.put(f"/player/queue/{second}/play", headers=AUTH).json()
+
+        assert player.commands == [f"play_item:{second}"]
+        assert body["item_id"] == second
+        assert body["now_playing"]["title"] == "Das Model"
+        assert body["state"] == "play"
+
+    def test_the_queue_is_not_reordered_or_consumed(
+        self, client: TestClient, player: FakePlayer, config: Config
+    ):
+        """A jump is not a skip. ``⏭`` on the way to track seven would have thrown six tracks away
+        with ``consume`` on, and even without it the queue is what the panel is showing — a route
+        that rebuilt it would make the row somebody tapped move under their thumb."""
+        items = self.queued(client, config)
+
+        body = client.put(f"/player/queue/{items[1]['id']}/play", headers=AUTH).json()
+
+        assert [item["id"] for item in body["queue"]] == [item["id"] for item in items]
+        assert [item["title"] for item in body["queue"]] == ["Autobahn", "Das Model"]
+
+    def test_it_is_absolute_so_two_taps_land_in_the_same_place(
+        self, client: TestClient, player: FakePlayer, config: Config
+    ):
+        """Same reasoning as the repeat *mode* rather than a cycle: the session is shared, so an id
+        is idempotent where "the next one" would depend on a poll that is already stale."""
+        items = self.queued(client, config)
+        first = items[0]["id"]
+
+        client.put(f"/player/queue/{first}/play", headers=AUTH)
+        body = client.put(f"/player/queue/{first}/play", headers=AUTH).json()
+
+        assert body["item_id"] == first
+        assert player.commands == [f"play_item:{first}", f"play_item:{first}"]
+
+    def test_the_track_already_loaded_is_not_a_dead_row(
+        self, client: TestClient, player: FakePlayer, config: Config
+    ):
+        """The row that does nothing is the bug being fixed, and the currently-playing row is the one
+        most likely to be tapped by accident *and* on purpose. It restarts the track — the remote's
+        label for that row says "Restart", so the behaviour is not a surprise."""
+        items = self.queued(client, config)
+        current = client.get("/player", headers=AUTH).json()["item_id"]
+        assert current == items[0]["id"]
+
+        assert client.put(f"/player/queue/{current}/play", headers=AUTH).status_code == 200
+        assert player.commands == [f"play_item:{current}"]
+
+    def test_an_id_that_is_no_longer_in_the_queue_is_a_404(
+        self, client: TestClient, player: FakePlayer, config: Config
+    ):
+        """The ordinary failure, not an exotic one: the remote polls every two seconds, so another
+        phone clearing the queue while a thumb is in the air is the expected way to get here."""
+        items = self.queued(client, config)
+        gone = items[1]["id"]
+        client.delete("/player/queue", headers=AUTH)
+
+        response = client.put(f"/player/queue/{gone}/play", headers=AUTH)
+
+        assert response.status_code == 404
+        assert "queue" in response.json()["error"]
+        assert player.commands == []
+
+    @pytest.mark.parametrize("given", ["bogus", "0", "-1", "9999", "1.5", "%20", "null"])
+    def test_a_nonsense_id_is_a_404_rather_than_a_500(
+        self, client: TestClient, player: FakePlayer, config: Config, given: str
+    ):
+        """It is refused by *looking in the queue*, which is a check no spelling of an id can get
+        past — and so the adapter's own integer check (``_item_id``) is unreachable from HTTP, which
+        is what makes it a ``ValueError`` there and not a handled failure."""
+        self.queued(client, config)
+
+        assert client.put(f"/player/queue/{given}/play", headers=AUTH).status_code == 404
+        assert player.commands == []
+
+    def test_nothing_can_be_played_out_of_an_empty_queue(
+        self, client: TestClient, player: FakePlayer
+    ):
+        assert client.put("/player/queue/1/play", headers=AUTH).status_code == 404
+        assert player.commands == []
+
+    def test_a_dead_daemon_is_503_and_not_a_missing_item(
+        self, client: TestClient, player: FakePlayer, config: Config
+    ):
+        """The 404 must mean "that item is gone", so a daemon that cannot be asked at all has to
+        answer differently — otherwise a remote would redraw a queue it has no information about."""
+        items = self.queued(client, config)
+        player.unavailable = True
+        assert client.put(f"/player/queue/{items[0]['id']}/play", headers=AUTH).status_code == 503
+
+    def test_there_is_no_play_by_position_route(self, client: TestClient, config: Config):
+        """A position is only true of the poll it came from. The id is the whole point, so the
+        obvious convenience route is asserted absent rather than merely not written."""
+        for path in ("/player/queue/0", "/player/queue/position/0", "/player/queue/0/position"):
+            assert client.put(path, headers=AUTH).status_code in (404, 405), path
 
 
 class TestQueuePathSafety:

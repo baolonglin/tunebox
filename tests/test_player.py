@@ -670,6 +670,75 @@ class TestQueue:
         assert "GET /api/queue" not in stub.calls()
 
 
+# --------------------------------------------------------------- jumping in the queue
+
+
+class TestPlayItem:
+    """``play_item`` — ``PUT /api/player/play?item_id=N``, the call behind tapping a queue row.
+
+    Measured against the running daemon, 2026-09-28: a jump to an item further down the queue is
+    ``204`` and ``GET /api/player`` then reports that ``item_id``; ``99999``, ``bogus`` and an empty
+    value are each ``400`` with an **HTML** body. That last detail is why the id is checked on this
+    side — an unchecked bad id would reach a caller as a ``502`` quoting a markup fragment.
+    """
+
+    def test_it_asks_the_daemon_to_start_at_that_item(self, player: OwnTonePlayer, stub):
+        player.play_item("48")
+        assert stub.calls() == ["PUT /api/player/play"]
+        assert stub.params("PUT", "/api/player/play")["item_id"] == ["48"]
+
+    def test_an_integer_id_is_accepted_because_the_daemon_sends_integers(
+        self, player: OwnTonePlayer, stub
+    ):
+        """``QueueItem.id`` is normalised to ``str`` by ``_as_str`` precisely because OwnTone sends
+        some ids as JSON numbers, so a caller holding the raw value must not be punished for it."""
+        player.play_item(48)
+        assert stub.params("PUT", "/api/player/play")["item_id"] == ["48"]
+
+    def test_the_position_parameter_is_not_used(self, player: OwnTonePlayer, stub):
+        """``^/api/player/play$`` takes ``position`` as well, and it is the wrong one: the queue is
+        shared, so a position is only true of the poll it came from."""
+        player.play_item("7")
+        assert "position" not in stub.params("PUT", "/api/player/play")
+
+    @pytest.mark.parametrize(
+        "given", ["", "   ", "bogus", "1.5", "-1", "1,2", "3 ; drop", None, True, 1.5, b"1", "٣", "²"]
+    )
+    def test_an_id_that_is_not_an_integer_never_reaches_the_daemon(
+        self, player: OwnTonePlayer, stub, given
+    ):
+        """OwnTone's ids are unsigned integers. ``"٣"`` and ``"²"`` are the interesting ones:
+        ``str.isdigit()`` is true of both and ``int()`` accepts the first, so a digit-shaped string
+        that no C ``strtol`` will read is exactly what has to be refused rather than forwarded."""
+        with pytest.raises(ValueError) as caught:
+            player.play_item(given)
+        assert "positive integer" in str(caught.value)
+        assert stub.calls() == []
+
+    def test_the_queue_is_left_alone(self, player: OwnTonePlayer, stub):
+        """A jump is not a skip and not a re-add: one request, and none of it touches ``/api/queue``.
+        Anything that rebuilt the queue would move the row under the thumb that tapped it."""
+        player.play_item("2")
+        assert stub.calls() == ["PUT /api/player/play"]
+
+    def test_an_id_the_daemon_refuses_is_a_player_error_not_a_crash(
+        self, player: OwnTonePlayer, stub
+    ):
+        """The measured race: the item was in the queue when the remote read it and gone by the time
+        the command arrived. ``tunebox.api.remote`` checks the queue first so this is rare, but the
+        window cannot be closed from here — and it has to stay inside the exception tree."""
+        stub.on("PUT", "/api/player/play", None, status=400)
+        with pytest.raises(PlayerError) as caught:
+            player.play_item("99999")
+        assert "HTTP 400" in str(caught.value)
+
+    def test_it_is_a_command_and_not_a_query(self, player: OwnTonePlayer, stub):
+        """No body, and no read of the state first: the response redraws the caller's screen, and a
+        read-then-write here would race whatever else is driving the session."""
+        player.play_item("5")
+        assert stub.body("PUT", "/api/player/play") is None
+
+
 # ------------------------------------------------------- the expression escaping
 
 

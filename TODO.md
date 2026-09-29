@@ -72,7 +72,75 @@ transport already rewrote.
 
 ---
 
+## Tapping the queue plays the song — **done, 2026-09-28**
+
+The Now-playing panel drew the queue and the queue did nothing. Rows rendered, titles were right, the
+loaded track was highlighted — and a tap was swallowed, because `renderPlayer` built each row with an
+empty action list. So the only way to reach track seven was ⏭ six times, and the one gesture everybody
+arrives already knowing was the one thing on the page that was inert.
+
+- [x] **Play a song from the queue** — tap the row.
+
+`PUT /player/queue/{item_id}/play`, `Player.play_item` on the port, and the queue row's main area is
+now a real `<button>`.
+
+**Verified against the running daemon, 2026-09-28.** The call was not in the JSON API's route table
+as such — `^/api/player/play$` is, and the parameters are in the binary's strings next to their own
+error messages (`No queue item with item id '%d'`):
+
+```
+PUT /api/player/play?item_id=<in the queue>  -> 204, GET /api/player then reports that item_id
+PUT /api/player/play?item_id=99999           -> 400 (HTML body)
+PUT /api/player/play?item_id=bogus           -> 400 (HTML body)
+PUT /api/player/play?item_id=                -> 400 (HTML body)
+```
+
+And end to end through the real app against the real daemon: `200`, `item_id` and `now_playing` move
+to the tapped item, the queue comes back identical, a stale id is `404`, no token is `401`.
+
+Four decisions, each of which had a wrong version that looks fine:
+
+- **An id, not a position.** OwnTone's route accepts both. A position is only true of the poll it
+  came from, and this session is shared — two phones and OwnTone's own web UI (PLAN.md 2) — so the
+  tap that landed on row four would play whatever row four had become. Same argument as the repeat
+  *mode* rather than a cycle, and `test_there_is_no_play_by_position_route` pins it.
+- **Not a path either.** Paths are this port's vocabulary for the *library*, but the same file can be
+  in the queue twice, so a path names no single item. `QueueItem.id` was already in the protocol and
+  already reported as `PlayerStatus.item_id`, so nothing about which daemon is playing leaks out that
+  was not already out — fallback A still only has to implement `play_item`.
+- **The queue is checked before the command is sent.** A remote polls every two seconds, so the
+  ordinary failure is a row somebody else removed while a thumb was in the air. Without the check the
+  answer would be the daemon's `400` *with an HTML body*, surfacing as a `502` quoting a markup
+  fragment; with it, that case is a `404` a client can recognise. It also makes the adapter's own
+  integer check unreachable from HTTP, which is why `_item_id` raises `ValueError` and not a
+  `TuneboxError` — same reasoning as `_repeat_state`. (`isascii()` as well as `isdigit()`: the latter
+  is true of `"٣"` and `int()` accepts it, and no C `strtol` will.)
+- **The row is the button, and it is a real `<button>`.** A click handler on the existing `<div>`
+  would have looked identical in a screenshot and been unreachable by keyboard, silent to a screen
+  reader, and deaf to Enter and Space — the standard way this pattern is got wrong. `row()` grew an
+  optional `activate`, and when it is given the main area is a button with the `button` rule's border
+  and fill undone (a filled control the width of every row reads as a wall of buttons) but its focus
+  ring kept. No per-row "Play" label: a queue is a list of things to play, so the verb on every row
+  would be noise, and the row is a 44px target where a corner button is not.
+
+The row already playing is **not** exempt, because a dead row is the bug being fixed; it restarts the
+track, and its accessible name says `Restart “…”` rather than `Play “…”` so that is not a surprise.
+No CLI verb, as with the last two items: `tunebox player play FILE…` already plays a file directly,
+and "the fourth thing in the queue" is a thing you point at, not a thing you type.
+
+One measured thing the UI does not hide: for **~2.5 s after the jump** the daemon answers
+`state=pause, item_progress_ms=0` while the Cast output starts, then flips to `play` on its own with
+no further command (sampled every 0.5 s on the real soundbar). The response redraws the panel, so the
+transport button shows ▶ until the next poll. That is the daemon being honest and the same lag
+`playback=start` on a queue add already had, so nothing optimistic was added to paper over it —
+rule 2 of `app.js` is that the server is the only source of truth about playback.
+
+Tests 1198 → 1244.
+
+---
+
 ## Delete from the library — **done, 2026-09-27**
+
 
 The Library panel offered **Play** (replace the queue and start) and **Queue** (append) and nothing
 else, so the remote was a one-way door: a mistagged ingest, a wrong search result or a duplicate could

@@ -311,3 +311,38 @@ def clear_queue(request: Request) -> QueueAddedView:
     player = _player(request)
     player.clear_queue()
     return QueueAddedView(queue=[QueueItemView(**item.as_dict()) for item in player.queue()])
+
+
+@router.put(
+    "/queue/{item_id}/play",
+    response_model=PlayerView,
+    summary="Play an item that is already in the queue",
+)
+def play_queue_item(item_id: str, request: Request) -> PlayerView:
+    """Jump to one queue item — what tapping a row in the remote's queue does.
+
+    The id in the path is the ``id`` from ``GET /player`` (or ``GET /player/queue``), not a position
+    and not a path: the queue is shared (PLAN.md 2), so a position is relative to a snapshot another
+    phone can invalidate between a poll and a tap, and the same file may legitimately be in the queue
+    twice, so a path names no single item.
+
+    **The queue is checked before the command is sent**, and the ``404`` that comes out of it is the
+    point. A remote polls every two seconds, so the ordinary failure here is a row somebody else
+    removed while a thumb was on its way to it — a *gone* resource, which the client can recognise and
+    redraw from. Without the check the answer would be OwnTone's own refusal, which is HTTP ``400``
+    with an HTML body (measured 2026-09-28) and would surface as a ``502`` about a markup fragment.
+
+    Playing the item that is *already* loaded is allowed and restarts it, because that is what the
+    absolute command means and a row that quietly does nothing is the bug this route was added to
+    fix. The remote's label for that row says so.
+    """
+    player = _player(request)
+    if not any(item.id == item_id for item in player.queue()):
+        # 404 and not 409: the id names a resource, and "it is not there" is the whole answer. A
+        # client is expected to hit this occasionally and simply refresh.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no queue item with id {item_id!r} — the queue has changed since it was read",
+        )
+    player.play_item(item_id)
+    return _view(player, _config(request))
