@@ -394,6 +394,20 @@
       select.hidden = false;
     }
 
+    // Playing with nothing attached. Everything above this line — the title, the moving progress
+    // bar, the ⏸ glyph — is true of the daemon's queue and a lie about the room, so the fact that
+    // no audio exists anywhere has to be said outright rather than left to be inferred from a
+    // "— off" at the end of a muted line. Measured: OwnTone keeps `state: play` and keeps counting
+    // after `All selected speakers failed to start`.
+    const alert = el("speaker-alert");
+    if (player.playing_without_output) {
+      alert.textContent = "Playing, but no speaker is attached — nothing is coming out.";
+      alert.hidden = false;
+    } else {
+      alert.textContent = "";
+      alert.hidden = true;
+    }
+
     renderQueue(player);
   }
 
@@ -496,12 +510,34 @@
     }, "player");
   }
 
+  /**
+   * Turn the speaker on, and say so while waiting.
+   *
+   * This is the one control whose request is *slow on purpose*: a sleeping Cast speaker refuses the
+   * first connection, so the server retries for up to about four seconds rather than handing back a
+   * failure that has already stopped being true. Four seconds of a button that looks untouched reads
+   * as a button that does nothing, which is the bug this whole change is about — so the label says
+   * what is happening and the button refuses a second tap while it is happening.
+   */
+  async function waking() {
+    const button = el("btn-select");
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = "Waking the speaker…";
+    try {
+      await command("/player/output/select");
+    } finally {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  }
+
   function wireTransport() {
     el("btn-toggle").addEventListener("click", () => command("/player/toggle"));
     el("btn-prev").addEventListener("click", () => command("/player/previous"));
     el("btn-next").addEventListener("click", () => command("/player/next"));
     el("btn-stop").addEventListener("click", () => command("/player/stop"));
-    el("btn-select").addEventListener("click", () => command("/player/output/select"));
+    el("btn-select").addEventListener("click", waking);
 
     // The *absolute* next mode, not "advance": the session is shared, so a relative command from a
     // phone holding a two-second-old poll could land somewhere neither phone asked for. Sending the

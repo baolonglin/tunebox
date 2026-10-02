@@ -52,3 +52,19 @@ class OutputNotFound(PlayerError):
     requires that it be re-selected automatically when it comes back, which is
     :class:`tunebox.player.selection.OutputKeeper`'s job.
     """
+
+
+class OutputUnreachable(PlayerError):
+    """The speaker *is* listed, and the daemon could not bring it up.
+
+    The distinct case between :class:`OutputNotFound` ("it is not there") and a plain
+    :class:`PlayerError` ("that command was wrong"), and the one a Cast device produces most often:
+    an LG soundbar in standby keeps advertising ``_googlecast._tcp`` while its Wi-Fi stops answering
+    ARP, so OwnTone lists it, fails to open the control channel on port 8009 with ``No route to
+    host``, and answers the enable with ``400`` and an HTML body. Measured on this household's
+    hardware against OwnTone 29.3, 2026-09-30.
+
+    Retryable, and that is why it is separate: the API maps it to ``503`` rather than ``502``, and
+    the message says "try again in a moment" because on the measured failure a later attempt
+    connected with nothing else changed.
+    """

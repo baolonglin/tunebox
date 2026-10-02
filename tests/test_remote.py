@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 
 from tunebox import library
 from tunebox.config import Config
+from tunebox.errors import OutputUnreachable
 from tunebox.jobs.store import JobStore
 
 from fakes import SOUNDBAR, FakePlayer, FakeSource, RecordingTagWriter
@@ -392,6 +393,66 @@ class TestOutputSelection:
         """A genuinely missing resource: an unplugged soundbar is not on the network to be found."""
         player.present = False
         assert client.put("/player/output/select", headers=AUTH).status_code == 404
+
+    def test_a_speaker_that_will_not_come_up_is_a_503_a_human_can_read(
+        self, client: TestClient, player: FakePlayer
+    ):
+        """Listed but refusing to start — a Cast device in standby, measured on the real hardware.
+
+        ``503`` because the client's move is to try again, not ``502`` (which is what a plain
+        ``PlayerError`` gives) and not ``404`` (the speaker is right there in the output list). And
+        the message must be a sentence: the daemon's own answer to this is an HTML error page, and
+        the whole point of the dedicated error type is that no markup reaches the phone.
+        """
+        player.select_error = OutputUnreachable(
+            "the player has output 9999 listed but could not bring it up after 3 attempt(s). "
+            "A Cast speaker in standby does exactly this, so try again in a moment."
+        )
+        response = client.put("/player/output/select", headers=AUTH)
+        assert response.status_code == 503
+        assert "<html>" not in response.json()["error"]
+        assert "try again in a moment" in response.json()["error"]
+
+
+class TestPlayingIntoNothing:
+    """The one state where every other field looks healthy and the room is silent.
+
+    Measured on the real daemon: after ``All selected speakers failed to start`` OwnTone keeps
+    reporting ``state: play`` and keeps advancing ``item_progress_ms``, so a remote that trusted the
+    transport drew a moving progress bar for three minutes of silence.
+    """
+
+    def test_playing_with_no_output_attached_is_reported(
+        self, client: TestClient, player: FakePlayer
+    ):
+        player.state = "play"
+        player.selected = False
+        assert client.get("/player", headers=AUTH).json()["playing_without_output"] is True
+
+    def test_playing_on_a_selected_speaker_is_not_flagged(
+        self, client: TestClient, player: FakePlayer
+    ):
+        player.state = "play"
+        player.selected = True
+        assert client.get("/player", headers=AUTH).json()["playing_without_output"] is False
+
+    def test_not_playing_is_not_flagged_however_the_speakers_are(
+        self, client: TestClient, player: FakePlayer
+    ):
+        """Stopped with nothing attached is the normal resting state, not a fault."""
+        player.state = "stop"
+        player.selected = False
+        assert client.get("/player", headers=AUTH).json()["playing_without_output"] is False
+
+    def test_an_invisible_speaker_while_playing_is_still_flagged(
+        self, client: TestClient, player: FakePlayer
+    ):
+        """The soundbar vanishing mid-song is exactly when this matters most."""
+        player.state = "play"
+        player.present = False
+        body = client.get("/player", headers=AUTH).json()
+        assert body["output"] is None
+        assert body["playing_without_output"] is True
 
 
 # ------------------------------------------------------------------------- queue

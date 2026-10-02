@@ -518,6 +518,46 @@ class TestTheTokenReveal:
         assert 'id="btn-show-token"' in markup
 
 
+class TestTheSilentRoom:
+    """Two things the page must say about a speaker that is not carrying the audio.
+
+    Both exist because of a measured three-minute silence on the real hardware: OwnTone reported
+    ``state: play`` and advanced the clock while every speaker had failed to start, so the phone drew
+    a confident now-playing screen for a room with no sound in it. A DOM-level assertion cannot see
+    that; what it *can* pin is that the page has somewhere to say it and something to say.
+    """
+
+    @staticmethod
+    def code(name: str) -> str:
+        return TestTheAssetsThemselves.code(name)
+
+    def test_the_now_playing_panel_has_a_place_to_say_it(self):
+        markup = self.code("index.html")
+        panel = markup[markup.index('id="panel-now"') : markup.index('id="panel-add"')]
+        assert 'id="speaker-alert"' in panel
+        # Announced, but politely: it is not an error the user caused, and `alert` would interrupt.
+        alert = re.search(r'<p[^>]*id="speaker-alert"[^>]*>', panel)
+        assert alert and 'role="status"' in alert.group(0)
+        assert alert and "hidden" in alert.group(0), "it must not be visible before the first poll"
+
+    def test_the_message_names_the_symptom_and_not_the_field(self):
+        """"nothing is coming out" is the fact somebody in the room can check. A message about
+        outputs not being selected describes the daemon's data model instead."""
+        script = self.code("app.js")
+        assert "playing_without_output" in script
+        assert "nothing is coming out" in script
+
+    def test_the_wake_button_says_it_is_working(self):
+        """The select request is *slow on purpose* — the server retries a sleeping speaker — so a
+        button that looked untouched for four seconds would read as a button that does nothing."""
+        script = self.code("app.js")
+        assert "Waking the speaker" in script
+        # And it must refuse a second tap while the first is in flight.
+        waking = script[script.index("async function waking()") :]
+        assert "disabled = true" in waking[: waking.index("finally")]
+        assert "disabled = false" in waking
+
+
 class TestPlaybackModeControls:
     """The tri-state repeat button and the shuffle toggle (TODO.md, *Playback modes*).
 

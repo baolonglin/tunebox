@@ -162,6 +162,14 @@ class PlayerView(BaseModel):
     #: button instead of leaving someone wondering why there is no sound.
     output: OutputView | None = None
     output_selected: bool = False
+    #: The daemon says it is playing and **no** output at all is enabled, so the audio is going
+    #: nowhere. Its own field rather than something the client derives, because it is the one state
+    #: where every other thing in this response looks healthy: measured on the real daemon, OwnTone
+    #: logs ``All selected speakers failed to start`` and then keeps ``state: play`` with
+    #: ``item_progress_ms`` advancing, so a remote that trusted the transport drew a moving progress
+    #: bar for a silent room. Any selected output counts, not just the configured one — audio
+    #: reaching the wrong speaker is a different complaint from audio reaching none.
+    playing_without_output: bool = False
 
 
 class VolumeRequest(BaseModel):

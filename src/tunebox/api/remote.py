@@ -108,6 +108,7 @@ def _view(player: Player, config: Config, status_: PlayerStatus | None = None) -
         queue=[QueueItemView(**item.as_dict()) for item in player.queue()],
         output=OutputView(**target.as_dict()) if target else None,
         output_selected=bool(target and target.selected),
+        playing_without_output=state.playing and not state.selected_outputs,
     )
 
 
@@ -251,6 +252,11 @@ def select_output(request: Request) -> PlayerView:
     off on purpose and now wants it back without waiting for the next power-cycle. Accepting an
     arbitrary id would also make the remote able to enable a *neighbour's* Cast device, which is
     reachable from a home network and is nobody's idea of a feature.
+
+    Slow on purpose when the speaker is asleep: the adapter retries the enable (see
+    :meth:`~tunebox.player.owntone.OwnTonePlayer.select_output`), so this route can take a few
+    seconds before answering ``503``. That is the right trade for the one button whose whole job is
+    to wake a device that refuses its first connection.
     """
     player = _player(request)
     config = _config(request)

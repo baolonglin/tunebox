@@ -145,6 +145,10 @@ class FakePlayer:
     #: Listing the output works but selecting it fails — the race a speaker dropping off Wi-Fi
     #: between two requests actually produces.
     fail_select: bool = False
+    #: A specific exception for :meth:`select_output` to raise, for the cases where *which* failure
+    #: it is decides the status code: a speaker in standby (``OutputUnreachable``, 503) is not the
+    #: same answer as a daemon that is down (``PlayerUnavailable``, also 503) or an absent one (404).
+    select_error: Exception | None = None
     state: str = "stop"
     volume: int = 30
     #: One of :data:`tunebox.core.models.REPEAT_MODES`, as the daemon would report it.
@@ -220,6 +224,8 @@ class FakePlayer:
 
     def select_output(self, output_id: str, *, volume: int | None = None) -> None:
         self._guard()
+        if self.select_error is not None:
+            raise self.select_error
         if self.fail_select:
             raise PlayerUnavailable("the speaker went away between listing and selecting")
         with self._lock:

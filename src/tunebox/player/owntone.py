@@ -43,9 +43,14 @@ from typing import Any, Sequence
 
 from ..config import Config
 from ..core.models import REPEAT_MODES, Output, PlayerStatus, QueueItem
-from ..errors import OutputNotFound, PlayerError, PlayerUnavailable
+from ..errors import OutputNotFound, OutputUnreachable, PlayerError, PlayerUnavailable
 
 log = logging.getLogger(__name__)
+
+#: Pause after a refused ``enable``, doubling per attempt. Half a second because the refusal itself
+#: already takes about one (the connect to port 8009 has to time out first), so the useful part of
+#: the wait is mostly the daemon's, not ours.
+_ENABLE_BACKOFF = 0.5
 
 #: Characters that terminate a string in OwnTone's expression lexer, so they can never appear
 #: inside one. See the module docstring.
@@ -286,17 +291,78 @@ class OwnTonePlayer:
         return self.find_output(output_id=self._config.output_id, name=self._config.output_name)
 
     def select_output(self, output_id: str, *, volume: int | None = None) -> None:
-        """Enable one output without touching the others.
+        """Enable one output without touching the others, retrying a speaker that is waking up.
 
         ``PUT /api/outputs/{id}`` rather than ``PUT /api/outputs/set``: the latter takes the full
         list of enabled outputs and *disables everything absent from it*, which would make
         selecting the soundbar silently switch off any other speaker — wrong now, and actively
         destructive if Phase 6's second speaker ever appears.
+
+        **Why this retries.** A Cast device in standby is the ordinary state of a soundbar somebody
+        is about to use, and it is not the same as an absent one: it keeps advertising over mDNS, so
+        the daemon lists it, and then the connection to port 8009 fails with ``No route to host``
+        and the enable comes back ``400``. Measured on this household's hardware (OwnTone 29.3,
+        2026-09-30): three consecutive enables failed that way over twelve seconds, and an attempt
+        fifty-four seconds later established ``TLS1.3`` and played, with nothing reconfigured in
+        between. So the failure is transient by nature and a single attempt turns it into a dead
+        button. The whole call is bounded — :attr:`Config.output_select_attempts` attempts with a
+        doubling pause, about four seconds in the worst case — because the caller is a phone waiting
+        on a tap, not a background job.
+
+        **Why it re-reads the output list between attempts.** OwnTone answers *both* "I could not
+        start that speaker" and "there is no such id" with the same ``400`` and the same generic
+        HTML body (measured: id ``999999`` and id ``bogus`` are indistinguishable from a real device
+        that will not come up), so the status code cannot tell them apart. Asking which one it is
+        costs one loopback GET and turns the second case into an accurate
+        :class:`~tunebox.errors.OutputNotFound` — a speaker really can leave between being listed
+        and being selected, and retrying then would be pointless.
+
+        The error this ends with carries **none of the daemon's answer**, deliberately: that answer
+        is a full HTML error page, and a remote whose "speaker is asleep" message is a markup
+        fragment in a toast on a phone is the failure this method exists to stop. The daemon's text
+        is in the log and on ``__cause__``, where whoever is debugging can reach it.
         """
         body: dict[str, Any] = {"selected": True}
         if volume is not None:
             body["volume"] = _clamp_volume(volume)
-        self._client.put(f"/api/outputs/{urllib.parse.quote(output_id, safe='')}", body=body)
+        path = f"/api/outputs/{urllib.parse.quote(output_id, safe='')}"
+        attempts = max(1, int(self._config.output_select_attempts))
+        delay = _ENABLE_BACKOFF
+        last: PlayerError | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                self._client.put(path, body=body)
+            except PlayerUnavailable:
+                # The *daemon* is not answering. Retrying here would only delay the true answer,
+                # and it is a different fix ("start OwnTone") from the one below.
+                raise
+            except PlayerError as exc:
+                last = exc
+                log.info(
+                    "could not enable output %s (attempt %d/%d): %s",
+                    output_id,
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                if attempt == attempts:
+                    break
+                # Raises OutputNotFound if it has gone, which ends this loop with the truth.
+                self.find_output(output_id=output_id)
+                time.sleep(delay)
+                delay *= 2
+                continue
+            if attempt > 1:
+                log.info("output %s came up on attempt %d of %d", output_id, attempt, attempts)
+            return
+
+        raise OutputUnreachable(
+            f"the player has output {output_id} listed but could not bring it up after "
+            f"{attempts} attempt(s). A Cast speaker in standby does exactly this: it is still "
+            "advertised on the network while it stops answering, so try again in a moment. "
+            'The reason is in the player\'s own log (look for "Could not connect").'
+        ) from last
 
     def deselect_output(self, output_id: str) -> None:
         self._client.put(

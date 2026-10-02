@@ -13,6 +13,10 @@ mistake that is easy to make and expensive to find:
   machine, so a dry run that quietly created a directory would make the whole promise worthless.
 * **The ``owntone.conf`` editor is tested against realistic input**, including the two cases that
   broke it while it was being written: a setting that is commented out, and a value that spans lines.
+* **The launchd agents are written for real** and their contents asserted, for both tunebox and the
+  player daemon, because a ``--dry-run`` cannot show the contents of a file it does not write and the
+  contents are the whole point: ``KeepAlive`` is the difference between a daemon that survives a
+  reboot and one somebody restarts by hand.
 
 What is deliberately *not* tested here: whether ``apt-get`` has the packages, whether OwnTone builds,
 and whether the service survives a reboot. None of those can be established from here, and the
@@ -33,7 +37,10 @@ REPO = Path(__file__).resolve().parent.parent
 DEPLOY = REPO / "deploy"
 INSTALL = DEPLOY / "install.sh"
 OWNTONE = DEPLOY / "owntone-setup.sh"
-SCRIPTS = (INSTALL, OWNTONE)
+START = DEPLOY / "start.sh"
+SCRIPTS = (INSTALL, OWNTONE, START)
+# The two that parse tunebox.env with sed, and therefore have to undo its quoting by hand.
+SED_READERS = (INSTALL, OWNTONE)
 
 
 def run(argv, **kwargs) -> subprocess.CompletedProcess:
@@ -889,10 +896,14 @@ class TestTheEnvFileStaysSourceable:
         hand, so it has to model quoting rather than demonstrate the bug."""
         assert "#TUNEBOX_OUTPUT='Living Room speaker'" in INSTALL.read_text(encoding="utf-8")
 
-    @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
+    @pytest.mark.parametrize("script", SED_READERS, ids=lambda p: p.name)
     def test_both_scripts_unquote_on_read(self, script: Path):
         """Both read this file with the same ``sed``, so both need the same inverse. A file written
-        by one and read by the other is the normal case, not an edge case."""
+        by one and read by the other is the normal case, not an edge case.
+
+        ``start.sh`` is deliberately not in this list: it ``source``s the env file the way the service
+        wrapper does, so the shell does the unquoting and there is no inverse to get wrong.
+        """
         assert "unquote" in code(script)
 
     def test_a_bare_value_still_reads(self, tmp_path: Path):
@@ -916,3 +927,204 @@ class TestTheEnvFileStaysSourceable:
         # which proves the bare value was read intact.
         assert "not answering" in completed.stderr
         assert "no TUNEBOX_MUSIC_ROOT" not in completed.stderr
+
+
+# ------------------------------------------------------- supervising the player daemon
+
+
+class TestSupervisingOwnTone:
+    """The daemon has to be *supervised*, not merely started once.
+
+    The bug this covers was found on the macOS host: ``restart_owntone`` knew ``systemctl`` and
+    ``brew services`` only, so a source build — which is the documented macOS route, and which
+    installs to a ``--prefix`` that is on no ``PATH`` — fell through to "restart it yourself". Nothing
+    then supervised the player at all: it died with the terminal that started it and did not come back
+    after a reboot, and the symptom is a remote whose buttons all work while no sound comes out.
+
+    Tested here rather than by hand because the interesting properties are in the plist and in the
+    order of the launchctl calls, and a ``--dry-run`` cannot show the contents of a file it does not
+    write.
+    """
+
+    @staticmethod
+    def harness(tmp_path: Path, *, already_loaded: bool = False) -> tuple[Path, Path, Path]:
+        source = code(OWNTONE)
+        start = source.index("install_owntone_agent() {")
+        end = source.index("\nrestart_owntone() {", start)
+
+        prefix = tmp_path / "owntone_data"
+        (prefix / "usr" / "sbin").mkdir(parents=True)
+        binary = prefix / "usr" / "sbin" / "owntone"
+        binary.write_text("#!/usr/bin/env bash\nsleep 1\n", encoding="utf-8")
+        binary.chmod(0o755)
+        (prefix / "etc").mkdir()
+        conf = prefix / "etc" / "owntone.conf"
+        conf.write_text('general {\n\tuid = "someone"\n}\n', encoding="utf-8")
+
+        bin_dir = tmp_path / "shims"
+        bin_dir.mkdir()
+        state = tmp_path / "state"
+        state.write_text("loaded\n" if already_loaded else "gone\n", encoding="utf-8")
+        calls = tmp_path / "calls"
+        calls.write_text("", encoding="utf-8")
+        shim(
+            bin_dir,
+            "launchctl",
+            f"""
+STATE={state}
+CALLS={calls}
+echo "$1" >>"$CALLS"
+case "$1" in
+  print)
+    read -r value <"$STATE" || value=""
+    case "$value" in
+      loaded) exit 0 ;;
+      draining) echo gone >"$STATE"; exit 0 ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  bootout) echo draining >"$STATE"; exit 0 ;;
+  bootstrap)
+    read -r value <"$STATE" || value=""
+    if [ "$value" != gone ]; then
+      echo "Bootstrap failed: 5: Input/output error" >&2
+      exit 5
+    fi
+    echo loaded >"$STATE"
+    exit 0
+    ;;
+esac
+exit 0
+""",
+        )
+
+        agent = tmp_path / "Library" / "LaunchAgents" / "io.tunebox.owntone.plist"
+        script = tmp_path / "harness.sh"
+        script.write_text(
+            "set -euo pipefail\n"
+            "DRY_RUN=0\n"
+            'DIM=""\n'
+            'N=""\n'
+            f'CONF="{conf}"\n'
+            f'OWNTONE_BIN="{binary}"\n'
+            "LAUNCHD_OWNTONE_LABEL=io.tunebox.owntone\n"
+            f'OWNTONE_AGENT="{agent}"\n'
+            'say() { echo "==> $*"; }\n'
+            'info() { echo "    $*"; }\n'
+            'ok() { echo "ok $*"; }\n'
+            'warn() { echo "warn: $*" >&2; }\n'
+            'die() { echo "die: $*" >&2; exit 1; }\n'
+            "find_conf() { printf '%s' \"$CONF\"; }\n"
+            + source[start:end]
+            + "\ninstall_owntone_agent\n",
+            encoding="utf-8",
+        )
+        return script, agent, calls
+
+    @staticmethod
+    def shimmed(tmp_path: Path) -> dict[str, str]:
+        return {**os.environ, "PATH": f"{tmp_path / 'shims'}{os.pathsep}{os.environ['PATH']}"}
+
+    def test_it_writes_and_loads_the_agent(self, tmp_path: Path):
+        script, agent, calls = self.harness(tmp_path)
+        completed = run(["bash", str(script)], env=self.shimmed(tmp_path))
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert agent.is_file()
+        assert "bootstrap" in calls.read_text(encoding="utf-8")
+
+    def test_the_daemon_runs_in_the_foreground(self, tmp_path: Path):
+        """``-f`` is load-bearing, not a style choice: launchd supervises the process it spawned, so a
+        daemon that forked and exited would be declared dead and restarted forever."""
+        script, agent, _ = self.harness(tmp_path)
+        run(["bash", str(script)], env=self.shimmed(tmp_path))
+        assert "<string>-f</string>" in agent.read_text(encoding="utf-8")
+
+    def test_it_keeps_the_daemon_alive_and_starts_it_at_login(self, tmp_path: Path):
+        """The whole point of the change. Without both keys this is just a slower way of starting it
+        by hand."""
+        script, agent, _ = self.harness(tmp_path)
+        run(["bash", str(script)], env=self.shimmed(tmp_path))
+        plist = agent.read_text(encoding="utf-8")
+        assert "<key>KeepAlive</key><true/>" in plist
+        assert "<key>RunAtLoad</key><true/>" in plist
+
+    def test_it_names_the_conf_explicitly(self, tmp_path: Path):
+        """A source build's compiled-in default conf path is whatever ``--prefix`` was, and the agent
+        must not depend on guessing it right."""
+        script, agent, _ = self.harness(tmp_path)
+        run(["bash", str(script)], env=self.shimmed(tmp_path))
+        assert "owntone.conf" in agent.read_text(encoding="utf-8")
+
+    def test_a_reload_waits_for_the_unload(self, tmp_path: Path):
+        """The same asynchronous ``bootout`` that bit the installer: without the wait, ``bootstrap``
+        fails and the daemon is left not loaded at all."""
+        script, _, calls = self.harness(tmp_path, already_loaded=True)
+        completed = run(["bash", str(script)], env=self.shimmed(tmp_path))
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert "Bootstrap failed" not in completed.stderr
+        sequence = calls.read_text(encoding="utf-8").split()
+        assert "bootout" in sequence
+        assert sequence.index("bootout") < sequence.index("bootstrap")
+        # Polled between the two, rather than hoping a fixed sleep was enough.
+        assert "print" in sequence[sequence.index("bootout") : sequence.index("bootstrap")]
+
+    def test_it_stops_an_unsupervised_daemon_first(self, tmp_path: Path):
+        """Port 3689 is held by whatever somebody started by hand, and launchd would otherwise spawn a
+        second copy that exits on the bind and is restarted forever."""
+        script, _, _ = self.harness(tmp_path)
+        pidfile = tmp_path / "owntone_data" / "var" / "run" / "owntone.pid"
+        pidfile.parent.mkdir(parents=True, exist_ok=True)
+        # A process that really is alive and really is ours to signal.
+        victim = subprocess.Popen(["sleep", "120"])
+        try:
+            pidfile.write_text(f"{victim.pid}\n", encoding="utf-8")
+            completed = run(["bash", str(script)], env=self.shimmed(tmp_path))
+            assert completed.returncode == 0, completed.stdout + completed.stderr
+            assert victim.wait(timeout=30) is not None
+            assert not pidfile.exists()
+        finally:
+            if victim.poll() is None:
+                victim.kill()
+                victim.wait(timeout=10)
+
+
+class TestFindingASourceBuild:
+    """Discovery is what removes ``--conf`` from the command somebody has to remember.
+
+    ``find_conf`` used to know five fixed paths, none of which is where a ``--prefix`` build puts its
+    config — so on the macOS host the script had to be told, every time.
+    """
+
+    @staticmethod
+    def probe(tmp_path: Path, snippet: str) -> subprocess.CompletedProcess:
+        prefix = tmp_path / "owntone_data"
+        (prefix / "usr" / "sbin").mkdir(parents=True)
+        binary = prefix / "usr" / "sbin" / "owntone"
+        binary.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        binary.chmod(0o755)
+        (prefix / "etc").mkdir()
+        (prefix / "etc" / "owntone.conf").write_text("general {\n}\n", encoding="utf-8")
+
+        source = code(OWNTONE)
+        start = source.index("find_owntone_bin() {")
+        end = source.index("\napply_conf() {", start)
+        script = tmp_path / "probe.sh"
+        script.write_text(
+            "set -euo pipefail\n"
+            f'HOME="{tmp_path}"\n'
+            'info() { :; }\n'
+            'warn() { echo "warn: $*" >&2; }\n'
+            + source[start:end]
+            + f"\n{snippet}\n",
+            encoding="utf-8",
+        )
+        return run(["bash", str(script)], env={**os.environ, "HOME": str(tmp_path)})
+
+    def test_it_finds_a_binary_off_path(self, tmp_path: Path):
+        completed = self.probe(tmp_path, 'printf "%s" "$OWNTONE_BIN"')
+        assert completed.stdout == str(tmp_path / "owntone_data" / "usr" / "sbin" / "owntone")
+
+    def test_it_finds_the_conf_beside_the_prefix(self, tmp_path: Path):
+        """Derived from the binary rather than hard-coded, so any ``--prefix`` works."""
+        completed = self.probe(tmp_path, "find_conf")
+        assert completed.stdout == str(tmp_path / "owntone_data" / "etc" / "owntone.conf")

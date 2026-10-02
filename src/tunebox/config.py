@@ -70,6 +70,13 @@ DEFAULT_OUTPUT_NAME = "Living Room speaker"
 #: enough to be free.
 DEFAULT_OUTPUT_CHECK_INTERVAL = 15.0
 
+#: How many times to ask the daemon to enable the output before giving up. More than one because a
+#: Cast device in standby refuses the *first* connection and accepts a later one — measured on this
+#: household's soundbar, where the failing attempt is a one-second ``No route to host`` and the
+#: attempt a minute later established TLS with nothing else changed. Three, because each failed
+#: attempt costs about a second and a phone waiting on a button has a budget.
+DEFAULT_OUTPUT_SELECT_ATTEMPTS = 3
+
 #: Phase 4: how many files ``GET /library`` is willing to look at before it stops walking. The
 #: filesystem is the library database (PLAN.md 3.1), so a browse is a directory walk, and a walk of
 #: an accidentally-enormous root — a music root set to ``/`` by a typo — must not hold a worker
@@ -313,6 +320,11 @@ class Config:
     output_volume: int | None = None
     #: Seconds between output-selection checks. ``0`` disables the keeper entirely.
     output_check_interval: float = DEFAULT_OUTPUT_CHECK_INTERVAL
+    #: Attempts per "enable this speaker" command. See
+    #: :meth:`~tunebox.player.owntone.OwnTonePlayer.select_output`: a sleeping Cast device refuses
+    #: the first connection, so one attempt is a button that fails for a reason that has already
+    #: gone away by the time somebody reads the error.
+    output_select_attempts: int = DEFAULT_OUTPUT_SELECT_ATTEMPTS
     #: Trigger a library rescan after each successful ingest (PLAN.md Phase 3). On by default; it
     #: is the whole reason a freshly ingested track is playable without waiting for a periodic
     #: scan.
@@ -595,6 +607,9 @@ class Config:
             output_volume=_env_opt_int(env, "TUNEBOX_OUTPUT_VOLUME"),
             output_check_interval=_env_float(
                 env, "TUNEBOX_OUTPUT_CHECK_INTERVAL", DEFAULT_OUTPUT_CHECK_INTERVAL
+            ),
+            output_select_attempts=_env_int(
+                env, "TUNEBOX_OUTPUT_SELECT_ATTEMPTS", DEFAULT_OUTPUT_SELECT_ATTEMPTS
             ),
             rescan_after_ingest=_env_bool(env, "TUNEBOX_RESCAN_AFTER_INGEST", True),
             ui_enabled=_env_bool(env, "TUNEBOX_UI", True),

@@ -115,7 +115,7 @@ reachable from outside the house (PLAN.md 3.2).
 | `PUT /player/seek` | `{"position_ms": n}` |
 | `PUT /player/repeat` | `{"mode": "off" \| "all" \| "single"}` — nothing, the whole queue, or one song |
 | `PUT /player/shuffle` | `{"enabled": true \| false}` |
-| `PUT /player/output/select` | enable the configured speaker (no id is taken from the caller) |
+| `PUT /player/output/select` | enable the configured speaker (no id is taken from the caller); `503` if it is listed but will not start |
 | `GET`&nbsp;`POST`&nbsp;`DELETE /player/queue` | list, add library files, or empty it |
 | `PUT /player/queue/{id}/play` | jump to an item already in the queue — `404` if it has since gone |
 
@@ -229,6 +229,30 @@ knew was that it should be on"*.
 length. It reports `"reachable": false` with the reason when the daemon is down — and still answers
 `200`, because a monitor should not see an outage because a soundbar is unplugged.
 
+### Waking a speaker that is asleep
+
+A Cast device in standby is not the same thing as an absent one, and telling them apart is the
+difference between a button that works and a button that lies. A soundbar in standby keeps
+advertising itself over mDNS, so OwnTone lists it and the remote correctly shows it as visible but
+off — and then the connection to its control port fails with `No route to host` and the enable comes
+back `400`. Measured on this household's hardware: three consecutive enables failed that way, and an
+attempt fifty-four seconds later established TLS and played, with nothing reconfigured in between.
+**An mDNS advert is not proof of reachability.**
+
+So `select_output` retries: `TUNEBOX_OUTPUT_SELECT_ATTEMPTS` attempts (3) with a doubling pause,
+about four seconds in the worst case, which is why the remote's button says *Waking the speaker…*
+while it waits. Between attempts the output list is re-read, because OwnTone answers a failed enable
+and an unknown id with the same `400` and the same HTML body — so the only way to tell "asleep" from
+"gone" is to ask, and a speaker that has genuinely left is then a `404` rather than three seconds of
+pointless retrying. A speaker that never comes up is a `503` whose message is a sentence, not the
+daemon's HTML error page.
+
+**`GET /player` also reports `playing_without_output`**, and it is the one field worth knowing about:
+when every speaker fails to start, OwnTone keeps reporting `state: play` and keeps advancing the
+track position, so a remote that trusted the transport would draw a confident progress bar for a
+silent room — measured, for three minutes. The page says *"Playing, but no speaker is attached"*
+instead.
+
 ### What this does not do
 
 The soundbar's **front-panel display shows no track title.** OwnTone's Chromecast output is
@@ -281,7 +305,10 @@ Three panels:
   it** — the row is the button, so track seven is one tap and not six presses of ⏭; the row already
   playing restarts it, and its label says so. When the speaker is visible
   but switched off, a button appears to turn it back on; that is the one case the output keeper
-  deliberately will not handle for you (see above). `consume` — the mode where the queue eats itself
+  deliberately will not handle for you (see above), and it says *Waking the speaker…* while it waits,
+  because a Cast device in standby takes a few seconds to answer. If audio is going nowhere at all —
+  the daemon playing with no speaker attached — the panel says so outright rather than leaving a
+  moving progress bar to imply otherwise. `consume` — the mode where the queue eats itself
   — is reported by `GET /player` but has no control, deliberately.
 - **Add music** — one field that does the right thing: a YouTube link or a bare 11-character video id
   is queued straight away, anything else is searched. Below it, every ingest with its progress,
@@ -461,8 +488,9 @@ daemon behind. Install it (see the [OwnTone
 docs](https://owntone.github.io/owntone-server/installation/)), then:
 
 ```bash
-./deploy/owntone-setup.sh            # configure, restart, find the speaker
+./deploy/owntone-setup.sh            # configure, supervise, find the speaker
 ./deploy/owntone-setup.sh --dry-run  # show the diff it would apply to owntone.conf
+./deploy/owntone-setup.sh --supervise  # just start it and keep it started; change no config
 ```
 
 It makes three changes to `owntone.conf`, backing the file up first with a timestamped copy:
@@ -479,6 +507,54 @@ Then it finds the speaker and writes `TUNEBOX_OUTPUT_ID` into `tunebox.env` — 
 name, because an id is stable and a name is what somebody renames in the Google Home app. It waits
 for the device to appear, since a Cast speaker takes a few seconds to turn up in mDNS after a restart.
 With more than one candidate it lists them and stops rather than choosing.
+
+**Starting it, on macOS.** One script, and it is the one to reach for:
+
+```bash
+./deploy/start.sh            # start both daemons, then check the speaker really answers
+./deploy/start.sh status     # what is running; changes nothing
+./deploy/start.sh stop       # stop both
+./deploy/start.sh restart
+```
+
+It hard-codes this host's answers — OwnTone as a source build under `~/owntone_data`, tunebox as its
+launchd agent — so nothing has to be remembered or discovered. `deploy/owntone-setup.sh` is the
+portable version; `start.sh` is the one somebody runs.
+
+It also **verifies the Cast session rather than the exit code**, which is the whole reason it exists.
+`owntone-setup.sh --supervise` registers a launchd agent (`io.tunebox.owntone`) so the daemon starts
+at login, and **on macOS 26 that agent cannot reach the speaker.** macOS gates local-network access
+per process, a launchd agent gets no consent dialog and is simply denied, and the denial does not look
+like one: mDNS discovery still works, because that goes through mDNSResponder out of process, so
+OwnTone *finds* the speaker and lists it — and then the direct connection fails with
+
+```
+cast: Could not connect to Living Room speaker
+misc: Could not connect to 'Chomecast control' at 192.168.50.13 (port 8009): No route to host
+```
+
+while `nc -z 192.168.50.13 8009` from a shell succeeds. `GET /player` reports `state: play`, the
+progress bar advances, and no sound comes out of anything. Measured on this host, both ways round:
+started from a terminal the daemon inherits that terminal's grant and the log says `cast: Session
+ready`; started by launchd it does not.
+
+So `start.sh` starts OwnTone **from your session** and confirms afterwards that the speaker answered.
+The cost is that nothing restarts it after a reboot — running the script is the restart. To get
+supervision back, grant the permission by hand in System Settings → Privacy & Security → Local
+Network, then use `owntone-setup.sh --supervise`; `start.sh status` flags the case where the daemon is
+supervised and therefore probably mute, because nothing else will.
+
+`--supervise` is otherwise the flag for a host that is already configured: it starts the daemon under
+launchd and re-checks the speaker, leaving `owntone.conf` and the generated password alone. Re-running
+the whole script instead would rotate the password and write another backup for nothing.
+
+On Debian none of the above applies — there is no local-network gate, the daemon has a packaged
+systemd unit, and `sudo systemctl enable --now owntone` is the whole of it.
+
+```bash
+tunebox player status   # is the speaker there?
+tunebox doctor          # is everything there?
+```
 
 ### What was verified, and where
 
@@ -720,6 +796,7 @@ night, not a test.
 | `TUNEBOX_OUTPUT_ID` | — | select by the daemon's output id instead; wins over the name |
 | `TUNEBOX_OUTPUT_VOLUME` | — | volume to set when first selecting; unset leaves whatever the speaker remembers |
 | `TUNEBOX_OUTPUT_CHECK_INTERVAL` | `15` | seconds between selection checks; `0` disables the keeper |
+| `TUNEBOX_OUTPUT_SELECT_ATTEMPTS` | `3` | tries per "turn the speaker on"; a Cast device in standby refuses the first connection and accepts a later one |
 | `TUNEBOX_RESCAN_AFTER_INGEST` | `1` | trigger a library rescan after each ingest that produced a new file |
 | `TUNEBOX_UI` | `1` | serve the web remote; `0` removes the shell routes *and* their auth exemption |
 | `TUNEBOX_OWNTONE_UI` | derived | absolute URL for the "full library in OwnTone" link; by default the browser joins its own hostname to the player's port |
@@ -783,7 +860,7 @@ launchd plists are written for real by running the installer's own functions in 
 `launchctl` shim, since a `--dry-run` cannot show the contents of a file it does not write and the
 contents are the whole point.
 
-1056 tests at the end of Phase 5.
+1276 tests at the end of Phase 5.
 
 ## Layout
 
@@ -802,7 +879,7 @@ src/tunebox/ops/       Phase 5: canary, yt-dlp update + rollback, backup/restore
                        request path imports it, so a bug here cannot break ingest or playback
 src/tunebox/cli.py     search / ingest / doctor / serve / player / exposure / update / healthcheck /
                        backup / restore / maintain
-deploy/                install.sh (macOS + Raspberry Pi) and owntone-setup.sh
+deploy/                install.sh (macOS + Raspberry Pi), owntone-setup.sh, and start.sh for this Mac
 tools/make_icons.py    regenerates the PNG icons from the same drawing as icon.svg
 ```
 

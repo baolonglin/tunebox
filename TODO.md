@@ -5,6 +5,77 @@ already decided; if an item turns out to need a *decision*, it belongs in `PLAN.
 
 ---
 
+## A speaker in standby, and the silence nobody was told about — **done, 2026-09-30**
+
+The remote's **Turn the speaker on** button failed with an error nobody could read, and the screen
+above it claimed to be playing music while the room was silent. Both were found by using it, both
+were measured on the real daemon, and they are the same incident:
+
+```
+PUT /api/outputs/2080974779 {"selected": true}   -> 400  <html>…400 Bad Request…</html>
+PUT /api/outputs/2080974779 {"selected": false}  -> 204
+PUT /api/outputs/2080974779 {"volume": 40}       -> 204
+```
+
+Only *enabling* failed, so it was neither the id, the body nor the credentials. OwnTone's own log had
+the reason, and it is the interesting part:
+
+```
+player: Speaker enable: 'Living Room speaker' (id=2080974779)
+misc:   Connecting to 'Chomecast control' at 192.168.50.13 (port 8009)
+misc:   Could not connect … : No route to host
+cast:   Could not connect to Living Room speaker
+web:    JSON api request failed with error code 400 (/api/outputs/2080974779)
+```
+
+The soundbar was in Wi-Fi standby: still advertising `_googlecast._tcp`, so the daemon listed it and
+the page correctly drew it as visible-but-off, but not answering ARP, so port 8009 was unreachable.
+**An mDNS advert is not proof of reachability**, which is the fact the old code assumed away. It then
+recovered on its own — a later attempt established `TLS1.3` and played, with nothing reconfigured,
+fifty-four seconds after the first failure. So the failure is transient by nature.
+
+- [x] **Retry a speaker that is waking up** — `select_output`, `TUNEBOX_OUTPUT_SELECT_ATTEMPTS=3`.
+- [x] **Say when audio is going nowhere** — `playing_without_output` on `GET /player`, and a line on
+      the page.
+
+Four decisions:
+
+- **The retry is in the adapter, not in the route or the keeper.** The keeper already retried every
+  fifteen seconds — that is what recovered the session above — so the *session* was never really
+  broken; what was broken was the one path a human drives, where "try again in fifteen seconds" is
+  indistinguishable from "this button is dead". Putting it in `select_output` means the CLI's
+  `tunebox player select` and the keeper get it too, and none of them had to learn about it.
+- **A new error type, `OutputUnreachable`, mapped to `503`.** `OutputNotFound` (404) is "it is not
+  there" and a plain `PlayerError` (502) is "that command was wrong"; this one is "it is there, it
+  will not start, try again", and the status code is the difference between a remote that says so and
+  one that shrugs. The message deliberately carries **none** of the daemon's answer: that answer is a
+  full HTML error page, and `HTTP 400 <html><head><title>…` in a toast on a phone was the original
+  bug. Same class of problem as the queue-tap pre-check below, and the same conclusion.
+- **The list is re-read between attempts.** Measured: OwnTone answers a failed enable, `id=999999`
+  and `id=bogus` with the identical `400` and the identical HTML, so the status code cannot tell
+  "asleep" from "gone". One loopback GET can, and a speaker that has genuinely left is a `404` rather
+  than three seconds of pointless retrying.
+- **"Playing" with no output attached is its own field, not something the client derives.** It is the
+  one state where every other value in the response looks healthy: OwnTone logs `All selected
+  speakers failed to start` and then keeps `state: play` with `item_progress_ms` advancing — measured
+  going from 7 690 ms to 231 120 ms across the outage — so the progress bar was honest about the queue
+  and a lie about the room. Any selected output counts, not just the configured one; audio reaching
+  the wrong speaker is a different complaint from audio reaching none.
+
+The button now says **Waking the speaker…** and refuses a second tap while the request is in flight,
+because the request is slow *on purpose* (up to about four seconds), and four seconds of a button
+that looks untouched reads as a button that does nothing — the very thing being fixed.
+
+Not verified: the retry has not yet been observed winning against the real soundbar, because
+reproducing it means waiting for the speaker to go back into standby. What *was* run against the live
+daemon, 2026-09-30: enabling the reachable speaker still takes one attempt and 0.09 s, and an enable
+of `id=999999` — the daemon's real `400` with its real HTML body — comes back as `OutputNotFound`
+naming the outputs that *are* visible, in 0.00 s, with no markup in the message and no retrying. The
+rest is tested against the stub: refused twice then accepted, refused throughout, refused and then
+gone from the list, and a daemon that is down not being retried at all. Tests 1262 → 1276.
+
+---
+
 ## Playback modes — **done, 2026-09-28** (the hardware check is still outstanding)
 
 OwnTone owns the queue (PLAN.md 2), so all three of these were daemon features that tunebox simply

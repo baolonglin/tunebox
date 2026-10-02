@@ -171,6 +171,13 @@
 
           <div class="card speaker">
             <p id="speaker-state" class="muted">Speaker: unknown</p>
+            <!--
+              The one state where everything else on this screen looks fine and the room is silent:
+              the daemon reports `play` and advances the clock with no speaker attached. `role=status`
+              rather than `alert` because it is polite — it is announced after whatever the user was
+              doing, and it is not an error they caused.
+            -->
+            <p id="speaker-alert" class="error" role="status" hidden></p>
             <button type="button" id="btn-select" hidden>Turn the speaker on</button>
           </div>
 

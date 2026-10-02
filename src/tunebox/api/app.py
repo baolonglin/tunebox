@@ -34,6 +34,7 @@ from ..errors import (
     ConfigError,
     InvalidURLError,
     OutputNotFound,
+    OutputUnreachable,
     PlayerError,
     PlayerUnavailable,
     SourceError,
@@ -167,6 +168,14 @@ def _install_error_handlers(app: FastAPI) -> None:
     async def _no_output(request: Request, exc: OutputNotFound) -> JSONResponse:
         # A genuinely missing resource: an unplugged soundbar is not on the network to be found.
         return error(404, str(exc))
+
+    @app.exception_handler(OutputUnreachable)
+    async def _output_asleep(request: Request, exc: OutputUnreachable) -> JSONResponse:
+        # The speaker is listed and will not come up — a Cast device in standby, most often. 503
+        # rather than 502 because the client's move is to try again, and rather than 404 because the
+        # thing it named is right there in the output list.
+        log.info("output would not come up: %s", exc)
+        return error(503, str(exc))
 
     @app.exception_handler(PlayerError)
     async def _player_failed(request: Request, exc: PlayerError) -> JSONResponse:

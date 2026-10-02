@@ -26,10 +26,12 @@ from tunebox.core.models import REPEAT_MODES, Output
 from tunebox.errors import (
     ConfigError,
     OutputNotFound,
+    OutputUnreachable,
     PlayerError,
     PlayerUnavailable,
     TuneboxError,
 )
+from tunebox.player import owntone
 from tunebox.player.hooks import rescan_library
 from tunebox.player.owntone import OwnTonePlayer, _path_expression, _quote_free_tail
 from tunebox.player.selection import OutputKeeper
@@ -54,6 +56,10 @@ class StubOwnTone:
         #: through ``parse_qs`` was true of both encodings and proved nothing.
         self.raw_queries: list[tuple[str, str]] = []
         self.responses: dict[str, tuple[int, object]] = {}
+        #: Scripted answers per path, consumed in order; see the handler. Separate from
+        #: :attr:`responses` so that adding a script to a test does not change what every other
+        #: path answers.
+        self.scripts: dict[str, list[tuple[int, object]]] = {}
         self.auth_headers: list[str | None] = []
         stub = self
 
@@ -74,6 +80,13 @@ class StubOwnTone:
                     (method, parsed.path, parse_qs(parsed.query, keep_blank_values=True), body)
                 )
                 status, payload = stub.responses.get(f"{method} {parsed.path}", (204, None))
+                scripted = stub.scripts.get(f"{method} {parsed.path}")
+                if scripted:
+                    # One-shot answers, in order, with the last one repeating. This is how a
+                    # *sequence* of statuses gets tested — ``responses`` fixes the status per path,
+                    # so it cannot express "refuses twice, then works", which is exactly what a
+                    # speaker waking up does.
+                    status, payload = scripted[0] if len(scripted) == 1 else scripted.pop(0)
                 if callable(payload):
                     payload = payload()
                 if payload is None:
@@ -121,6 +134,10 @@ class StubOwnTone:
 
     def on(self, method: str, path: str, payload: object, status: int = 200) -> None:
         self.responses[f"{method} {path}"] = (status, payload)
+
+    def script(self, method: str, path: str, answers: list[tuple[int, object]]) -> None:
+        """Answer ``path`` with each of ``answers`` in turn, repeating the last one forever."""
+        self.scripts[f"{method} {path}"] = list(answers)
 
     def params(self, method: str, path: str) -> dict[str, list[str]]:
         for seen_method, seen_path, params, _ in self.requests:
@@ -465,6 +482,87 @@ class TestOutputs:
             "volume": 40,
         }
         assert "PUT /api/outputs/set" not in stub.calls()
+
+    # ------------------------------------------------- a speaker that is waking up
+
+    def test_a_refused_enable_is_retried_until_the_speaker_comes_up(
+        self, player: OwnTonePlayer, stub, monkeypatch
+    ):
+        """The measured failure: a Cast device in standby refuses the first connection.
+
+        OwnTone answers ``400`` while its own log says ``No route to host`` on port 8009, and a
+        later attempt succeeds with nothing reconfigured. One attempt would make that a dead button.
+        """
+        naps: list[float] = []
+        monkeypatch.setattr(owntone.time, "sleep", naps.append)
+        stub.script("PUT", "/api/outputs/8365057286ba1880", [(400, None), (400, None), (204, None)])
+        stub.on("GET", "/api/outputs", {"outputs": [OUTPUT_SOUNDBAR]})
+
+        player.select_output("8365057286ba1880")
+
+        assert stub.count("PUT", "/api/outputs/8365057286ba1880") == 3
+        # Doubling, and short: the refusal itself already costs about a second.
+        assert naps == [0.5, 1.0]
+
+    def test_a_speaker_that_never_answers_is_503_material_not_a_bad_command(
+        self, player: OwnTonePlayer, stub, monkeypatch
+    ):
+        monkeypatch.setattr(owntone.time, "sleep", lambda _seconds: None)
+        stub.script("PUT", "/api/outputs/8365057286ba1880", [(400, None)])
+        stub.on("GET", "/api/outputs", {"outputs": [OUTPUT_SOUNDBAR]})
+
+        with pytest.raises(OutputUnreachable) as caught:
+            player.select_output("8365057286ba1880")
+
+        message = str(caught.value)
+        assert "standby" in message
+        assert "try again in a moment" in message
+        # The daemon's answer to a failed enable is a full HTML error page. A phone showing a markup
+        # fragment in a toast is the bug this replaces, so none of it may reach the message.
+        assert "<html>" not in message and "400" not in message
+        assert stub.count("PUT", "/api/outputs/8365057286ba1880") == 3
+
+    def test_the_attempt_count_is_configurable(self, config: Config, stub, monkeypatch):
+        monkeypatch.setattr(owntone.time, "sleep", lambda _seconds: None)
+        stub.script("PUT", "/api/outputs/8365057286ba1880", [(400, None)])
+        stub.on("GET", "/api/outputs", {"outputs": [OUTPUT_SOUNDBAR]})
+        one = OwnTonePlayer(replace(config, output_select_attempts=1))
+
+        with pytest.raises(OutputUnreachable):
+            one.select_output("8365057286ba1880")
+
+        # One attempt, and no listing: with nothing left to retry there is nothing to find out.
+        assert stub.calls() == ["PUT /api/outputs/8365057286ba1880"]
+
+    def test_a_speaker_that_left_between_listing_and_selecting_is_not_found(
+        self, player: OwnTonePlayer, stub, monkeypatch
+    ):
+        """OwnTone answers a failed enable and an unknown id with the same 400 and the same HTML.
+
+        Measured against 29.3: ``999999`` and ``bogus`` are indistinguishable from a real device
+        that will not start, so the only way to tell them apart is to ask for the list again — and
+        the answer matters, because a speaker that has gone is a 404 and not something to retry.
+        """
+        monkeypatch.setattr(owntone.time, "sleep", lambda _seconds: None)
+        stub.script("PUT", "/api/outputs/8365057286ba1880", [(400, None)])
+        stub.on("GET", "/api/outputs", {"outputs": [OUTPUT_LOCAL]})
+
+        with pytest.raises(OutputNotFound):
+            player.select_output("8365057286ba1880")
+
+        assert stub.count("PUT", "/api/outputs/8365057286ba1880") == 1
+
+    def test_a_dead_daemon_is_not_retried(self, config: Config, monkeypatch):
+        """``PlayerUnavailable`` is a different fix ("start OwnTone") and retrying only delays it."""
+        naps: list[float] = []
+        monkeypatch.setattr(owntone.time, "sleep", naps.append)
+        # Port 1 on loopback: nothing listens, so the connection is refused immediately.
+        gone = OwnTonePlayer(replace(config, player_url="http://127.0.0.1:1"))
+
+        with pytest.raises(PlayerUnavailable):
+            gone.select_output("8365057286ba1880")
+
+        assert naps == []
 
     @pytest.mark.parametrize("given,sent", [(-5, 0), (0, 0), (50, 50), (100, 100), (250, 100)])
     def test_volume_is_clamped_before_it_reaches_the_daemon(
@@ -1256,6 +1354,7 @@ class TestPlayerConfig:
                 "TUNEBOX_OUTPUT_ID": "42",
                 "TUNEBOX_OUTPUT_VOLUME": "35",
                 "TUNEBOX_OUTPUT_CHECK_INTERVAL": "30",
+                "TUNEBOX_OUTPUT_SELECT_ATTEMPTS": "5",
                 "TUNEBOX_RESCAN_AFTER_INGEST": "0",
             }
         )
@@ -1265,7 +1364,15 @@ class TestPlayerConfig:
         assert config.output_id == "42"
         assert config.output_volume == 35
         assert config.output_check_interval == 30
+        assert config.output_select_attempts == 5
         assert config.rescan_after_ingest is False
+
+    def test_one_select_attempt_is_allowed_and_is_not_the_default(self):
+        """A single attempt is a legitimate choice on a host whose speaker is never asleep; it is
+        not the default, because the measured failure is that the *first* attempt is the one that
+        fails."""
+        assert Config.from_env({}).output_select_attempts == 3
+        assert Config.from_env({"TUNEBOX_OUTPUT_SELECT_ATTEMPTS": "1"}).output_select_attempts == 1
 
     def test_an_unset_output_volume_means_leave_it_alone(self):
         assert Config.from_env({}).output_volume is None
@@ -1277,9 +1384,13 @@ class TestPlayerConfig:
 
     def test_player_errors_are_part_of_the_one_exception_tree(self):
         """So the CLI and the API keep telling "this failed" apart from "we have a bug"."""
-        for exc in (PlayerError, PlayerUnavailable, OutputNotFound):
+        for exc in (PlayerError, PlayerUnavailable, OutputNotFound, OutputUnreachable):
             assert issubclass(exc, TuneboxError)
         assert issubclass(PlayerUnavailable, PlayerError)
+        # Not a subclass of OutputNotFound: "it is not there" and "it is there and will not start"
+        # are different answers (404 against 503) and different advice.
+        assert issubclass(OutputUnreachable, PlayerError)
+        assert not issubclass(OutputUnreachable, OutputNotFound)
         assert issubclass(OutputNotFound, PlayerError)
 
     def test_secrets_do_not_appear_in_the_config_repr(self):

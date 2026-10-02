@@ -26,6 +26,7 @@ set -euo pipefail
 
 DRY_RUN=0
 DISCOVER_ONLY=0
+SUPERVISE_ONLY=0
 CONF=""
 PLAYER_URL=""
 
@@ -53,6 +54,7 @@ Usage: deploy/owntone-setup.sh [options]
   --env-file FILE  tunebox env file to update (default: $ENV_FILE)
   --url URL        player API base (default: TUNEBOX_PLAYER_URL or http://127.0.0.1:3689)
   --discover       only look for the speaker; do not touch owntone.conf
+  --supervise      only (re)start OwnTone under launchd and find the speaker; change no config
   --dry-run        print the changes without applying them
   -h, --help       this
 EOF
@@ -64,6 +66,7 @@ while [ $# -gt 0 ]; do
     --env-file) ENV_FILE="${2:?--env-file needs a file}"; shift 2 ;;
     --url)      PLAYER_URL="${2:?--url needs a URL}"; shift 2 ;;
     --discover) DISCOVER_ONLY=1; shift ;;
+    --supervise) SUPERVISE_ONLY=1; shift ;;
     --dry-run)  DRY_RUN=1; shift ;;
     -h|--help)  usage; exit 0 ;;
     *)          usage >&2; die "unknown option: $1" ;;
@@ -126,17 +129,54 @@ fi
 [ -n "$PLAYER_URL" ] || PLAYER_URL="http://127.0.0.1:3689"
 PLAYER_URL="${PLAYER_URL%/}"
 
-command -v owntone >/dev/null 2>&1 || command -v owntone-server >/dev/null 2>&1 || \
-  warn "no 'owntone' binary on PATH. If the daemon runs anyway (a service, a container), carry on."
+# --------------------------------------------------------------------- the binary
+
+# A source build with --prefix is the documented macOS route (see README), and it puts the daemon
+# somewhere no package manager would: not on PATH, and not under /usr/local. Finding it matters for
+# more than tidiness — it is what lets this script *supervise* the daemon (see restart_owntone)
+# instead of telling somebody to start it by hand after every reboot.
+find_owntone_bin() {
+  local candidate
+  for candidate in owntone owntone-server; do
+    if command -v "$candidate" >/dev/null 2>&1; then command -v "$candidate"; return 0; fi
+  done
+  for candidate in \
+    "$HOME/owntone_data/usr/sbin/owntone" \
+    /usr/local/sbin/owntone \
+    /opt/homebrew/sbin/owntone \
+    /usr/sbin/owntone
+  do
+    if [ -x "$candidate" ]; then printf '%s' "$candidate"; return 0; fi
+  done
+  return 1
+}
+
+OWNTONE_BIN="$(find_owntone_bin)" || OWNTONE_BIN=""
+if [ -n "$OWNTONE_BIN" ]; then
+  info "owntone: $OWNTONE_BIN"
+else
+  warn "no 'owntone' binary found. If the daemon runs anyway (a service, a container), carry on."
+fi
 
 # --------------------------------------------------------------------------- the conf
 
 find_conf() {
   local candidate
+  # A source build's conf sits beside its prefix, not in /usr/local/etc: from
+  # <prefix>/usr/sbin/owntone the conf is <prefix>/etc/owntone.conf. Derived from the binary we
+  # actually found rather than hard-coded, so any --prefix works and nobody needs --conf.
+  if [ -n "${OWNTONE_BIN:-}" ]; then
+    local prefix
+    prefix="$(dirname "$(dirname "$(dirname "$OWNTONE_BIN")")")"
+    for candidate in "$prefix/etc/owntone.conf" "$(dirname "$(dirname "$OWNTONE_BIN")")/etc/owntone.conf"; do
+      if [ -f "$candidate" ]; then printf '%s' "$candidate"; return 0; fi
+    done
+  fi
   for candidate in \
     /usr/local/etc/owntone.conf \
     /opt/homebrew/etc/owntone.conf \
     /etc/owntone.conf \
+    "$HOME/owntone_data/etc/owntone.conf" \
     /usr/local/etc/forked-daapd.conf \
     /etc/forked-daapd.conf
   do
@@ -296,12 +336,97 @@ configure_owntone() {
   restart_owntone
 }
 
+LAUNCHD_OWNTONE_LABEL="io.tunebox.owntone"
+OWNTONE_AGENT="$HOME/Library/LaunchAgents/$LAUNCHD_OWNTONE_LABEL.plist"
+
+# Put a source-built OwnTone under launchd, the same treatment tunebox itself gets from
+# deploy/install.sh. Without this the daemon is the one part of the system nobody supervises: it dies
+# with the terminal that started it, it does not come back after a reboot, and the symptom is a
+# remote whose buttons all work while nothing plays. `-f` is required — launchd supervises the
+# process it spawned, so a daemon that forked and exited would be restarted forever.
+install_owntone_agent() {
+  local conf="${CONF:-}"
+  [ -n "$conf" ] || conf="$(find_conf)" || die "no owntone.conf to point the agent at"
+  local prefix log pidfile
+  prefix="$(dirname "$(dirname "$(dirname "$OWNTONE_BIN")")")"
+  log="$prefix/var/log/owntone-launchd.log"
+  pidfile="$prefix/var/run/owntone.pid"
+
+  say "supervising OwnTone with launchd ($LAUNCHD_OWNTONE_LABEL)"
+  info "$OWNTONE_AGENT"
+  if [ "$DRY_RUN" = 1 ]; then
+    info "${DIM}[dry-run]${N} would write the agent and load it"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$OWNTONE_AGENT")" "$prefix/var/log" "$prefix/var/run"
+  cat >"$OWNTONE_AGENT" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LAUNCHD_OWNTONE_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$OWNTONE_BIN</string>
+    <string>-f</string>
+    <string>-c</string><string>$conf</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <!-- launchd starts with a minimal PATH; Homebrew's bin dirs are where a source build's helpers
+       live. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StandardOutPath</key><string>$log</string>
+  <key>StandardErrorPath</key><string>$log</string>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+EOF
+
+  # An OwnTone somebody started by hand still holds port 3689, and launchd would spawn a second one
+  # that exits on the bind and gets restarted forever. Stop the unsupervised copy first.
+  if [ -f "$pidfile" ]; then
+    local stale; stale="$(cat "$pidfile" 2>/dev/null || true)"
+    if [ -n "$stale" ] && kill -0 "$stale" 2>/dev/null; then
+      info "stopping the unsupervised owntone (pid $stale)"
+      kill "$stale" 2>/dev/null || true
+      local waited=0
+      while kill -0 "$stale" 2>/dev/null && [ "$waited" -lt 20 ]; do sleep 0.5; waited=$((waited + 1)); done
+    fi
+    rm -f "$pidfile"
+  fi
+
+  # Reload rather than kickstart, for the reason install.sh documents: the plist may have changed and
+  # `kickstart -k` would re-exec the definition already loaded. bootout unloads asynchronously, so
+  # wait for it or the following bootstrap races itself and leaves nothing loaded at all.
+  if launchctl print "gui/$(id -u)/$LAUNCHD_OWNTONE_LABEL" >/dev/null 2>&1; then
+    launchctl bootout "gui/$(id -u)/$LAUNCHD_OWNTONE_LABEL" 2>/dev/null || true
+    local waited=0
+    while launchctl print "gui/$(id -u)/$LAUNCHD_OWNTONE_LABEL" >/dev/null 2>&1; do
+      if [ "$waited" -ge 20 ]; then
+        die "the old $LAUNCHD_OWNTONE_LABEL agent did not unload; 'launchctl bootout gui/$(id -u)/$LAUNCHD_OWNTONE_LABEL' by hand, then re-run"
+      fi
+      sleep 0.5
+      waited=$((waited + 1))
+    done
+  fi
+  launchctl bootstrap "gui/$(id -u)" "$OWNTONE_AGENT"
+  ok "OwnTone is supervised; it will start again at login"
+}
+
 restart_owntone() {
   say "restarting OwnTone"
   if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files owntone.service >/dev/null 2>&1; then
     sudo systemctl restart owntone
   elif command -v brew >/dev/null 2>&1 && brew services list 2>/dev/null | grep -q '^owntone'; then
     brew services restart owntone
+  elif [ "$(uname -s)" = "Darwin" ] && [ -n "${OWNTONE_BIN:-}" ]; then
+    # A source build, which is the documented macOS route and has no supervisor of its own.
+    install_owntone_agent
   else
     warn "could not work out how OwnTone is supervised — restart it yourself, then re-run with --discover"
     return 1
@@ -385,7 +510,14 @@ print("{}\t{}\t{}".format(one.get("id"), one.get("name"), one.get("type")))
 
 # ----------------------------------------------------------------------------- main
 
-if [ "$DISCOVER_ONLY" = 0 ]; then
+if [ "$SUPERVISE_ONLY" = 1 ]; then
+  # The config is already right and must be left alone — re-running configure_owntone would generate
+  # a fresh admin_password and another backup for nothing. All this does is make sure the daemon is
+  # running and stays that way.
+  [ -n "${OWNTONE_BIN:-}" ] || die "no owntone binary found; --supervise needs one to run"
+  [ "$(uname -s)" = "Darwin" ] || die "--supervise is launchd, so macOS only; on Linux use 'systemctl enable --now owntone'"
+  install_owntone_agent
+elif [ "$DISCOVER_ONLY" = 0 ]; then
   configure_owntone
 fi
 discover_output
