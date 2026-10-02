@@ -11,7 +11,7 @@
 # platform and per architecture — a source build on macOS (see README), a package on Debian — and a
 # script that guessed wrong would leave a half-built daemon behind. It checks, and tells you.
 #
-# Three changes are made to owntone.conf, and the second is the one that matters:
+# Four changes are made to owntone.conf, and the second is the one that matters:
 #
 #   library.directories   -> tunebox's music root, or the daemon never sees an ingested track.
 #   general.trusted_networks -> { "localhost" }. OwnTone ships { "lan" }, which *skips its own
@@ -21,6 +21,12 @@
 #                            to loopback.
 #   general.admin_password -> generated, because trusted_networks alone would lock tunebox's own
 #                            LAN-side web UI link out with no way back in.
+#   library.clear_queue_on_stop_disable -> true. OwnTone's default is iTunes': when playback stops,
+#                            *including* when the last track of the queue ends, it empties the
+#                            queue. On the remote that reads as the list of songs vanishing by
+#                            itself the moment the music finishes — the one state in which somebody
+#                            is most likely to want to replay it. The queue is the user's list
+#                            until the user clears it, which the remote has a button for.
 #
 set -euo pipefail
 
@@ -294,8 +300,12 @@ configure_owntone() {
 
   local work="$CONF"
   local next
+  # `clear_queue_on_stop_disable` goes in `library` and not `mpd`: 29.x moved it and warns about the
+  # old spelling ("Found deprecated option 'clear_queue_on_stop_disable' in section 'mpd'", in the
+  # binary's own strings), and a deprecated setting is one release away from being ignored silently.
   for pair in \
     "library:directories:{ \"$MUSIC_ROOT\" }" \
+    "library:clear_queue_on_stop_disable:true" \
     "general:trusted_networks:{ \"localhost\" }" \
     "general:admin_password:\"$password\""
   do

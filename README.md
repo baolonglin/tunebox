@@ -172,8 +172,15 @@ general {
 }
 library {
     directories = { "/home/youruser/Music/tunebox" }
+    clear_queue_on_stop_disable = true   # keep the queue when the music ends
 }
 ```
+
+**Set `clear_queue_on_stop_disable`.** OwnTone's default is iTunes': stopping playback empties the
+play queue, and reaching the end of the last track *is* stopping playback — so the list of songs on
+the remote deletes itself at the exact moment somebody might want to play it again. With this set the
+queue is only ever emptied on purpose, by the remote's clear button or OwnTone's own UI. It belongs in
+`library`; `mpd` is the old spelling and 29.x warns about it.
 
 **Change `trusted_networks`.** OwnTone ships `{ "lan" }`, which skips its own password for every
 device on the home network — a `curl -X PUT http://host:3689/api/player/stop` from anywhere in the
@@ -493,9 +500,12 @@ docs](https://owntone.github.io/owntone-server/installation/)), then:
 ./deploy/owntone-setup.sh --supervise  # just start it and keep it started; change no config
 ```
 
-It makes three changes to `owntone.conf`, backing the file up first with a timestamped copy:
+It makes four changes to `owntone.conf`, backing the file up first with a timestamped copy:
 
 - `library.directories` → tunebox's music root, or the daemon never sees an ingested track;
+- `library.clear_queue_on_stop_disable` → `true`, so the queue outlives the music. OwnTone's default
+  clears it when playback stops, and the end of the last track counts — see
+  [Setting up OwnTone](#setting-up-owntone);
 - `general.trusted_networks` → `{ "localhost" }`. **This is the one that matters.** OwnTone ships
   `{ "lan" }`, which skips its own password for every device on the home network — measured:
   `curl -X PUT http://host:3689/api/player/stop` from anywhere in the house returns `204`. tunebox

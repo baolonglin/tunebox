@@ -743,6 +743,20 @@ class TestOwnToneConf:
         assert out.count("library {") == 1
         assert '\tpodcasts = { "/p" }' in out
 
+    def test_it_enables_the_queue_setting_shipped_commented_out(self, tmp_path: Path):
+        """``clear_queue_on_stop_disable`` is in the shipped file already, disabled, and *after* the
+        multi-line ``directories`` value — so this exercises the uncomment path and the depth tracking
+        at once. A second live copy of the key would leave OwnTone reading whichever it parsed last.
+        """
+        conf = SAMPLE_CONF.replace(
+            '\tpodcasts = { "/podcasts" }',
+            '\tpodcasts = { "/podcasts" }\n#\tclear_queue_on_stop_disable = false',
+        )
+        out = apply_conf(tmp_path, conf, "library", "clear_queue_on_stop_disable", "true")
+        assert "\tclear_queue_on_stop_disable = true" in out
+        assert out.count("clear_queue_on_stop_disable") == 1
+        assert out.count("library {") == 1
+
 
 class TestOwnToneSetup:
     def test_it_refuses_to_run_before_the_installer(self, tmp_path: Path):
@@ -770,6 +784,19 @@ class TestOwnToneSetup:
         source = code(OWNTONE)
         assert 'trusted_networks:{ \\"localhost\\" }' in source
         assert "admin_password" in source
+
+    def test_it_stops_the_queue_emptying_itself_when_the_music_ends(self):
+        """OwnTone's default is iTunes': stopping playback — which is what reaching the end of the
+        queue does — empties the queue. On the remote that is the list of songs disappearing by itself
+        at the exact moment somebody might want to replay it, so the queue stays until it is cleared
+        on purpose.
+
+        ``library`` and not ``mpd``: 29.x moved the setting and warns about the old section by name,
+        and a deprecated spelling is one release from being ignored without a word.
+        """
+        source = code(OWNTONE)
+        assert "library:clear_queue_on_stop_disable:true" in source
+        assert "mpd:clear_queue_on_stop_disable" not in source
 
     def test_it_needs_no_jq(self):
         """A fresh Raspberry Pi OS has python3 and does not have jq, and asking an operator to
