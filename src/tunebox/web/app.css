@@ -495,6 +495,17 @@ button.row-main:hover .row-title {
   padding: 0.4rem 0;
 }
 
+/*
+ * The queue's own footer: one right-aligned action, set further from the list than the list's rows
+ * are from each other (0.4rem). Sharing that spacing would make an irreversible button look like
+ * part of the last row, and the extra gap is what separates "tap a track" from "empty the lot".
+ */
+.queue-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.9rem;
+}
+
 /* -------------------------------------------------------------------- jobs */
 
 .job-bar {

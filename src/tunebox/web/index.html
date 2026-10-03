@@ -183,7 +183,18 @@
 
           <h2>Queue <span id="queue-count" class="muted"></span></h2>
           <ol id="queue" class="list"></ol>
-          <button type="button" id="btn-clear" class="danger">Clear the queue</button>
+          <!--
+            Clear is right-aligned, where every other action on this screen already is: a row's own
+            buttons sit hard right, so the one button that empties the whole list belongs on the same
+            edge rather than under the first track's title. The visible label is the short one and
+            `aria-label` carries the full sentence, since "Clear" on its own tells a screen reader
+            nothing about what it clears.
+          -->
+          <div class="queue-actions">
+            <button type="button" id="btn-clear" class="danger" aria-label="Clear the queue">
+              Clear
+            </button>
+          </div>
         </section>
 
         <!-- ------------------------------------------------------------- add music -->
