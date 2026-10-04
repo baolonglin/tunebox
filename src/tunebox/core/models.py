@@ -267,6 +267,89 @@ class DeletedTrack:
 
 
 @dataclass(frozen=True)
+class PlaylistEntry:
+    """One line of a playlist: where it is in the list, what it says, and what it resolves to.
+
+    :attr:`position` is the field that makes editing possible at all, and it is why this type exists
+    rather than a bare list of :class:`LibraryTrack`. A playlist may legitimately hold the same track
+    twice, and it may hold entries that resolve to nothing — so neither a path nor an index into the
+    *resolvable* tracks identifies a line. "Remove the second copy" and "move line four up" need the
+    position of the entry in the **file**, and anything else is a client guessing.
+
+    :attr:`track` is ``None`` for an entry that names no library track: a file deleted by hand, a
+    playlist restored beside a library that moved, a stream URL, a line somebody typed. Reported with
+    its :attr:`entry` text rather than dropped, because a playlist that silently shrinks is the
+    failure worth naming — OwnTone's own behaviour is to skip such a line without saying so.
+    """
+
+    position: int
+    #: The raw text of the line, as it appears in the file.
+    entry: str
+    track: LibraryTrack | None = None
+
+    @property
+    def missing(self) -> bool:
+        return self.track is None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "position": self.position,
+            "entry": self.entry,
+            "missing": self.missing,
+            "track": self.track.as_dict() if self.track else None,
+        }
+
+
+@dataclass(frozen=True)
+class Playlist:
+    """One playlist: a name, the file it is, and the entries it holds in order.
+
+    A playlist in tunebox is **a file, not a table** (PLAN.md 3.1: the filesystem is the library
+    database). So this carries no id — :attr:`name` is the identity, because it is the filename, and
+    there is nowhere else for an id to come from or to drift out of step with.
+
+    :attr:`entries` is the single ordered truth, one per line of the file that names something.
+    :attr:`tracks` and :attr:`missing` are views onto it for the two callers that only want one half —
+    playback, which needs the resolvable ones, and a UI that wants to say how many are not.
+
+    :attr:`count` and :attr:`missing_count` are fields rather than lengths of :attr:`entries` because
+    a **listing** of playlists leaves ``entries`` empty rather than sending every track in the library
+    back for a sidebar — and both numbers are what a row on a phone says. Without them, a summary and
+    an empty playlist would be the same document, and "4 tracks · 1 missing" would need the whole list.
+    """
+
+    name: str
+    #: The ``.m3u`` file, relative to the music root — ``Playlists/Saturday morning.m3u``.
+    path: str
+    #: Entries that resolve to a real track: what will play.
+    count: int = 0
+    #: Entries that resolve to nothing. Its own number because it is the half OwnTone never mentions.
+    missing_count: int = 0
+    modified: float | None = None
+    entries: tuple[PlaylistEntry, ...] = ()
+
+    @property
+    def tracks(self) -> tuple[LibraryTrack, ...]:
+        """Just the entries that resolve, in order — what gets handed to the player."""
+        return tuple(entry.track for entry in self.entries if entry.track is not None)
+
+    @property
+    def missing(self) -> tuple[str, ...]:
+        """The raw text of every entry that resolves to nothing."""
+        return tuple(entry.entry for entry in self.entries if entry.track is None)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "path": self.path,
+            "count": self.count,
+            "missing_count": self.missing_count,
+            "modified": self.modified,
+            "entries": [entry.as_dict() for entry in self.entries],
+        }
+
+
+@dataclass(frozen=True)
 class LibraryPage:
     """A page of :class:`LibraryTrack`, plus how much of the library it is speaking for.
 

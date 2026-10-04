@@ -29,6 +29,30 @@ class LibraryError(TuneboxError):
     """Placing a file in the library failed, including attempted escapes from the root."""
 
 
+class PlaylistError(TuneboxError):
+    """A playlist could not be named, read or written.
+
+    Deliberately *not* a subclass of :class:`LibraryError`, even though a playlist is a file in the
+    library: the API maps the two differently, and the distinction is the useful one. A bad library
+    path in a playlist's entries is still a :class:`LibraryError` (``400``, "that is not a track"),
+    while this is about the playlist itself — its name, or its absence.
+    """
+
+
+class PlaylistNotFound(PlaylistError):
+    """No playlist by that name. Mapped to ``404``: it names a resource that is not there."""
+
+
+class PlaylistExists(PlaylistError):
+    """A playlist by that name is already there and the caller did not ask to replace it.
+
+    ``409`` rather than ``400``: the request is well formed, and the one thing standing in its way is
+    state the caller can see with ``GET /playlists``. Overwriting by default would make "create" and
+    "replace everything in it" the same request, which is a bad default for the one thing in the
+    library a person arranged by hand.
+    """
+
+
 class TaggingError(TuneboxError):
     """Writing tags to the downloaded file failed."""
 

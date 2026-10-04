@@ -257,12 +257,13 @@ daemon's behaviour on a mid-song `ENOENT` is unmeasured. Tests 1056 → 1120.
 
 ---
 
-## Playlists
+## Playlists — **done, 2026-10-03**
 
 **Feasible, and cheaper than it looks — because a playlist in this architecture is a file, not a
 table.** Measured against the running daemon and its binary, 2026-09-27.
 
-- [ ] **Playlists** — create, play, append to, delete. See the staging below; v1 is three verbs.
+- [x] **Playlists** — create, play, append to, delete. `src/tunebox/playlists.py`, six
+  `/playlists` routes, `tunebox playlist <verb>`, and a fourth tab on the remote.
 
 ### What OwnTone actually offers
 
@@ -341,5 +342,153 @@ v1 is three verbs and no reordering UI: **create from the current queue**, **pla
 playlists are all things OwnTone's own web UI can do on the same files — Phase 4 already decided to
 link out for the expensive half of a music UI rather than rebuild it, and that decision applies here
 unchanged.
+
+(That last sentence turned out to be **wrong**, and the audit caught it: the same
+`allow_modifying_stored_playlists = false` that stops the daemon writing a playlist stops its web UI
+editing one, so there is nothing to link out *to* for a reorder. The staging decision stands — v1 has
+no reorder — but the reason is now "a text file and `$EDITOR`, or rebuild the queue and save over the
+list", not "OwnTone does it".)
+
+### What was decided
+
+All five open questions above were answered rather than deferred; they are recorded here and in the
+README under *Playlists*. Shipped slightly wider than the staging said — `list`, `show` and `delete`
+came along because each is a few lines once the reader and the writer exist, and a feature that can
+create a playlist and not see or remove one is a feature that needs a terminal to undo a typo.
+
+1. **Where the files live: a visible `Playlists/` directory under the music root**
+   (`TUNEBOX_PLAYLISTS_DIR`). The pseudo-artist is harmless — `.m3u` is not in
+   `library.AUDIO_EXTENSIONS`, so `GET /library` never lists one and nothing can enqueue one as a
+   song, with no code written to exclude it. A dot-directory is refused at startup rather than
+   silently accepted, because the files in it would never be indexed. `naming.sanitize_component`
+   already strips a leading dot, so the check in `Config` exists to *say so*, not to enforce it.
+2. **Relative entries, relative to the playlist file** — so `../Artist/Album/Track.m4a` from a
+   subdirectory. Verified as written bytes in a test, because round-tripping through this module alone
+   would still pass if they quietly became absolute. **And verified against the real daemon**, which
+   was the one thing question 2 called out as untested: a `tunebox playlist create` into
+   `Playlists/`, then the rescan tunebox triggers itself, left OwnTone 29.3 reporting
+   `{"type": "plain", "item_count": 1, "uri": "library:playlist:7"}` and
+   `GET /api/library/playlists/7/tracks` resolving the `../Imagine Dragons/Singles/Believer.m4a`
+   entry to the real track with its correct absolute path — so **`../` out of a subdirectory works**
+   (measured 2026-10-03, probe deleted afterwards: playlists back to 0, songs unchanged at 34). It
+   would not have mattered to playback either way, because tunebox resolves the entries itself and
+   hands `enqueue_paths` absolute paths; what it buys is the playlist appearing in OwnTone's own
+   browse view, which is where the footer link sends people to reorder one. An absolute entry is read
+   and never written.
+3. **Concurrent edits: last-write-wins, stated.** Every edit is a read-modify-write. The *write* is
+   atomic — staged under a dot-name beside the target, then `os.replace` — so a scanner cannot read
+   half a list and a crash cannot truncate one. The merge is not attempted, deliberately.
+4. **Library delete prunes, and reports.** `DELETE /library` calls `playlists.forget_tracks` **before**
+   the unlink, which is what makes it exact rather than a guess: while the file still exists its entry
+   resolves, so it is matched by `(device, inode)` — which covers the case-insensitive spelling, the
+   NFD form of a CJK filename and a hard link — and an entry that was already dangling for an
+   unrelated reason is left alone. The playlists that changed come back in `playlists_updated`.
+   Pruning rather than merely reporting, because OwnTone skips an unresolvable entry silently — the
+   alternative is a list that is one track shorter forever with nothing having mentioned it.
+5. **`POST /api/queue/save` is not used, and the config flip was not needed.** `from_queue` reads the
+   queue through the `Player` port and writes the file here, so the one-tap "save what is playing" is
+   the *default* way a playlist is made on the phone — there is no track-picker in the UI at all,
+   because the queue already is one. Queue items that are not library tracks are skipped and named in
+   `skipped` rather than failing the save; explicit `paths` stay all-or-nothing.
+
+Two distinctions that are rules because they were bugs first, both found by an audit of this feature
+before it shipped:
+
+- **Creating a playlist sanitises the name; addressing one does not.** Sanitising a lookup means
+  `a:b` and `a_b` name the same file, so `DELETE /playlists/a:b` removed `a_b.m3u` — somebody else's
+  list. `normalise_name` is now the write-side function and `exact_name` the read-side one, which
+  refuses a name that is not already a usable filename rather than quietly rewriting it.
+- **Reading a playlist is never capped; writing one is.** `MAX_ENTRIES` applied to the read meant a
+  hand-written 1005-entry playlist was *read* as 1000 — and then the next unrelated `DELETE /library`
+  rewrote the file from that truncated reading and destroyed the last five lines. Measured: 1005 → 999.
+
+Reused rather than rebuilt: `library.resolve_track_path` for every entry in both directions (so a
+playlist cannot name a file outside the music root, and a hand-written one naming a URL reports it as
+unresolvable rather than handing it to the player), `library.describe_track` so a playlist's tracks
+read exactly like `GET /library` rows, `naming.sanitize_component` for the name — a playlist called
+`Road trip: 2026/07` is one component, `Road trip_ 2026_07`, and the create response says so —
+`player/hooks.rescan_library` for the "tell OwnTone but never fail because of it" call, and
+`remote.player_view` so `PUT /playlists/{name}/play` answers with the same document as
+`PUT /player/play`.
+
+Also reported rather than hidden: **an entry that resolves to nothing**. `GET /playlists/{name}` has a
+`missing` list, the phone's row says *"8 tracks · 2 missing"*, and `tunebox playlist play` says so on
+stderr. A list that plays eight of its ten tracks in silence is this feature's most likely failure and
+the one OwnTone will not mention.
+
+### What the audit found
+
+An independent review before shipping found five real defects, all reproduced and then fixed; they are
+worth recording because three of them are the same mistake in different clothes — *a rewrite that
+knows less about the file than the file does*.
+
+1. **A write outside the music root.** `forget_tracks` and `list_playlists` joined the directory name
+   and called `iterdir` with no containment check, so with `Playlists/` replaced by a symlink pointing
+   out of the tree a `DELETE /library` read *and rewrote* a file elsewhere on disk. A direct violation
+   of PLAN.md 3.2, measured. `_playlists_dir` now puts `naming.resolve_within` in front of every walk,
+   and each `.m3u` is checked too, so a single symlinked playlist file is skipped rather than read.
+2. **Silent truncation of long playlists** — the read cap, above.
+3. **`#EXTINF` and comments destroyed** by an append or a prune, in files tunebox did not write. Every
+   edit now carries the file across line for line; a prune removes an entry and the `#EXTINF`
+   immediately above it, and nothing else.
+4. **The prune missed on this project's own filesystem.** Matching by path string meant an entry
+   spelled `../A/SINGLES/t.m4a` on case-insensitive macOS resolved to the file being deleted and
+   compared unequal to it, so it survived into a playlist that could never play it. Inode identity now.
+5. **Three reachable 500s** — `LibraryError` had no handler and fell through to the `TuneboxError`
+   catch-all, so a path parameter that refused a traversal reported itself as a server fault. It is
+   mapped to `400` in `api/app.py` now, which is what the routes catching it inline already did.
+
+Also from the audit: `list_playlists` derived each name by sanitising the stem, which hid any file
+whose name would not survive that (a hand-made `Road:trip.m3u` appeared in no listing) and showed two
+different files as one row; it now reports the real filename. `Config.playlists_dir` was removed as a
+second, unchecked answer to "where are the playlists". An `OSError` from the writer is no longer
+dressed up as a `400`, because a read-only disk is not a malformed request. And the claim that
+OwnTone's web UI could reorder these files was wrong, as noted above.
+
+### What the first version got wrong, and the second one fixed
+
+Shipped, used, and the verdict was three sentences: *only the queue can create a playlist; after
+creating one it is hard to know which songs are in it; and it cannot be modified.* All three are the
+same mistake — the staging above ("v1 is three verbs and no reordering UI") was drawn up on the
+assumption that OwnTone's web UI could do the rest, and that assumption was already known to be false
+by the time it shipped. With no reorder, no remove and no rename anywhere, a playlist was a write-once
+file: one wrong song in forty meant rebuilding the list.
+
+- **Seeing inside one.** `GET /playlists/{name}` now answers with `entries` — every line that names
+  something, in order, each with a `position` and either its track or a flag saying it resolves to
+  nothing. On the phone the playlist's name became the control: tap it and the row expands into the
+  numbered list. The old `tracks`/`missing` pair is gone from the JSON; they are properties of the
+  model, derived from `entries`, so the two cannot drift.
+- **An entry is named by its position, not its path.** The distinction the old shape could not express:
+  a playlist may hold the same track twice, and an entry may resolve to nothing — so "remove the second
+  copy" and "remove that dangling line" are both unsayable with a path, and an index into the *playable*
+  tracks is not an index into the file. `DELETE /playlists/{name}/tracks` takes `positions` (lines) or
+  `paths` (every copy of a track), exactly one.
+- **Reordering is one move at a time.** `PUT /playlists/{name}/tracks/{position}` with `{"to": n}`,
+  which is what ↑ and ↓ send. Not a whole new order, for the reason `PUT /player/repeat` takes a mode
+  rather than a cycle: two phones can be looking at one list, and an order computed from a
+  two-second-old reading would silently undo the other one's edit.
+- **Renaming.** `PATCH /playlists/{name}`. It also brings tunebox's own `# tunebox playlist:` comment
+  line up to date, so a file somebody opens does not disagree with its own name; a header another
+  program wrote is left alone.
+- **Creating without the queue.** A name on its own now makes an empty playlist, which is the thing
+  that was actually missing: `paths` needs a client that already knows what it wants and `from_queue`
+  needs the list to be the thing playing, so there was nowhere to put a *first* track. The CLI keeps
+  requiring `--empty` explicitly, because at a prompt a bare `create NAME` is far more likely to be a
+  forgotten argument than a request for an empty list.
+
+One internal change carried all of it: edits operate on **blocks** (`playlists._Block`) rather than
+lines. A block is an entry plus the `#EXTINF` immediately above it, ending where the next entry begins,
+with everything before the first entry as an untouchable preamble. That is what makes "move track two"
+carry its own metadata with it, "remove track one" leave the header alone, and a playlist another
+program wrote survive an edit line for line.
+
+Found while testing it, and fixed: the `409` added for a stale position swallowed `PlaylistNotFound`
+(it *is* a `PlaylistError`), so editing a playlist that did not exist answered "that playlist is in the
+way" instead of `404`.
+
+Not verified: **two phones editing one playlist at the same instant** — last-write-wins is a decision
+rather than a measurement, and the atomic write is tested only in the sense that no `.partial` file
+survives one. **Nothing has run on a Pi**, as everywhere else. Tests 1276 → 1479 → 1562.
 
 

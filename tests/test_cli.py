@@ -780,6 +780,285 @@ class TestPlayerCLI:
             parser.parse_args(["player", "volume"])
 
 
+def playlists_count(root: Path) -> int:
+    """How many playlist files exist — for the tests that assert nothing was lost."""
+    return len(list((root / "Playlists").glob("*.m3u")))
+
+
+class TestPlaylistCLI:
+    """``tunebox playlist …`` — the six verbs over the ``.m3u`` files in the music root.
+
+    There *is* a CLI for playlists where there deliberately is none for deleting a track, and the
+    asymmetry is the point: a delete has ``rm``, while writing a correct M3U by hand means getting the
+    relative paths right and no shell one-liner does that.
+
+    The player is patched out at :func:`tunebox.cli._player` for the same reason as ``TestPlayerCLI``:
+    what is under test is argparse wiring and output shape, and on a development host where OwnTone is
+    running an unpatched test would clear its queue.
+    """
+
+    @pytest.fixture
+    def player(self, monkeypatch) -> FakePlayer:
+        fake = FakePlayer()
+        monkeypatch.setattr("tunebox.cli._player", lambda config: fake)
+        return fake
+
+    @pytest.fixture
+    def root(self, tmp_path: Path) -> Path:
+        music = tmp_path / "music"
+        for relative in ("Kraftwerk/Singles/Autobahn.m4a", "陳奕迅/Singles/K歌之王.m4a"):
+            path = music / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"audio")
+        return music
+
+    def run(self, root: Path, *argv: str) -> int:
+        return main(["--music-root", str(root), "playlist", *argv])
+
+    def _json(self, capsys) -> object:
+        return json.loads(capsys.readouterr().out)
+
+    def test_create_writes_the_file_and_prints_it(self, root: Path, player, capsys):
+        assert self.run(root, "create", "Road trip", "Kraftwerk/Singles/Autobahn.m4a") == 0
+        body = self._json(capsys)
+        assert body["name"] == "Road trip"
+        assert body["count"] == 1
+        assert (root / "Playlists" / "Road trip.m3u").is_file()
+
+    def test_a_path_relative_to_the_shell_works_too(
+        self, root: Path, player, capsys, monkeypatch
+    ):
+        """The one translation a terminal needs and the API does not: ``GET /library`` hands out paths
+        relative to the music root, while somebody at a prompt has a path relative to where they are
+        standing. Both are accepted; neither reaches the library resolver as a guess."""
+        monkeypatch.chdir(root / "Kraftwerk" / "Singles")
+        assert self.run(root, "create", "Here", "Autobahn.m4a") == 0
+        assert self._json(capsys)["count"] == 1
+
+    def test_create_refuses_a_file_outside_the_library(self, root: Path, player, capsys):
+        assert self.run(root, "create", "Evil", "/etc/passwd") == 1
+        assert "error:" in capsys.readouterr().err
+        assert not (root / "Playlists").exists()
+
+    def test_create_needs_exactly_one_source(self, root: Path, player, capsys):
+        """A bare ``create NAME`` is an error at a prompt even though the *API* takes it as "empty".
+
+        Deliberately asymmetric: on a command line a missing argument is far more likely than a request
+        for an empty list, and silently making one would hide the typo. ``--empty`` says it on purpose.
+        """
+        assert self.run(root, "create", "Nothing") == 1
+        assert "exactly one of FILEs, --from-queue or --empty" in capsys.readouterr().err
+        assert self.run(root, "create", "Nothing", "--empty", "--from-queue") == 1
+
+    def test_create_empty_then_add(self, root: Path, player, capsys):
+        """The other way in, and the one the first version of this feature was missing: name it now,
+        fill it later from the Library panel or a second command."""
+        assert self.run(root, "create", "Mix", "--empty") == 0
+        assert self._json(capsys)["count"] == 0
+        assert self.run(root, "add", "Mix", "Kraftwerk/Singles/Autobahn.m4a") == 0
+        assert [e["track"]["title"] for e in self._json(capsys)["entries"]] == ["Autobahn"]
+
+    def test_create_from_the_queue(self, root: Path, player: FakePlayer, capsys):
+        player.enqueue_paths([root / "陳奕迅/Singles/K歌之王.m4a"])
+        assert self.run(root, "create", "Right now", "--from-queue") == 0
+        assert [e["track"]["title"] for e in self._json(capsys)["entries"]] == ["K歌之王"]
+
+    def test_create_from_an_empty_queue_is_an_error(self, root: Path, player, capsys):
+        assert self.run(root, "create", "Nothing", "--from-queue") == 1
+        assert "no library tracks" in capsys.readouterr().err
+
+    def test_create_twice_is_an_error_until_replace(self, root: Path, player, capsys):
+        self.run(root, "create", "Road trip", "Kraftwerk/Singles/Autobahn.m4a")
+        capsys.readouterr()
+        assert self.run(root, "create", "Road trip", "陳奕迅/Singles/K歌之王.m4a") == 1
+        assert "already exists" in capsys.readouterr().err
+        assert self.run(root, "create", "Road trip", "陳奕迅/Singles/K歌之王.m4a", "--replace") == 0
+        assert [e["track"]["title"] for e in self._json(capsys)["entries"]] == ["K歌之王"]
+
+    def test_list_and_show(self, root: Path, player, capsys):
+        self.run(root, "create", "Road trip", "Kraftwerk/Singles/Autobahn.m4a")
+        capsys.readouterr()
+        assert self.run(root, "list") == 0
+        listing = self._json(capsys)
+        assert [p["name"] for p in listing] == ["Road trip"]
+        assert listing[0]["entries"] == [] and listing[0]["count"] == 1
+        assert self.run(root, "show", "Road trip") == 0
+        shown = self._json(capsys)
+        assert [e["track"]["title"] for e in shown["entries"]] == ["Autobahn"]
+        assert [e["position"] for e in shown["entries"]] == [0]
+
+    def test_show_one_that_is_not_there(self, root: Path, player, capsys):
+        assert self.run(root, "show", "nope") == 1
+        assert "no playlist called" in capsys.readouterr().err
+
+    def test_add_appends(self, root: Path, player, capsys):
+        self.run(root, "create", "Road trip", "Kraftwerk/Singles/Autobahn.m4a")
+        capsys.readouterr()
+        assert self.run(root, "add", "Road trip", "陳奕迅/Singles/K歌之王.m4a") == 0
+        assert [e["track"]["title"] for e in self._json(capsys)["entries"]] == ["Autobahn", "K歌之王"]
+
+    def test_play_replaces_the_queue_and_starts(self, root: Path, player: FakePlayer, capsys):
+        self.run(root, "create", "Road trip", "Kraftwerk/Singles/Autobahn.m4a")
+        capsys.readouterr()
+        assert self.run(root, "play", "Road trip") == 0
+        body = self._json(capsys)
+        assert body["playlist"] == "Road trip"
+        assert [item["title"] for item in body["queued"]] == ["Autobahn"]
+        assert player.state == "play"
+
+    def test_play_with_add_appends_without_starting(
+        self, root: Path, player: FakePlayer, capsys
+    ):
+        self.run(root, "create", "Road trip", "Kraftwerk/Singles/Autobahn.m4a")
+        capsys.readouterr()
+        assert self.run(root, "play", "Road trip", "--add") == 0
+        assert player.state == "stop"
+
+    def test_play_rescans_for_a_file_the_daemon_has_not_indexed(
+        self, root: Path, player: FakePlayer, capsys
+    ):
+        """The same sequence as ``tunebox player play FILE``: resolve first, and only rescan if
+        something is unknown — OwnTone's track ids are unstable *during* a scan, so resolving after
+        triggering one is how a freshly ingested track becomes an ``Invalid uri``."""
+        self.run(root, "create", "Road trip", "Kraftwerk/Singles/Autobahn.m4a")
+        player.indexed = set()  # nothing is in the daemon's library yet
+        player.rescans = 0  # the create already asked for one; this is about what `play` does
+        assert self.run(root, "play", "Road trip") == 1  # it still cannot be resolved after the scan
+        assert player.rescans == 1 and player.scan_waits == 1
+
+    def test_play_says_which_entries_it_skipped(self, root: Path, player, capsys):
+        directory = root / "Playlists"
+        directory.mkdir(parents=True)
+        (directory / "Holes.m3u").write_text(
+            "#EXTM3U\n../Kraftwerk/Singles/Autobahn.m4a\n../gone.m4a\n", encoding="utf-8"
+        )
+        assert self.run(root, "play", "Holes") == 0
+        assert "1 entry(ies)" in capsys.readouterr().err
+
+    def test_play_a_playlist_with_nothing_in_it(self, root: Path, player, capsys):
+        directory = root / "Playlists"
+        directory.mkdir(parents=True)
+        (directory / "Broken.m3u").write_text("#EXTM3U\n../gone.m4a\n", encoding="utf-8")
+        assert self.run(root, "play", "Broken") == 1
+        assert "no playable tracks" in capsys.readouterr().err
+
+    def test_delete_removes_the_file_and_no_audio(self, root: Path, player, capsys):
+        self.run(root, "create", "Road trip", "Kraftwerk/Singles/Autobahn.m4a")
+        capsys.readouterr()
+        assert self.run(root, "delete", "Road trip") == 0
+        assert self._json(capsys) == {"deleted": "Playlists/Road trip.m3u"}
+        assert (root / "Kraftwerk/Singles/Autobahn.m4a").is_file()
+
+    def test_delete_one_that_is_not_there(self, root: Path, player, capsys):
+        assert self.run(root, "delete", "nope") == 1
+
+    def test_remove_by_path_and_by_position(self, root: Path, player, capsys):
+        """Both, because they answer different questions: a path removes every entry naming that
+        track, while ``--position`` removes one line — which is the only way to take out one of two
+        copies, or an entry that no longer resolves to anything."""
+        self.run(
+            root,
+            "create",
+            "Mix",
+            "Kraftwerk/Singles/Autobahn.m4a",
+            "陳奕迅/Singles/K歌之王.m4a",
+            "Kraftwerk/Singles/Autobahn.m4a",
+        )
+        capsys.readouterr()
+        assert self.run(root, "remove", "Mix", "--position", "2") == 0
+        assert [e["track"]["title"] for e in self._json(capsys)["entries"]] == ["Autobahn", "K歌之王"]
+        assert self.run(root, "remove", "Mix", "Kraftwerk/Singles/Autobahn.m4a") == 0
+        assert [e["track"]["title"] for e in self._json(capsys)["entries"]] == ["K歌之王"]
+
+    def test_remove_needs_one_way_or_the_other(self, root: Path, player, capsys):
+        self.run(root, "create", "Mix", "Kraftwerk/Singles/Autobahn.m4a")
+        capsys.readouterr()
+        assert self.run(root, "remove", "Mix") == 1
+        assert "either FILEs or --position" in capsys.readouterr().err
+
+    def test_remove_a_position_that_is_not_there(self, root: Path, player, capsys):
+        self.run(root, "create", "Mix", "Kraftwerk/Singles/Autobahn.m4a")
+        capsys.readouterr()
+        assert self.run(root, "remove", "Mix", "--position", "4") == 1
+        assert "nothing at position 4" in capsys.readouterr().err
+
+    def test_move_reorders(self, root: Path, player, capsys):
+        self.run(
+            root, "create", "Mix", "Kraftwerk/Singles/Autobahn.m4a", "陳奕迅/Singles/K歌之王.m4a"
+        )
+        capsys.readouterr()
+        assert self.run(root, "move", "Mix", "1", "0") == 0
+        assert [e["track"]["title"] for e in self._json(capsys)["entries"]] == ["K歌之王", "Autobahn"]
+
+    def test_move_outside_the_playlist(self, root: Path, player, capsys):
+        self.run(root, "create", "Mix", "Kraftwerk/Singles/Autobahn.m4a")
+        capsys.readouterr()
+        assert self.run(root, "move", "Mix", "0", "9") == 1
+        assert "outside playlist" in capsys.readouterr().err
+
+    def test_rename_keeps_the_tracks(self, root: Path, player, capsys):
+        self.run(root, "create", "Mix", "Kraftwerk/Singles/Autobahn.m4a")
+        capsys.readouterr()
+        assert self.run(root, "rename", "Mix", "Road trip: 2026") == 0
+        renamed = self._json(capsys)
+        assert renamed["name"] == "Road trip_ 2026"
+        assert [e["track"]["title"] for e in renamed["entries"]] == ["Autobahn"]
+        assert not (root / "Playlists" / "Mix.m3u").exists()
+
+    def test_rename_onto_an_existing_playlist_is_refused(self, root: Path, player, capsys):
+        self.run(root, "create", "One", "Kraftwerk/Singles/Autobahn.m4a")
+        self.run(root, "create", "Two", "陳奕迅/Singles/K歌之王.m4a")
+        capsys.readouterr()
+        assert self.run(root, "rename", "One", "Two") == 1
+        assert "already exists" in capsys.readouterr().err
+        assert playlists_count(root) == 2
+
+    def test_every_verb_is_reachable_from_the_parser(self):
+        parser = build_parser()
+        for argv in (
+            ["list"],
+            ["show", "x"],
+            ["create", "x", "--from-queue"],
+            ["create", "x", "--empty"],
+            ["add", "x", "f.m4a"],
+            ["remove", "x", "f.m4a"],
+            ["remove", "x", "--position", "0"],
+            ["move", "x", "1", "0"],
+            ["rename", "x", "y"],
+            ["play", "x"],
+            ["delete", "x"],
+        ):
+            assert callable(parser.parse_args(["playlist", *argv]).func), argv
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["show"],
+            ["add", "x"],
+            ["play"],
+            ["delete"],
+            [],
+            ["move", "x"],
+            ["move", "x", "1"],
+            ["move", "x", "up", "0"],
+            ["rename", "x"],
+        ],
+    )
+    def test_a_verb_missing_its_argument_is_a_usage_error(self, argv: list[str]):
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["playlist", *argv])
+
+    def test_a_dead_daemon_does_not_fail_a_write(self, root: Path, monkeypatch, capsys):
+        """The file is written; a daemon that is not answering only means OwnTone's own playlist view
+        is stale until its next scan. Same rule as the rescan hook after an ingest."""
+        monkeypatch.setattr("tunebox.cli._player", lambda config: FakePlayer(unavailable=True))
+        assert self.run(root, "create", "Road trip", "Kraftwerk/Singles/Autobahn.m4a") == 0
+        assert "rescan failed" in capsys.readouterr().err
+        assert (root / "Playlists" / "Road trip.m3u").is_file()
+
+
+
 class TestDoctorPlayerCheck:
     """The player check is *advisory*: PLAN.md 3.1 keeps ingest working with no player installed,
     so a missing OwnTone must not make ``doctor`` exit non-zero on every Phase 1/2 host."""

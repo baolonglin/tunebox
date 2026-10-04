@@ -823,9 +823,21 @@ class TestDeleteAsksFirst:
         assert body.index("panel.hidden = true") < body.index('button("Delete"')
         assert body.index('button("Queue"') < body.index("row-confirm")
 
-    def test_there_is_exactly_one_delete_button_in_the_page(self):
+    def test_every_delete_button_is_behind_a_confirmation(self):
+        """Two now — the library's, and the playlist's — and neither is reachable in one tap.
+
+        The count is asserted rather than left open on purpose: it is the number of places in this
+        page that can destroy something, and a third appearing without this test being read is exactly
+        the regression the class exists to catch. What they share is the shape — each is built *after*
+        its panel has been hidden — and what they do not share is the stakes, which is why the library
+        one names the file and warns that it cannot be put back, while the playlist one says that no
+        music is removed.
+        """
         code = TestTheAssetsThemselves.code("app.js")
-        assert code.count('button("Delete"') == 1
+        assert code.count('button("Delete"') == 2
+        for body in (self.source(), TestPlaylists.source()):
+            assert body.index("panel.hidden = true") < body.index('button("Delete"')
+            assert 'button("Cancel"' in body
 
     def test_the_disclosure_is_announced(self):
         """``⋯`` is not a label. Without ``aria-label`` and ``aria-expanded`` a screen reader gets
@@ -871,6 +883,245 @@ class TestDeleteAsksFirst:
         body = code[code.index("async function deleteTrack(") :]
         assert "await loadLibrary()" in body
         assert "await refreshPlayer()" in body
+
+
+class TestPlaylists:
+    """The Playlists panel: save the queue, play a playlist, append one track, delete the list.
+
+    A playlist is an ``.m3u`` file in the music root that tunebox wrote, so there is no local state
+    here to get out of step — every one of these is a request and a redraw. The assertions worth having
+    are therefore about the two things a reading of the API cannot establish: that the panel exists and
+    is wired at all, and that its delete is as far from a thumb as the library's is while saying
+    something different, because it destroys no audio.
+    """
+
+    @staticmethod
+    def source() -> str:
+        """The body of ``playlistRow``, which is where the row's buttons are decided."""
+        code = TestTheAssetsThemselves.code("app.js")
+        start = code.index("function playlistRow(")
+        return code[start : code.index("\n  }", start)]
+
+    def test_the_panel_is_a_tab_like_the_others(self):
+        markup = TestTheAssetsThemselves.code("index.html")
+        assert 'id="tab-playlists"' in markup and 'id="panel-playlists"' in markup
+        assert 'aria-controls="panel-playlists"' in markup
+        assert 'aria-labelledby="tab-playlists"' in markup
+
+    def test_the_script_knows_about_the_tab(self):
+        """``TABS`` drives the roving tabindex and the arrow keys; a panel missing from it is a tab
+        that cannot be reached from the keyboard."""
+        code = TestTheAssetsThemselves.code("app.js")
+        assert '"playlists"' in re.findall(r"const TABS = \[([^\]]+)\]", code)[0]
+
+    def test_opening_the_tab_re_reads_the_directory(self):
+        """Same rule as the Library panel, and for the same reason: a playlist can have been created
+        from a terminal or another phone since this panel was last drawn."""
+        code = TestTheAssetsThemselves.code("app.js")
+        assert 'if (name === "playlists") loadPlaylists();' in code
+
+    def test_creation_offers_both_ways_in(self):
+        """Two buttons on one name field, because "save the queue" alone was the wrong place to stop:
+        it means a playlist can only be built by first making it the thing that is playing."""
+        code = TestTheAssetsThemselves.code("app.js")
+        assert "body: { name, ...body }" in code
+        assert "{ from_queue: true }" in code, "the submit button saves the queue"
+        assert 'empty.addEventListener("click"' in code, "and the other one starts an empty list"
+        markup = TestTheAssetsThemselves.code("index.html")
+        assert 'id="pl-name"' in markup and 'for="pl-name"' in markup
+        assert 'id="btn-pl-empty"' in markup
+
+    def test_a_playlist_with_holes_in_it_says_so(self):
+        """OwnTone skips an entry it cannot resolve and says nothing, so a list that plays eight of
+        its ten tracks would otherwise be silent about it. The count is on the row, and the entry
+        itself is in the expanded list with a line saying what is wrong with it."""
+        code = TestTheAssetsThemselves.code("app.js")
+        subtitle = code[code.index("function playlistSubtitle(") : code.index("function playlistRow(")]
+        assert "missing_count" in subtitle
+        assert "${missing} missing" in subtitle
+        rows = code[code.index("function entryRow(") :]
+        assert "entry.missing" in rows
+        assert "This file is not there" in rows
+
+    def test_a_row_can_be_opened_to_see_what_is_in_it(self):
+        """The complaint this answers: a playlist used to be a name with a count beside it, so there
+        was no way to find out which songs were in one. The name is now the control, and it is a real
+        ``<button>`` with ``aria-expanded`` rather than a div with a click handler."""
+        code = TestTheAssetsThemselves.code("app.js")
+        body = self.source()
+        assert "() => toggle()" in body, "the row's activate handler expands it"
+        assert 'main.setAttribute("aria-expanded", "false")' in body
+        assert 'main.setAttribute("aria-controls", tracks.id)' in body
+        assert "async function drawEntries(" in code
+        assert 'api(`/playlists/${encodeURIComponent(name)}`)' in code
+
+    def test_an_edit_does_not_collapse_the_playlist_being_edited(self):
+        """Every edit redraws the list from the response, so without remembering which row was open
+        the first ✕ would close the playlist under the thumb that pressed it."""
+        code = TestTheAssetsThemselves.code("app.js")
+        assert "openPlaylist: null," in code, "the open row is state, not DOM"
+        assert "if (state.openPlaylist === playlist.name) toggle();" in self.source()
+
+    def test_entries_are_numbered_from_one_and_sent_from_zero(self):
+        """What the API takes is the entry's ``position``, which is the only handle that survives a
+        playlist holding the same track twice — an index into the *playable* tracks would not, since a
+        missing entry occupies a position too."""
+        code = TestTheAssetsThemselves.code("app.js")
+        rows = code[code.index("function entryRow(") : code.index("function playPlaylist(")]
+        assert "`${index + 1}. ${title}`" in rows
+        assert "entry.position" in rows
+        assert "body: { to: entry.position - 1 }" in rows
+        assert "body: { to: entry.position + 1 }" in rows
+        assert "positions: [entry.position]" in rows
+
+    def test_the_ends_of_the_list_cannot_be_moved_past(self):
+        code = TestTheAssetsThemselves.code("app.js")
+        rows = code[code.index("function entryRow(") : code.index("function playPlaylist(")]
+        assert "up.disabled = index === 0" in rows
+        assert "down.disabled = last" in rows
+
+    def test_removing_a_track_from_a_playlist_asks_no_confirmation(self):
+        """Unlike the Library panel's delete, and the difference is the point: this removes a line of
+        text and the audio stays on disk, so a confirmation strip would be ceremony that teaches people
+        to tap through the one that matters."""
+        code = TestTheAssetsThemselves.code("app.js")
+        rows = code[code.index("function entryRow(") : code.index("function playPlaylist(")]
+        assert 'button("✕"' in rows
+        assert "row-confirm" not in rows
+        assert 'method: "DELETE"' in rows
+
+    def test_a_playlist_can_be_renamed(self):
+        """Also here because nothing else can do it — OwnTone's web UI cannot edit these files either.
+        The server sanitises the name, so the answer's name is the one the next request must use."""
+        body = self.source()
+        assert '"row-rename"' in body
+        assert 'method: "PATCH"' in body
+        assert "state.openPlaylist = renamed.name" in body, "the row should follow its new name"
+
+    def test_adding_a_track_to_a_playlist_lives_in_the_library_row(self):
+        """Where the track is, rather than on the Playlists panel: the thing somebody is looking at
+        when they want to file a track is the track."""
+        code = TestTheAssetsThemselves.code("app.js")
+        assert "function addToPlaylistControl(" in code
+        assert "/tracks`, {" in code
+        body = code[code.index("function addToPlaylistControl(") :]
+        assert 'picker.setAttribute("aria-label"' in body, "a bare <select> has no accessible name"
+
+    def test_the_picker_offers_existing_playlists_only(self):
+        """No free-text "new playlist" field in a library row: creating one lives on the Playlists
+        panel, and two ways to create would be two names for the same thing."""
+        code = TestTheAssetsThemselves.code("app.js")
+        body = code[code.index("function addToPlaylistControl(") :]
+        assert "state.playlists" in body
+        assert "No playlists yet" in body, "an empty set should say so rather than offer nothing"
+
+    def test_the_row_offers_play_and_queue(self):
+        body = self.source()
+        assert 'button("Play"' in body and 'button("Queue"' in body
+        assert '"replace", true' in body and '"append", false' in body
+
+    def test_the_confirmation_says_that_no_music_is_removed(self):
+        """The one way this delete must *not* read like the library's: a playlist is a list, and the
+        tracks it named are all still there afterwards."""
+        body = self.source()
+        warn = body[body.index('"row-warn"') : body.index("const actions")]
+        assert "${playlist.name}" in warn
+        assert "No music is removed" in warn
+
+
+class TestTheAddToPlaylistControlIsBuiltCorrectly:
+    """``addToPlaylistControl`` run for real under deno, against a DOM just big enough to hold it.
+
+    Behavioural rather than a reading of the source, for one reason: this control is built *lazily*,
+    when a library row's ``⋯`` is first opened, so none of the DOM-level assertions elsewhere in this
+    file ever see it. The two things worth proving are that the dropdown is populated from the cached
+    names rather than from a fetch, and that an empty set produces a sentence instead of an empty
+    dropdown with an Add button that could only fail.
+    """
+
+    FUNCTIONS = ("make", "button", "addToPlaylistControl")
+
+    HARNESS = r"""
+class FakeNode {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase();
+    this.children = [];
+    this.dataset = {};
+    this.attributes = {};
+    this.className = "";
+    this.textContent = "";
+    this.disabled = false;
+  }
+  appendChild(child) { this.children.push(child); return child; }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  addEventListener() {}
+  *walk() { for (const c of this.children) { yield c; yield* c.walk(); } }
+}
+
+const document = { createElement: (tag) => new FakeNode(tag) };
+const state = { playlists: [] };
+const el = () => new FakeNode("p");
+const api = () => {};
+const attempt = () => {};
+
+__FUNCTIONS__
+
+const describe = (box) => ({
+  className: box.className,
+  tags: [...box.walk()].map((n) => n.tagName),
+  options: [...box.walk()].filter((n) => n.tagName === "OPTION").map((n) => n.textContent),
+  selectLabelled: [...box.walk()].some(
+    (n) => n.tagName === "SELECT" && n.attributes["aria-label"]
+  ),
+  buttons: [...box.walk()].filter((n) => n.tagName === "BUTTON").map((n) => n.textContent),
+  text: [...box.walk()].filter((n) => n.tagName === "P").map((n) => n.textContent),
+});
+
+const result = {};
+result.empty = describe(addToPlaylistControl({ title: "Autobahn", path: "a.m4a" }));
+state.playlists = ["Road trip", "廣東歌"];
+result.populated = describe(addToPlaylistControl({ title: "Autobahn", path: "a.m4a" }));
+console.log(JSON.stringify(result));
+"""
+
+    @classmethod
+    def run(cls) -> dict:
+        deno = shutil.which("deno")
+        if deno is None:  # pragma: no cover - deno is a declared requirement, but not here
+            pytest.skip("deno is not installed")
+        code = TestTheAssetsThemselves.code("app.js")
+        sources = []
+        for name in cls.FUNCTIONS:
+            start = code.index(f"  function {name}(")
+            sources.append(code[start : code.index("\n  }\n", start) + 4])
+        script = cls.HARNESS.replace("__FUNCTIONS__", "\n".join(sources))
+        completed = subprocess.run(
+            [deno, "eval", script], capture_output=True, text=True, timeout=60
+        )
+        assert completed.returncode == 0, completed.stderr
+        return json.loads(completed.stdout)
+
+    def test_the_dropdown_holds_every_cached_playlist(self):
+        populated = self.run()["populated"]
+        assert populated["options"] == ["Road trip", "廣東歌"]
+        assert populated["buttons"] == ["Add to playlist"]
+
+    def test_the_dropdown_carries_an_accessible_name(self):
+        """A bare ``<select>`` beside a button called "Add to playlist" announces nothing about what
+        it is choosing *for*, and this one sits inside a list of a hundred identical rows."""
+        assert self.run()["populated"]["selectLabelled"] is True
+
+    def test_no_playlists_yet_is_a_sentence_and_not_an_empty_dropdown(self):
+        empty = self.run()["empty"]
+        assert empty["options"] == [] and empty["buttons"] == []
+        assert empty["text"] and "No playlists yet" in empty["text"][0]
+
+    def test_it_is_marked_so_the_strip_only_builds_it_once(self):
+        """``reveal()`` looks for ``.row-add`` before inserting: a strip closed and reopened must not
+        stack a second dropdown."""
+        assert self.run()["populated"]["className"] == "row-add"
+        code = TestTheAssetsThemselves.code("app.js")
+        assert 'panel.querySelector(".row-add")' in code
 
 
 class TestTheLibraryPanelDoesNotGoStale:
@@ -1039,9 +1290,9 @@ class TestTheMarkupAndTheScriptAgree:
         """
         ids, refs = self.parse()
         controls = {target for attribute, target, role in refs if role == "tab"}
-        assert controls == {"panel-now", "panel-add", "panel-library"}
+        assert controls == {"panel-now", "panel-add", "panel-library", "panel-playlists"}
         labelled = {target for attribute, target, _ in refs if attribute == "aria-labelledby"}
-        assert labelled == {"tab-now", "tab-add", "tab-library"}
+        assert labelled == {"tab-now", "tab-add", "tab-library", "tab-playlists"}
 
     def test_a_disclosure_button_controls_something_that_exists(self):
         """``aria-expanded`` without a resolvable ``aria-controls`` tells a screen reader that

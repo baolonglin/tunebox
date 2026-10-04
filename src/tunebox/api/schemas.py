@@ -282,6 +282,168 @@ class LibraryDeletedView(BaseModel):
     #: Directories that emptied as a result and were removed — reported because they are visible in
     #: OwnTone's browse view even though ``GET /library`` never showed them.
     removed_directories: list[str] = Field(default_factory=list)
+    #: Playlists that named one of the deleted tracks and had the entry removed. Reported for the
+    #: same reason as ``removed_directories``: it is the part of the delete nobody asked for, and a
+    #: playlist that silently got shorter is exactly the sort of thing a UI should be able to mention.
+    playlists_updated: list[str] = Field(default_factory=list)
     #: Non-fatal problems, currently only "the player could not be told to re-index". The file is
     #: gone either way, which is why this is a field and not a status code.
+    warnings: list[str] = Field(default_factory=list)
+
+
+# ------------------------------------------------------------------ playlists
+#
+# A playlist is an M3U file in the music root (see :mod:`tunebox.playlists`), so there is no id here
+# and no database behind it: the name *is* the filename. These mirror
+# :class:`tunebox.core.models.Playlist`, with one addition that the model deliberately does not carry
+# — ``skipped``, which is about one request rather than about the playlist.
+
+
+class PlaylistEntryView(BaseModel):
+    """One line of a playlist. ``position`` is how an edit names it — see the request bodies below."""
+
+    position: int
+    #: The raw text of the line in the file. The only thing there is to show for a missing entry.
+    entry: str
+    missing: bool = False
+    track: LibraryTrackView | None = None
+
+
+class PlaylistView(BaseModel):
+    name: str
+    #: The ``.m3u`` file, relative to the music root.
+    path: str
+    #: Number of entries that resolve to a real track. ``GET /playlists`` leaves ``entries`` empty and
+    #: fills this, so a summary and an empty playlist are distinguishable.
+    count: int = 0
+    #: Entries that resolve to nothing — the half OwnTone skips without saying so. A number of its own
+    #: so that a listing can say "4 tracks · 1 missing" without carrying every entry.
+    missing_count: int = 0
+    modified: float | None = None
+    #: Every line that names something, in file order — including the ones that resolve to nothing,
+    #: flagged rather than dropped. The order *is* the playlist, and ``position`` is what
+    #: ``DELETE /playlists/{name}/tracks`` and ``PUT /playlists/{name}/tracks/{position}`` take.
+    entries: list[PlaylistEntryView] = Field(default_factory=list)
+    #: Only ever non-empty from ``from_queue``: queue items that are not library tracks (a stream, a
+    #: file deleted since it was queued) and were left out instead of failing the save.
+    skipped: list[str] = Field(default_factory=list)
+
+
+class PlaylistCreateRequest(BaseModel):
+    """``POST /playlists`` — from explicit paths, from the queue, or empty.
+
+    ``paths`` and ``from_queue`` are mutually exclusive, and **neither is required**: a name on its own
+    creates an empty playlist. That is the entry point for assembling one a track at a time from the
+    Library panel, and its absence was the complaint that "only the queue can create a playlist".
+
+    Where they differ is what an unusable entry means. ``paths`` came from a client that read them out
+    of ``GET /library``, so a path that does not resolve is that client's bug and the whole request
+    fails. The *queue* is shared state that tunebox did not necessarily fill (OwnTone's own web UI can
+    add to it), so an item that is not a library track is skipped and reported — the alternative is a
+    "save the queue" button that cannot save this queue and cannot say which entry is the problem.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+    paths: list[str] | None = Field(default=None, max_length=1000)
+    from_queue: bool = False
+    #: Overwrite a playlist of the same name. Off by default, so creating twice is a ``409`` rather
+    #: than silently discarding whatever was in the first one.
+    replace: bool = False
+
+    @model_validator(mode="after")
+    def _at_most_one_source(self) -> "PlaylistCreateRequest":
+        if self.paths is not None and self.from_queue:
+            raise ValueError("send at most one of paths or from_queue")
+        if self.paths is not None and not self.paths:
+            raise ValueError("paths must not be empty; omit it to create an empty playlist")
+        return self
+
+
+class PlaylistTracksRequest(BaseModel):
+    """``POST /playlists/{name}/tracks`` — append. Same ``paths`` shape as the queue route."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    paths: list[str] = Field(min_length=1, max_length=1000)
+
+
+class PlaylistRemoveRequest(BaseModel):
+    """``DELETE /playlists/{name}/tracks`` — take entries out. Exactly one of two ways to say which.
+
+    ``positions`` names **lines**: ``[1]`` is the second entry and nothing else. It is the only form
+    that can express "remove the second copy of this track" or "remove that dangling entry", so it is
+    what the remote sends. ``paths`` names **tracks** and removes every entry resolving to one of them,
+    which is what a terminal wants to type.
+
+    A body rather than a path parameter for the same reason ``DELETE /library`` has one: this removes
+    several at once, all-or-nothing, and a library path in a URL is how a delete names the wrong thing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    positions: list[int] | None = Field(default=None, max_length=1000)
+    paths: list[str] | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> "PlaylistRemoveRequest":
+        if (self.positions is None) == (self.paths is None):
+            raise ValueError("send exactly one of positions or paths")
+        if self.positions is not None:
+            if not self.positions:
+                raise ValueError("positions must not be empty")
+            if any(position < 0 for position in self.positions):
+                raise ValueError("positions are zero-based and must not be negative")
+        elif not self.paths:
+            raise ValueError("paths must not be empty")
+        return self
+
+
+class PlaylistMoveRequest(BaseModel):
+    """``PUT /playlists/{name}/tracks/{position}`` — the reorder primitive, one entry at a time.
+
+    A move rather than a whole new order, for the reason ``PUT /player/repeat`` takes a mode rather
+    than a cycle: two phones can be looking at this list, and an order computed from a two-second-old
+    reading would silently undo whatever the other one just did.
+
+    ``to`` is where the entry lands **after** being lifted out, so ``to: 0`` is "put it first" and no
+    caller has to reason about whether its own removal shifted the target index.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    to: int = Field(ge=0)
+
+
+class PlaylistRenameRequest(BaseModel):
+    """``PATCH /playlists/{name}`` — the new name, which is sanitised because it names a file.
+
+    Here because nothing else can do it: the same ``allow_modifying_stored_playlists = false`` that
+    stops OwnTone writing a playlist stops its web UI renaming one. The answer says the name it used.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+
+
+class PlaylistPlayRequest(BaseModel):
+    """``PUT /playlists/{name}/play``.
+
+    The defaults are the verb's whole point: *replace the queue and start*, which is what tapping a
+    playlist means. ``mode: append`` and ``start: false`` are there so the same route serves "add
+    this playlist to what is already on", which is the other thing anybody wants from a list.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["append", "replace"] = "replace"
+    start: bool = True
+
+
+class PlaylistDeletedView(BaseModel):
+    #: The file that was removed, relative to the music root.
+    deleted: str
+    #: Non-fatal problems, currently only a rescan the daemon refused.
     warnings: list[str] = Field(default_factory=list)

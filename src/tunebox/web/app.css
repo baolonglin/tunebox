@@ -170,7 +170,15 @@ main {
   background: transparent;
   color: var(--muted);
   font: inherit;
-  font-size: 0.9rem;
+  /*
+   * Four tabs now rather than three, so the padding comes off rather than the words: "Now playing"
+   * shortened to "Now" would be the cheapest fix and the worst one, since the label is the only thing
+   * naming the section a screen reader is about to enter. A narrow phone wraps a label onto two lines
+   * instead, which is legible; an abbreviated one is not recoverable.
+   */
+  font-size: 0.85rem;
+  padding: 0 0.4rem;
+  line-height: 1.15;
   cursor: pointer;
 }
 
@@ -487,6 +495,132 @@ button.row-main:hover .row-title {
   font-size: 0.82rem;
   color: var(--danger);
   overflow-wrap: anywhere;
+}
+
+/*
+ * "Add to playlist", inside a library row's `⋯` strip and above the delete confirmation.
+ *
+ * `flex-basis: 100%` puts it on its own line, like `.row-confirm` itself, so the dropdown gets the
+ * width of the row rather than whatever is left beside a sentence about deleting a file. Its own line
+ * is also what keeps the two things in that strip visibly separate: one adds a track to a list, the
+ * other removes it from the disk, and they must not read as a row of equivalent buttons.
+ */
+.row-add {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding-bottom: 0.5rem;
+}
+
+.row-add select {
+  flex: 1;
+  min-width: 0;
+  min-height: var(--tap);
+  padding: 0 0.6rem;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.row-add p {
+  margin: 0;
+}
+
+/*
+ * A playlist's tracks, expanded under its row. Its own line (`flex-basis: 100%`) like `.row-confirm`,
+ * because the list needs the width of the row rather than what is left beside two buttons.
+ */
+.row-tracks {
+  flex-basis: 100%;
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--line);
+}
+
+.row-tracks p {
+  margin: 0;
+}
+
+.entries {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  counter-reset: none;
+}
+
+/*
+ * One entry: tighter than a top-level list row, and indented, so an expanded playlist reads as part
+ * of its own row rather than as a second list competing with it.
+ */
+.entries li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  padding: 0.3rem 0.5rem;
+  background: var(--surface-2);
+  border-radius: 9px;
+}
+
+.entries .row-main {
+  min-height: 0;
+  padding: 0.15rem 0;
+}
+
+.entries .row-title {
+  font-size: 0.9rem;
+}
+
+.entries .row-actions button {
+  padding: 0 0.5rem;
+  min-width: 2.1rem;
+}
+
+/*
+ * An entry that resolves to nothing. Marked by a border as well as by its subtitle, because the
+ * stylesheet's rule is that nothing conveys state by colour alone — and this is the state OwnTone
+ * would skip in silence, so it is the one that most needs to be visible.
+ */
+.entries li.missing {
+  border: 1px solid var(--danger);
+}
+
+.entries li.missing .row-title {
+  color: var(--danger);
+}
+
+/* Rename, in the ⋯ strip above the delete confirmation: a field and one button, on their own line. */
+.row-rename {
+  flex-basis: 100%;
+  display: flex;
+  gap: 0.5rem;
+  padding-bottom: 0.5rem;
+}
+
+.row-rename input {
+  flex: 1;
+  min-width: 0;
+  min-height: var(--tap);
+  padding: 0 0.6rem;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+/* The two create buttons share a row: the common case first, and both full-height for a thumb. */
+.pl-create {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.pl-create button {
+  flex: 1;
 }
 
 .empty {

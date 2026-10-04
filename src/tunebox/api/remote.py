@@ -90,7 +90,13 @@ def configured_output(outputs: tuple[Output, ...], config: Config) -> Output | N
     )
 
 
-def _view(player: Player, config: Config, status_: PlayerStatus | None = None) -> PlayerView:
+def player_view(player: Player, config: Config, status_: PlayerStatus | None = None) -> PlayerView:
+    """The one response every command here answers with — and ``/playlists/{name}/play`` too.
+
+    Public because of that second caller: a playlist that has just replaced the queue has to answer
+    with the same now-playing document as ``PUT /player/play``, or the remote would need a second
+    round trip to find out what it had just started. One builder means the two cannot drift.
+    """
     state = status_ if status_ is not None else player.status()
     target = configured_output(state.outputs, config)
     return PlayerView(
@@ -117,21 +123,21 @@ def _view(player: Player, config: Config, status_: PlayerStatus | None = None) -
 
 @router.get("", response_model=PlayerView, summary="Transport state, queue and outputs")
 def get_player(request: Request) -> PlayerView:
-    return _view(_player(request), _config(request))
+    return player_view(_player(request), _config(request))
 
 
 @router.put("/play", response_model=PlayerView, summary="Start or resume")
 def play(request: Request) -> PlayerView:
     player = _player(request)
     player.play()
-    return _view(player, _config(request))
+    return player_view(player, _config(request))
 
 
 @router.put("/pause", response_model=PlayerView, summary="Pause, keeping the track loaded")
 def pause(request: Request) -> PlayerView:
     player = _player(request)
     player.pause()
-    return _view(player, _config(request))
+    return player_view(player, _config(request))
 
 
 @router.put("/toggle", response_model=PlayerView, summary="Pause if playing, play if not")
@@ -150,28 +156,28 @@ def toggle(request: Request) -> PlayerView:
         action()
     else:  # pragma: no cover - OwnTone and the fake both have toggle()
         (player.pause if player.status().playing else player.play)()
-    return _view(player, _config(request))
+    return player_view(player, _config(request))
 
 
 @router.put("/stop", response_model=PlayerView, summary="Stop and unload the track")
 def stop(request: Request) -> PlayerView:
     player = _player(request)
     player.stop()
-    return _view(player, _config(request))
+    return player_view(player, _config(request))
 
 
 @router.put("/next", response_model=PlayerView, summary="Skip to the next queue item")
 def next_track(request: Request) -> PlayerView:
     player = _player(request)
     player.next_track()
-    return _view(player, _config(request))
+    return player_view(player, _config(request))
 
 
 @router.put("/previous", response_model=PlayerView, summary="Skip to the previous queue item")
 def previous_track(request: Request) -> PlayerView:
     player = _player(request)
     player.previous_track()
-    return _view(player, _config(request))
+    return player_view(player, _config(request))
 
 
 @router.put("/volume", response_model=PlayerView, summary="Set volume, or change it by a step")
@@ -187,7 +193,7 @@ def set_volume(payload: VolumeRequest, request: Request) -> PlayerView:
     else:
         assert payload.volume is not None  # guaranteed by VolumeRequest
         player.set_volume(payload.volume)
-    return _view(player, _config(request))
+    return player_view(player, _config(request))
 
 
 @router.put("/seek", response_model=PlayerView, summary="Jump to a position in the current track")
@@ -200,7 +206,7 @@ def seek(payload: SeekRequest, request: Request) -> PlayerView:
             detail="this player cannot seek",
         )
     action(payload.position_ms)
-    return _view(player, _config(request))
+    return player_view(player, _config(request))
 
 
 @router.put(
@@ -222,7 +228,7 @@ def set_repeat(payload: RepeatRequest, request: Request) -> PlayerView:
     """
     player = _player(request)
     player.set_repeat(payload.mode)
-    return _view(player, _config(request))
+    return player_view(player, _config(request))
 
 
 @router.put("/shuffle", response_model=PlayerView, summary="Shuffle the queue, or stop shuffling")
@@ -235,7 +241,7 @@ def set_shuffle(payload: ShuffleRequest, request: Request) -> PlayerView:
     """
     player = _player(request)
     player.set_shuffle(payload.enabled)
-    return _view(player, _config(request))
+    return player_view(player, _config(request))
 
 
 @router.put(
@@ -268,7 +274,7 @@ def select_output(request: Request) -> PlayerView:
         )
     output = target()
     player.select_output(output.id, volume=config.output_volume)
-    return _view(player, config)
+    return player_view(player, config)
 
 
 @router.get("/queue", response_model=list[QueueItemView], summary="The daemon's queue")
@@ -351,4 +357,4 @@ def play_queue_item(item_id: str, request: Request) -> PlayerView:
             detail=f"no queue item with id {item_id!r} — the queue has changed since it was read",
         )
     player.play_item(item_id)
-    return _view(player, _config(request))
+    return player_view(player, _config(request))

@@ -118,6 +118,12 @@ reachable from outside the house (PLAN.md 3.2).
 | `PUT /player/output/select` | enable the configured speaker (no id is taken from the caller); `503` if it is listed but will not start |
 | `GET`&nbsp;`POST`&nbsp;`DELETE /player/queue` | list, add library files, or empty it |
 | `PUT /player/queue/{id}/play` | jump to an item already in the queue — `404` if it has since gone |
+| `GET`&nbsp;`POST /playlists` | list playlists, or create one — from library paths, from the queue, or empty |
+| `GET`&nbsp;`DELETE /playlists/{name}` | one playlist and its entries; delete the list (no audio is touched) |
+| `PATCH /playlists/{name}` | rename it, keeping its tracks |
+| `POST`&nbsp;`DELETE /playlists/{name}/tracks` | append tracks, or remove them by `positions` or by `paths` |
+| `PUT /playlists/{name}/tracks/{position}` | `{"to": n}` — move one entry, which is the whole reorder surface |
+| `PUT /playlists/{name}/play` | replace the queue with a playlist and start, or append it |
 
 ```bash
 T=$TUNEBOX_TOKEN
@@ -268,6 +274,131 @@ nothing to put a title into. It also means the host re-encodes AAC → Opus on e
 is not the zero-CPU passthrough that ingest is. Neither is configurable. PLAN.md Phase 0 has the
 measurements and PLAN.md 7.11 has the open question about whether to fix it by driving Cast directly.
 
+## Playlists
+
+**A playlist here is a file, not a table.** `$TUNEBOX_MUSIC_ROOT/Playlists/Saturday morning.m3u`,
+written by tunebox, read by OwnTone — and by Navidrome or MPD if either ever gets pointed at the same
+tree. The easiest way to make one is to build the queue you want and then save it:
+
+```bash
+tunebox playlist create "Road trip" FILE...       # from library files, in order
+tunebox playlist create "Right now" --from-queue  # whatever is playing, saved
+tunebox playlist create "Later" --empty           # name it now, fill it later
+tunebox playlist list                             # names and track counts
+tunebox playlist show "Road trip"                 # its entries, with positions
+tunebox playlist add "Road trip" FILE...          # append
+tunebox playlist remove "Road trip" FILE...       # every entry naming those tracks
+tunebox playlist remove "Road trip" --position 2  # exactly that entry
+tunebox playlist move "Road trip" 3 0             # make the fourth track first
+tunebox playlist rename "Road trip" "Long drive"  # keeps the tracks
+tunebox playlist play "Road trip"                 # replace the queue and start
+tunebox playlist play "Road trip" --add           # append it instead
+tunebox playlist delete "Road trip"               # the list only; no audio is touched
+```
+
+Positions are zero-based and are what `show` prints, because a playlist may hold the same track twice
+and may hold an entry that resolves to nothing — so a path does not name a line and an index into the
+*playable* tracks does not either.
+
+On the phone it is the **Playlists** tab:
+
+- **Making one.** Type a name, then **Save the queue** (what is playing right now) or **Start empty**.
+  Either way the new row opens itself. Filing a single track is done where the track is — the Library
+  row's **⋯** holds *Add to playlist*.
+- **Seeing inside one.** Tap the name. The row expands into its entries, numbered, with the artist and
+  album under each — and any entry whose file is missing marked in red saying so.
+- **Changing one.** Each entry has **↑ ↓** to move it and **✕** to take it out. No confirmation on the
+  ✕: it removes a line of text and the track stays on disk, and a strip there would teach people to tap
+  through the one in the Library panel that does delete a file. **⋯** on the playlist holds **Rename**
+  and the delete confirmation.
+
+Why a file, rather than OwnTone's own playlist API: **the daemon will not write one without a config
+change.** `owntone.conf` ships `allow_modifying_stored_playlists = false` with an empty
+`default_playlist_directory`, the same shape of locked-down default as `trusted_networks`. Writing the
+M3U ourselves turns out to be the better half of that trade anyway:
+
+- **No new database.** The filesystem is the library database (PLAN.md 3.1), so a playlist is backed
+  up by `tunebox backup`, survives `tunebox restore`, and is portable — with no new code in any of
+  those three places.
+- **OwnTone's write side stays shut.**
+- **Playback needs no new daemon integration.** tunebox reads the M3U, resolves the entries and hands
+  the paths to the same `enqueue_paths` the Library panel uses. Building on
+  `uris=library:playlist:N` would have put the daemon's own playlist ids through the `Player` port and
+  broken the drop-in property that port exists for (PLAN.md 3.4) — so the fallback player gets
+  playlists for free.
+- **The write path already existed.** Every entry goes through `library.resolve_track_path`, the one
+  function that refuses `..`, a symlink out of the tree and a non-audio file, so a playlist cannot
+  name a file outside the music root — which is the whole risk of accepting a list of paths from a
+  phone.
+
+What is in the file, and why:
+
+```
+#EXTM3U
+# tunebox playlist: Road trip
+../Kraftwerk/Autobahn/01 - Autobahn.m4a
+../陳奕迅/Singles/K歌之王.m4a
+```
+
+- **Entries are relative to the playlist file**, which is what M3U means everywhere and what survives
+  the library moving — the symlinked external SSD, and a restore to a different path. Because the
+  playlists live in a subdirectory, that means `../`, and OwnTone resolves it: measured on this host
+  against OwnTone 29.3, a playlist tunebox wrote into `Playlists/` was indexed as
+  `{"type": "plain", "item_count": 1}` with its `../Artist/Singles/Track.m4a` entry resolving to the
+  real track. An absolute entry is *read* and never written, so a hand-written file plays.
+- **No `#EXTINF`** written — and none removed. Writing one would be a second copy of each track's
+  metadata, going stale the moment somebody retags a file, to tell players something they read from the
+  tags anyway. But a playlist another program wrote is carried across line for line by an append or a
+  prune, so its `#EXTINF`s survive; the one exception is deliberate, in that pruning an entry takes its
+  own `#EXTINF` with it rather than leaving it attached to the next track.
+- **UTF-8**, and `.m3u` is not in `library.AUDIO_EXTENSIONS` — so playlists never appear in
+  `GET /library` and cannot be enqueued as if they were songs, with no code to exclude them.
+
+Details worth knowing:
+
+- **An entry is identified by its position, not its path.** The same track may legitimately be in a
+  playlist twice, and an entry may resolve to nothing at all, so neither a path nor an index into the
+  playable tracks names a line. `GET /playlists/{name}` reports `entries` with a `position` each, and
+  that is what a removal or a move takes. Removal by `paths` also exists, and means "every copy".
+- **The name is the filename**, so *creating* one sanitises it exactly as a track name is sanitised:
+  `Road trip: 2026/07` becomes one component, `Road trip_ 2026_07`. The create response says the name
+  it used, which is the one to put in the next URL. Every other verb takes the name **verbatim** and
+  refuses one that is not already a usable filename, rather than sanitising it too — otherwise
+  `a:b` and `a_b` would address the same file and a delete could remove the wrong playlist. The price
+  is that a `.m3u` somebody hand-named with a `:` in it is listed and cannot be played or deleted
+  through the API; renaming it on the host is the fix.
+- **A visible `Playlists/` directory, not a hidden one.** It is a pseudo-artist in OwnTone's browse
+  view, which is where it is expected; a dot-directory would not work at all, because every music
+  scanner skips dot-entries — the same rule that keeps `.tunebox-tmp` out of the library. `tunebox
+  serve` refuses a `TUNEBOX_PLAYLISTS_DIR` starting with a dot rather than writing files nothing will
+  ever index.
+- **Deleting a track removes its entry from every playlist that named it**, and `DELETE /library`
+  reports which in `playlists_updated`. The pruning happens *before* the unlink, which is what makes
+  it exact: while the file still exists, every entry can be resolved and matched by *inode* rather
+  than by comparing text — so `../A/SINGLES/one.m4a` on a case-insensitive filesystem, the NFD
+  spelling of a CJK filename and a hard link are all recognised, while an entry that was already
+  dangling for some unrelated reason is left exactly where it is. Without this, OwnTone would skip the
+  dead entry silently and the playlist would be one track shorter forever with nothing having
+  mentioned it.
+- **An entry that resolves to nothing is reported, not dropped.** It keeps its position, the row on
+  the phone says *"8 tracks · 2 missing"* and shows the entry in red when expanded — so it can be taken
+  out from the phone, which a path-based removal could never name. `tunebox playlist play` says so on
+  stderr. A list that plays eight of its ten tracks in silence is this feature's most likely
+  failure, and it is the one OwnTone will not mention.
+- **Two phones editing one playlist is last-write-wins.** Every edit is a read-modify-write. The
+  *write* is atomic — staged beside the target under a dot-name, then `os.replace` — so a scanner
+  never reads half a list and a crash cannot truncate one; it is only the merge that is not attempted,
+  deliberately, at one household's scale.
+- **Reorder and rename are tunebox's own, because nothing else can do them.** The same
+  `allow_modifying_stored_playlists = false` that stops the daemon writing a playlist stops its web UI
+  editing one — so "reorder it over there" was never true, and the first version of this feature shipped
+  with no editing at all on that false assumption. Moving is one entry at a time
+  (`PUT /playlists/{name}/tracks/{position}`) rather than sending a whole new order, for the reason
+  `PUT /player/repeat` takes a mode rather than a cycle: two phones can be looking at one list, and an
+  order computed from a two-second-old reading would silently undo whatever the other one just did.
+- **No nesting, and no multi-select.** A playlist is one flat file. Building one by picking twenty
+  tracks at once is the queue's job — fill it, then **Save the queue**.
+
 ## The remote
 
 One page, served by the API at `/`. Open `http://<host>:8080/` on the phone, paste the token once,
@@ -304,7 +435,7 @@ shared secret stays out of uvicorn's access log — which is the audit trail wor
 network (PLAN.md 3.2). The page removes it from the address bar as soon as it has read it and keeps
 it in `localStorage`; **Forget token** in the footer removes it again.
 
-Three panels:
+Four panels:
 
 - **Now playing** — title and artist of the current track, a progress bar, previous/play-pause/next/stop,
   a volume slider with ± buttons, a **repeat** button that cycles off → the queue → one song, a
@@ -321,10 +452,15 @@ Three panels:
   is queued straight away, anything else is searched. Below it, every ingest with its progress,
   cancel while queued, and **Play** the moment it finishes.
 - **Library** — everything under the music root, newest first, with a filter. Play replaces the queue
-  and starts; Queue appends. **⋯** on a row opens a confirmation strip that names the track and then
-  deletes it — see below, because that one is not undoable from the phone. The listing is re-read
-  whenever you open the tab and whenever an ingest finishes, so a track that says "done" above is
-  already here.
+  and starts; Queue appends. **⋯** on a row opens *Add to playlist* and, below it, a confirmation
+  strip that names the track and then deletes it — see below, because that one is not undoable from
+  the phone. The listing is re-read whenever you open the tab and whenever an ingest finishes, so a
+  track that says "done" above is already here.
+- **Playlists** — make one from the queue or empty, then **Play** (replace and start) or **Queue**
+  (append). **Tap the name to see what is in it**: the row expands into numbered entries with **↑ ↓**
+  to reorder and **✕** to remove, and a missing file says so in red rather than being a number in a
+  subtitle. **⋯** holds *Rename* and the delete confirmation, and deletes no audio. See
+  [Playlists](#playlists).
 
 The footer links to **OwnTone's own web UI** for browsing by artist and album, playlists and artwork
 — the expensive half of a music UI, which OwnTone already has and tunebox does not rebuild. The link
@@ -356,7 +492,8 @@ curl -s -X DELETE -H "X-Tunebox-Token: $T" -H 'Content-Type: application/json' \
      -d '{"paths":["Kraftwerk/Singles/Autobahn (Single version 1974).m4a"]}' \
      http://127.0.0.1:8080/library
 # -> {"deleted":["Kraftwerk/Singles/Autobahn (Single version 1974).m4a"],
-#     "removed_directories":["Kraftwerk/Singles","Kraftwerk"],"warnings":[]}
+#     "removed_directories":["Kraftwerk/Singles","Kraftwerk"],
+#     "playlists_updated":["Playlists/Road trip.m3u"],"warnings":[]}
 ```
 
 **This unlinks the file. There is no trash directory, and the remote cannot put it back** — the
@@ -377,6 +514,9 @@ Details worth knowing before you point it at an album:
   twice is one delete.
 - **OwnTone is told to re-index afterwards**, and a daemon that is down cannot fail the delete — the
   file is gone either way, so it comes back as a string in `warnings`.
+- **Playlists that named the track lose the entry**, and they are listed in `playlists_updated`. See
+  [Playlists](#playlists) for why that is pruned rather than left dangling, and why it happens before
+  the unlink rather than after.
 - There is no CLI verb for this: on the host, `rm` is the tool. The API exists because a phone has no
   terminal, which is the whole reason the remote was a one-way door before it.
 
@@ -811,6 +951,7 @@ night, not a test.
 | `TUNEBOX_UI` | `1` | serve the web remote; `0` removes the shell routes *and* their auth exemption |
 | `TUNEBOX_OWNTONE_UI` | derived | absolute URL for the "full library in OwnTone" link; by default the browser joins its own hostname to the player's port |
 | `TUNEBOX_LIBRARY_MAX_FILES` | `50000` | ceiling on the `GET /library` directory walk; the answer says when it was truncated |
+| `TUNEBOX_PLAYLISTS_DIR` | `Playlists` | directory under the music root holding the `.m3u` files. One name, not a path, and never starting with a dot — a music scanner skips dot-entries, so the playlists would never be indexed |
 | `TUNEBOX_CANARY_URL` | "Me at the zoo" | the video the canary downloads; pick something tiny and permanent |
 | `TUNEBOX_YTDLP_CHANNEL` | `stable` | or `nightly` (pip `--pre`); nightly is for while extraction is broken |
 | `TUNEBOX_AUTO_UPDATE` | `1` | `0` makes `tunebox maintain` a pure health check and never touches the venv |
@@ -870,7 +1011,7 @@ launchd plists are written for real by running the installer's own functions in 
 `launchctl` shim, since a `--dry-run` cannot show the contents of a file it does not write and the
 contents are the whole point.
 
-1276 tests at the end of Phase 5.
+1276 tests at the end of Phase 5; 1562 with playlists.
 
 ## Layout
 
@@ -880,6 +1021,7 @@ src/tunebox/sources/   yt-dlp adapter: URL allowlist, subprocess calls, tag mapp
 src/tunebox/ingest.py  the use case, wired from injected ports
 src/tunebox/tagging.py mutagen tag writer — the authority on file metadata
 src/tunebox/library.py atomic placement under the music root, and listing what is in it
+src/tunebox/playlists.py the M3U reader/writer — a playlist is a file in the library, not a table
 src/tunebox/jobs/      SQLite job queue + the worker that drains it
 src/tunebox/player/    OwnTone adapter, output keeper, rescan hook — behind the Player port
 src/tunebox/api/       FastAPI app, token middleware, routes, the remote's routes, the app shell

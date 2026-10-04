@@ -64,6 +64,17 @@ ROUTES = (
     ("POST", "/player/queue", "/player/queue"),
     ("DELETE", "/player/queue", "/player/queue"),
     ("PUT", "/player/queue/{item_id}/play", "/player/queue/1/play"),
+    # Playlists. Behaviour lives in ``tests/test_playlists.py``; listed here so the matrix below
+    # still covers every route in the app.
+    ("GET", "/playlists", "/playlists"),
+    ("POST", "/playlists", "/playlists"),
+    ("GET", "/playlists/{name}", "/playlists/x"),
+    ("DELETE", "/playlists/{name}", "/playlists/x"),
+    ("PATCH", "/playlists/{name}", "/playlists/x"),
+    ("POST", "/playlists/{name}/tracks", "/playlists/x/tracks"),
+    ("DELETE", "/playlists/{name}/tracks", "/playlists/x/tracks"),
+    ("PUT", "/playlists/{name}/tracks/{position}", "/playlists/x/tracks/0"),
+    ("PUT", "/playlists/{name}/play", "/playlists/x/play"),
 )
 
 #: Added by FastAPI itself, outside our router — and therefore the reason auth is middleware.

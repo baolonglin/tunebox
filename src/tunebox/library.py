@@ -123,6 +123,23 @@ def resolve_track_path(root: Path, relative: str) -> Path:
     return resolved
 
 
+def describe_track(root: Path, absolute: Path) -> LibraryTrack:
+    """Describe one track exactly as :func:`list_tracks` would describe it.
+
+    Here so that :mod:`tunebox.playlists` can report a playlist's entries in the same vocabulary a
+    ``GET /library`` row uses — same title, same artist, same relative path — rather than deriving
+    them a second time and disagreeing about, say, whether ``Singles`` is an album.
+
+    A path that is somehow not under ``root`` falls back to its own filename. That cannot happen via
+    :func:`resolve_track_path`, and this is not where it should be discovered if it ever does.
+    """
+    try:
+        relative = absolute.relative_to(root)
+    except ValueError:  # pragma: no cover - callers resolve through resolve_track_path first
+        relative = Path(absolute.name)
+    return _describe(relative, absolute)
+
+
 # ------------------------------------------------------------------ taking it out again
 
 

@@ -83,6 +83,17 @@ DEFAULT_OUTPUT_SELECT_ATTEMPTS = 3
 #: thread for minutes. The answer is truncated and says so rather than being slow.
 DEFAULT_LIBRARY_MAX_FILES = 50_000
 
+#: Phase 6: the directory under the music root that holds playlists, one ``.m3u`` file each.
+#:
+#: A *visible* top-level directory, which is the one non-obvious part. The music root is
+#: ``Artist/Album/Track`` by convention, so this is a pseudo-artist — harmless, because
+#: :func:`tunebox.library.list_tracks` lists audio files and ``.m3u`` is not one, and it is where
+#: OwnTone's own browse view expects to find playlists. A *hidden* directory would not work at all:
+#: every music scanner skips dot-entries (it is the same rule that keeps :data:`SCRATCH_DIRNAME` and
+#: :data:`STATE_DIRNAME` out of the library), so a ``.playlists`` directory would hold files no
+#: daemon ever indexed. Hence the validation in :meth:`Config.__post_init__`.
+DEFAULT_PLAYLISTS_DIRNAME = "Playlists"
+
 # ------------------------------------------------------------------ Phase 5: hardening
 
 #: The canary video. "Me at the zoo" — the first video ever uploaded to YouTube, 19 seconds long.
@@ -343,6 +354,12 @@ class Config:
     owntone_ui_url: str | None = None
     #: Ceiling on the directory walk behind ``GET /library``.
     library_max_files: int = DEFAULT_LIBRARY_MAX_FILES
+    #: Directory under the music root holding the playlist files. See
+    #: :data:`DEFAULT_PLAYLISTS_DIRNAME` for why it must be visible rather than a dot-directory. The
+    #: *path* is deliberately not a property here: :mod:`tunebox.playlists` sanitises this name and
+    #: checks containment before it joins anything, and a convenience accessor that skipped those
+    #: steps would be a second answer to "where are the playlists" that could disagree with the first.
+    playlists_dirname: str = DEFAULT_PLAYLISTS_DIRNAME
 
     # ------------------------------------------------ Phase 5: keeping it alive
     #: The video the canary ingest downloads. See :data:`DEFAULT_CANARY_URL` for why this one.
@@ -415,6 +432,21 @@ class Config:
             raise ConfigError(f"output volume must be 0-100, got {self.output_volume}")
         if self.library_max_files < 1:
             raise ConfigError(f"library max files must be at least 1, got {self.library_max_files}")
+        playlists = self.playlists_dirname.strip()
+        if not playlists or playlists in (".", ".."):
+            raise ConfigError("playlists directory must be a name, not empty")
+        if "/" in playlists or "\\" in playlists:
+            raise ConfigError(
+                f"playlists directory must be a single directory name under the music root, "
+                f"got {self.playlists_dirname!r}"
+            )
+        if playlists.startswith("."):
+            # Not fussiness: every music scanner skips dot-entries, so a hidden playlists directory
+            # would hold files OwnTone never indexes — the playlists would exist and be invisible.
+            raise ConfigError(
+                f"playlists directory must not start with a dot ({self.playlists_dirname!r}): "
+                "music scanners skip dot-entries, so the playlists would never be indexed"
+            )
         if self.ytdlp_channel not in YTDLP_CHANNELS:
             raise ConfigError(
                 f"unknown yt-dlp channel {self.ytdlp_channel!r}; "
@@ -617,6 +649,8 @@ class Config:
             library_max_files=_env_int(
                 env, "TUNEBOX_LIBRARY_MAX_FILES", DEFAULT_LIBRARY_MAX_FILES
             ),
+            playlists_dirname=(env.get("TUNEBOX_PLAYLISTS_DIR") or "").strip()
+            or DEFAULT_PLAYLISTS_DIRNAME,
             canary_url=(env.get("TUNEBOX_CANARY_URL") or DEFAULT_CANARY_URL).strip(),
             ytdlp_channel=(env.get("TUNEBOX_YTDLP_CHANNEL") or "stable").strip().lower(),
             auto_update=_env_bool(env, "TUNEBOX_AUTO_UPDATE", True),

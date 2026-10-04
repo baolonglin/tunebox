@@ -112,6 +112,16 @@
         >
           Library
         </button>
+        <button
+          type="button"
+          role="tab"
+          id="tab-playlists"
+          aria-controls="panel-playlists"
+          aria-selected="false"
+          tabindex="-1"
+        >
+          Playlists
+        </button>
       </nav>
 
       <main>
@@ -231,6 +241,48 @@
           </form>
           <p id="lib-note" class="muted" role="status" aria-live="polite"></p>
           <ul id="library" class="list"></ul>
+        </section>
+
+        <!-- ------------------------------------------------------------- playlists -->
+        <!--
+          Playlists are .m3u files in the music root, written by tunebox (see tunebox/playlists.py).
+          Three verbs and no reordering UI, which is the same decision Phase 4 made about browsing by
+          artist: reordering a text file is $EDITOR's job on the host, or rebuilding the queue
+          and saving over the list, which is what the form below does.
+
+          "Save the queue" is the create form, and that is not a shortcut for a missing one — it is the
+          way a playlist gets made on a phone. Building a list by adding tracks one at a time is what
+          the queue already is, so the queue *is* the editor, and this button is the save.
+        -->
+        <section id="panel-playlists" role="tabpanel" aria-labelledby="tab-playlists" tabindex="0" hidden>
+          <form id="pl-form" class="card">
+            <label for="pl-name">New playlist</label>
+            <input
+              id="pl-name"
+              type="text"
+              required
+              maxlength="120"
+              enterkeyhint="done"
+              autocapitalize="sentences"
+              placeholder="Saturday morning"
+            />
+            <!--
+              Two ways in from one field. "Save the queue" is the quick one — build the list on the Now
+              playing tab, then name it here — and is the submit button because it is the common case.
+              "Start empty" is the other half: name it now and file tracks into it from the Library
+              tab's ⋯ whenever you come across them. With only the first, a playlist could be built
+              only by first making it the thing that is playing.
+            -->
+            <div class="pl-create">
+              <button type="submit" class="primary">Save the queue</button>
+              <button type="button" id="btn-pl-empty">Start empty</button>
+            </div>
+            <p class="muted small">
+              Tap a playlist below to see what is in it, reorder it, or take a track out.
+            </p>
+          </form>
+          <p id="pl-note" class="muted" role="status" aria-live="polite"></p>
+          <ul id="playlists" class="list"></ul>
         </section>
       </main>
 

@@ -111,6 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     pair.set_defaults(func=_cmd_pair)
 
     _add_player_parser(sub)
+    _add_playlist_parser(sub)
     _add_ops_parsers(sub)
 
     return parser
@@ -320,6 +321,130 @@ def _add_player_parser(sub: argparse._SubParsersAction) -> None:
 
     rescan = verbs.add_parser("rescan", help="ask the daemon to index new files under the music root")
     rescan.set_defaults(func=_cmd_player_rescan)
+
+
+#: ``tunebox playlist <verb>`` — the six verbs over the ``.m3u`` files in the music root.
+#:
+#: There *is* a CLI for this, unlike ``DELETE /library``, and the asymmetry is deliberate: a delete
+#: has ``rm``, while writing a correct M3U by hand means getting the relative paths right and no shell
+#: one-liner does that. These are also the verbs that make the feature scriptable — "every track
+#: ingested this week as a playlist" is a ``tunebox playlist create`` away.
+def _add_playlist_parser(sub: argparse._SubParsersAction) -> None:
+    playlist = sub.add_parser(
+        "playlist",
+        help="create, inspect and play playlists (M3U files in the music root)",
+        description=(
+            "Playlists are plain .m3u files under $TUNEBOX_MUSIC_ROOT/Playlists, written by tunebox "
+            "and readable by OwnTone, Navidrome or MPD. The name is the filename, so it is "
+            "sanitised the same way a track name is — 'create' prints the name it actually used."
+        ),
+    )
+    playlist.add_argument(
+        "--player-url",
+        help="player daemon base URL (default $TUNEBOX_PLAYER_URL or http://127.0.0.1:3689)",
+    )
+    verbs = playlist.add_subparsers(dest="playlist_command", required=True)
+
+    listing = verbs.add_parser("list", help="every playlist, by name, with its track count")
+    listing.set_defaults(func=_cmd_playlist_list)
+
+    show = verbs.add_parser("show", help="one playlist and the tracks it resolves to")
+    show.add_argument("name")
+    show.set_defaults(func=_cmd_playlist_show)
+
+    create = verbs.add_parser(
+        "create",
+        help="create a playlist from FILEs, or from the current queue",
+        description=(
+            "With file paths it writes those, in order. With --from-queue it writes whatever the "
+            "player has queued right now, which is the 'save what is playing' verb."
+        ),
+    )
+    create.add_argument("name")
+    create.add_argument("files", nargs="*", type=Path, help="library files, in playlist order")
+    create.add_argument(
+        "--from-queue", action="store_true", help="use the player's current queue instead of FILEs"
+    )
+    create.add_argument(
+        "--empty",
+        action="store_true",
+        help="create it with no tracks, to add to later",
+    )
+    create.add_argument("--replace", action="store_true", help="overwrite a playlist of that name")
+    create.set_defaults(func=_cmd_playlist_create)
+
+    add = verbs.add_parser("add", help="append FILEs to an existing playlist")
+    add.add_argument("name")
+    add.add_argument("files", nargs="+", type=Path)
+    add.set_defaults(func=_cmd_playlist_add)
+
+    remove = verbs.add_parser(
+        "remove",
+        help="remove tracks from a playlist (no audio is touched)",
+        description=(
+            "With file paths it removes every entry naming them. With --position it removes exactly "
+            "that line, which is how to remove one of two copies of the same track, or an entry "
+            "that no longer resolves. Positions are zero-based and are what `show` prints."
+        ),
+    )
+    remove.add_argument("name")
+    remove.add_argument("files", nargs="*", type=Path, help="library files to remove")
+    remove.add_argument(
+        "--position",
+        type=int,
+        action="append",
+        dest="positions",
+        metavar="N",
+        help="remove the entry at this position instead; repeatable",
+    )
+    remove.set_defaults(func=_cmd_playlist_remove)
+
+    move = verbs.add_parser(
+        "move",
+        help="move one entry to another position (zero-based)",
+        description=(
+            "Positions are what `show` prints. TO is where the entry ends up after being lifted "
+            "out, so `move NAME 3 0` puts the fourth track first."
+        ),
+    )
+    move.add_argument("name")
+    move.add_argument("position", type=int)
+    move.add_argument("to", type=int)
+    move.set_defaults(func=_cmd_playlist_move)
+
+    rename = verbs.add_parser("rename", help="rename a playlist, keeping its tracks")
+    rename.add_argument("name")
+    rename.add_argument("new_name", metavar="NEW-NAME")
+    rename.set_defaults(func=_cmd_playlist_rename)
+
+    play = verbs.add_parser(
+        "play",
+        help="replace the queue with a playlist and start it",
+        description=(
+            "Resolves the playlist's entries, makes sure the daemon has indexed them, then hands "
+            "them over — the same sequence as `tunebox player play FILE...`, for a whole list."
+        ),
+    )
+    play.add_argument("name")
+    play.add_argument(
+        "--add",
+        action="store_true",
+        help="append to the queue instead of replacing it, and do not start playback",
+    )
+    play.add_argument(
+        "--wait",
+        type=float,
+        default=20.0,
+        help="seconds to wait for freshly ingested files to appear in the player's index",
+    )
+    play.set_defaults(func=_cmd_playlist_play)
+
+    delete = verbs.add_parser(
+        "delete", help="delete the playlist file (no audio is touched)"
+    )
+    delete.add_argument("name")
+    delete.set_defaults(func=_cmd_playlist_delete)
+
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -762,6 +887,206 @@ def _cmd_player_rescan(args: argparse.Namespace, config: Config) -> int:
     player = _player(config)
     player.rescan()
     return _emit(player.library_info())
+
+
+# ------------------------------------------------------------- playlist commands
+#
+# Thin, like the player verbs: all the behaviour is in :mod:`tunebox.playlists`, which is where it can
+# be tested without argparse in the way. The only thing these add is the one translation a terminal
+# needs and the API does not — a path typed relative to the *shell's* working directory is not a
+# library path, so :func:`_library_entry` turns one into the absolute form before handing it over.
+
+
+def _library_entry(path: Path) -> str:
+    """One CLI path argument as something :func:`tunebox.library.resolve_track_path` accepts.
+
+    A file that exists where the shell is standing becomes its absolute path; anything else is passed
+    through untouched so that a path relative to the *music root* — which is what ``GET /library``
+    hands out and what somebody who has just read a playlist will copy — still works.
+    """
+    candidate = path.expanduser()
+    if candidate.is_file():
+        return str(candidate.resolve())
+    return path.as_posix()
+
+
+def _cmd_playlist_list(args: argparse.Namespace, config: Config) -> int:
+    from . import playlists
+
+    found = playlists.list_playlists(
+        config.music_root, directory=config.playlists_dirname
+    )
+    return _emit([playlist.as_dict() for playlist in found])
+
+
+def _cmd_playlist_show(args: argparse.Namespace, config: Config) -> int:
+    from . import playlists
+
+    playlist = playlists.read_playlist(
+        config.music_root, args.name, directory=config.playlists_dirname
+    )
+    return _emit(playlist.as_dict())
+
+
+def _cmd_playlist_create(args: argparse.Namespace, config: Config) -> int:
+    from . import playlists
+
+    sources = [bool(args.files), args.from_queue, args.empty]
+    if sum(sources) != 1:
+        raise TuneboxError("give exactly one of FILEs, --from-queue or --empty")
+
+    if args.from_queue:
+        entries = _queue_entries(config)
+        if not entries:
+            raise TuneboxError("the queue holds no library tracks to save")
+    elif args.empty:
+        # Explicit rather than "create with no arguments", unlike the API: at a prompt, a bare
+        # `playlist create NAME` is far more likely to be a forgotten argument than a request for an
+        # empty list, and silently making one would hide the typo.
+        entries = []
+    else:
+        entries = [_library_entry(path) for path in args.files]
+
+    playlist = playlists.write_playlist(
+        config.music_root,
+        args.name,
+        entries,
+        directory=config.playlists_dirname,
+        overwrite=args.replace,
+    )
+    _tell_the_player(config)
+    return _emit(playlist.as_dict())
+
+
+def _queue_entries(config: Config) -> list[str]:
+    """The player's queue as library paths, skipping anything that is not one.
+
+    Skipping rather than failing, for the reason ``POST /playlists`` gives: the queue is shared state
+    that OwnTone's own web UI can add to, so "save what is playing" must not be impossible because
+    something in it came from elsewhere.
+    """
+    from .library import resolve_track_path
+
+    entries: list[str] = []
+    for item in _player(config).queue():
+        if not item.path:
+            continue
+        try:
+            entries.append(str(resolve_track_path(config.music_root, item.path)))
+        except TuneboxError:
+            print(f"skipping {item.path}: not a track in this library", file=sys.stderr)
+    return entries
+
+
+def _cmd_playlist_add(args: argparse.Namespace, config: Config) -> int:
+    from . import playlists
+
+    playlist = playlists.append_tracks(
+        config.music_root,
+        args.name,
+        [_library_entry(path) for path in args.files],
+        directory=config.playlists_dirname,
+    )
+    _tell_the_player(config)
+    return _emit(playlist.as_dict())
+
+
+def _cmd_playlist_remove(args: argparse.Namespace, config: Config) -> int:
+    from . import playlists
+
+    if bool(args.files) == bool(args.positions):
+        raise TuneboxError("give either FILEs or --position N, not both and not neither")
+    playlist = playlists.remove_entries(
+        config.music_root,
+        args.name,
+        positions=args.positions,
+        paths=[_library_entry(path) for path in args.files] if args.files else None,
+        directory=config.playlists_dirname,
+    )
+    _tell_the_player(config)
+    return _emit(playlist.as_dict())
+
+
+def _cmd_playlist_move(args: argparse.Namespace, config: Config) -> int:
+    from . import playlists
+
+    playlist = playlists.move_entry(
+        config.music_root,
+        args.name,
+        args.position,
+        args.to,
+        directory=config.playlists_dirname,
+    )
+    _tell_the_player(config)
+    return _emit(playlist.as_dict())
+
+
+def _cmd_playlist_rename(args: argparse.Namespace, config: Config) -> int:
+    from . import playlists
+
+    playlist = playlists.rename_playlist(
+        config.music_root, args.name, args.new_name, directory=config.playlists_dirname
+    )
+    _tell_the_player(config)
+    return _emit(playlist.as_dict())
+
+
+def _cmd_playlist_play(args: argparse.Namespace, config: Config) -> int:
+    from . import playlists
+
+    playlist = playlists.read_playlist(
+        config.music_root, args.name, directory=config.playlists_dirname
+    )
+    paths = playlists.resolved_paths(config.music_root, playlist)
+    if not paths:
+        raise TuneboxError(
+            f"playlist {playlist.name!r} has no playable tracks"
+            + (f" ({len(playlist.missing)} entry(ies) name files that are not there)"
+               if playlist.missing else "")
+        )
+    if playlist.missing:
+        # Said out loud rather than silently skipped: a playlist that plays eight of its ten tracks
+        # is the failure this whole feature is most likely to produce, and OwnTone would not mention it.
+        print(
+            f"{len(playlist.missing)} entry(ies) in {playlist.name!r} name files that are not there, "
+            "and were skipped",
+            file=sys.stderr,
+        )
+
+    player = _player(config)
+    _ensure_indexed(player, paths, wait=args.wait)
+    items = player.enqueue_paths(paths, clear=not args.add, start=not args.add)
+    return _emit(
+        {
+            "playlist": playlist.name,
+            "queued": [item.as_dict() for item in items],
+            "player": player.status().as_dict(),
+        }
+    )
+
+
+def _cmd_playlist_delete(args: argparse.Namespace, config: Config) -> int:
+    from . import playlists
+
+    deleted = playlists.delete_playlist(
+        config.music_root, args.name, directory=config.playlists_dirname
+    )
+    _tell_the_player(config)
+    return _emit({"deleted": deleted})
+
+
+def _tell_the_player(config: Config) -> None:
+    """Ask the daemon to re-index, and never fail because it would not.
+
+    Same rule as :func:`tunebox.player.hooks.rescan_library`, which is what this calls: the file is
+    written, and a daemon that is down costs only that OwnTone's own playlist view is stale until its
+    next scan. tunebox's own playback reads the file directly and needs none of it.
+    """
+    from .player.hooks import rescan_library
+
+    warning = rescan_library(_player(config))
+    if warning:
+        print(warning, file=sys.stderr)
 
 
 # ----------------------------------------------------------------- Phase 5 commands

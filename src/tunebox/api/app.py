@@ -33,10 +33,14 @@ from ..core.ports import MusicSource, Player
 from ..errors import (
     ConfigError,
     InvalidURLError,
+    LibraryError,
     OutputNotFound,
     OutputUnreachable,
     PlayerError,
     PlayerUnavailable,
+    PlaylistError,
+    PlaylistExists,
+    PlaylistNotFound,
     SourceError,
     SourceTimeout,
     TuneboxError,
@@ -49,6 +53,7 @@ from ..sources.ytdlp import YtDlpSource
 from ..tagging import write_tags
 from . import ui
 from .auth import TokenAuthMiddleware
+from .playlists import router as playlists_router
 from .remote import router as remote_router
 from .routes import router
 
@@ -128,6 +133,7 @@ def create_app(
     _install_error_handlers(app)
     app.include_router(router)
     app.include_router(remote_router)
+    app.include_router(playlists_router)
     if ui_router is not None:
         # Last, so a hand-written asset path can never shadow an API route: FastAPI matches in
         # registration order, and the API is the part that must not move.
@@ -181,6 +187,34 @@ def _install_error_handlers(app: FastAPI) -> None:
     async def _player_failed(request: Request, exc: PlayerError) -> JSONResponse:
         log.warning("player error: %s", exc)
         return error(502, str(exc))
+
+    @app.exception_handler(PlaylistNotFound)
+    async def _no_playlist(request: Request, exc: PlaylistNotFound) -> JSONResponse:
+        # It names a resource, and "it is not there" is the whole answer.
+        return error(404, str(exc))
+
+    @app.exception_handler(PlaylistExists)
+    async def _playlist_exists(request: Request, exc: PlaylistExists) -> JSONResponse:
+        # Well-formed request, blocked by state the caller can see with GET /playlists.
+        return error(409, str(exc))
+
+    @app.exception_handler(PlaylistError)
+    async def _bad_playlist(request: Request, exc: PlaylistError) -> JSONResponse:
+        # A name that sanitises to nothing, or a list that is too long: the caller's input.
+        return error(400, str(exc))
+
+    @app.exception_handler(LibraryError)
+    async def _bad_library_path(request: Request, exc: LibraryError) -> JSONResponse:
+        """A request named a file it may not, or one that is not there.
+
+        Registered as a handler rather than left to the ``TuneboxError`` catch-all, which answered
+        ``500``: ``LibraryError`` is raised by :func:`tunebox.library.resolve_track_path`, and
+        everything that calls it is validating something a *client* sent. The routes that already catch
+        it inline keep their own message; this is the backstop for the ones where it can only arrive via
+        a path parameter, where a 500 would have reported a refused traversal as a server fault.
+        """
+        log.info("refused a library path: %s", exc)
+        return error(400, str(exc))
 
     @app.exception_handler(TuneboxError)
     async def _tunebox_error(request: Request, exc: TuneboxError) -> JSONResponse:

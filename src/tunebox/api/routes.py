@@ -40,6 +40,7 @@ from ..jobs.store import JobStore
 from ..jobs.worker import Worker
 from ..library import delete_track, list_tracks, resolve_track_path
 from ..player.hooks import rescan_library
+from ..playlists import forget_tracks as forget_playlist_tracks
 from ..sources import urls
 from .remote import configured_output
 from .schemas import (
@@ -219,6 +220,13 @@ def delete_library(payload: LibraryDeleteRequest, request: Request) -> LibraryDe
       only add a warning to it.
     * **No confirmation lives here.** An API that asked twice would be a protocol nobody follows;
       the confirmation step is the remote's job, and it has one.
+
+    Since playlists arrived there is a fifth: **entries naming a deleted track are removed from every
+    playlist, and the playlists that changed are reported.** It happens *before* the unlink, which is
+    what makes it exact rather than a guess — while the file still exists its entry resolves, so a
+    line that was already dangling for an unrelated reason is left alone. Pruning rather than merely
+    reporting, because OwnTone skips an unresolvable entry silently: the alternative is a playlist that
+    is quietly one track shorter forever and nothing on any screen having mentioned it.
     """
     config = _config(request)
     player = getattr(request.app.state, "player", None)
@@ -246,6 +254,13 @@ def delete_library(payload: LibraryDeleteRequest, request: Request) -> LibraryDe
                 )
 
     store = _store(request)
+    # Before the unlink, deliberately: see the docstring. Cannot raise — a playlist that could not be
+    # rewritten must not fail a delete that has already been authorised.
+    playlists_updated = list(
+        forget_playlist_tracks(
+            config.music_root, targets, directory=config.playlists_dirname
+        )
+    )
     deleted: list[str] = []
     removed: list[str] = []
     for target, entry in targets.items():
@@ -263,7 +278,12 @@ def delete_library(payload: LibraryDeleteRequest, request: Request) -> LibraryDe
         warning = rescan_library(player)
         if warning:
             warnings.append(warning)
-    return LibraryDeletedView(deleted=deleted, removed_directories=removed, warnings=warnings)
+    return LibraryDeletedView(
+        deleted=deleted,
+        removed_directories=removed,
+        playlists_updated=playlists_updated,
+        warnings=warnings,
+    )
 
 
 def _loaded_track_path(player: object | None) -> Path | None:

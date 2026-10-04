@@ -45,6 +45,23 @@
     jobsActive: false,
     /** Ids of ingests already seen as finished. ``null`` until the first poll — see noticeFinishedIngests. */
     finishedJobs: null,
+    /**
+     * The playlist names last read from GET /playlists.
+     *
+     * Cached because the Library panel needs them: a row's `⋯` offers "add to playlist", and a
+     * dropdown that fetched its options when it opened would be a request per tap and an empty
+     * select for the first moment of each one. Refreshed whenever the Playlists panel is drawn and
+     * whenever one is created or deleted, which is every moment the set can have changed from here.
+     */
+    playlists: [],
+    /**
+     * Which playlist row is expanded, by name, or `null`.
+     *
+     * The one piece of state on this page the server has no opinion about — and it has to be held
+     * here rather than in the DOM because every edit redraws the list: without it, removing a track
+     * from a playlist collapsed the playlist you were editing.
+     */
+    openPlaylist: null,
     timer: null,
     ticker: null,
   };
@@ -284,12 +301,15 @@
     el("gate-token").value = "";
     startPolling();
     loadLibrary();
+    // Up front rather than on the tab switch, because the *library* panel needs the names too: a
+    // row's "add to playlist" must have something to offer the first time somebody opens one.
+    loadPlaylists();
     return true;
   }
 
   // --------------------------------------------------------------------- tabs
 
-  const TABS = ["now", "add", "library"];
+  const TABS = ["now", "add", "library", "playlists"];
 
   function selectTab(name) {
     state.tab = name;
@@ -308,6 +328,9 @@
     // what the panel is for, and it is capped by TUNEBOX_LIBRARY_MAX_FILES.
     if (name === "library") refreshLibrary();
     if (name === "add") refreshJobs();
+    // Same reasoning as the library: a playlist can have been created from a terminal, or by another
+    // phone, since this panel was last drawn. Reading it is one small directory.
+    if (name === "playlists") loadPlaylists();
   }
 
   function wireTabs() {
@@ -871,6 +894,13 @@
     function reveal(show) {
       panel.hidden = !show;
       more.setAttribute("aria-expanded", String(show));
+      // Rebuilt on every open rather than cached, which is not laziness about the DOM: the set of
+      // playlists changes behind this row's back, so a strip first opened before any playlist existed
+      // would go on saying "No playlists yet" for as long as the listing stood. One `<select>` per
+      // open is cheap; a hundred rows each holding a stale one is what building it eagerly would cost.
+      const stale = panel.querySelector(".row-add");
+      if (stale) panel.removeChild(stale);
+      if (show) panel.insertBefore(addToPlaylistControl(track), panel.firstChild);
     }
 
     panel.appendChild(
@@ -912,8 +942,15 @@
     await loadLibrary();
     await refreshPlayer();
     const pruned = (result.removed_directories || []).length;
+    const lists = (result.playlists_updated || []).length;
     el("lib-note").textContent =
-      `Deleted ${track.title}.` + (pruned ? ` ${pruned} empty folder${pruned === 1 ? "" : "s"} removed.` : "");
+      `Deleted ${track.title}.` +
+      (pruned ? ` ${pruned} empty folder${pruned === 1 ? "" : "s"} removed.` : "") +
+      // The part nobody asked a delete to do: entries naming this track were taken out of the
+      // playlists that held them. Saying so is the difference between that and a list that silently
+      // got shorter, which is what OwnTone on its own would have left behind.
+      (lists ? ` Removed from ${lists} playlist${lists === 1 ? "" : "s"}.` : "");
+    if (lists) await loadPlaylists();
     // A rescan the daemon refused is worth saying out loud: the file is gone, but OwnTone's own
     // browse view will keep offering it until it re-indexes.
     if (result.warnings && result.warnings.length) banner(result.warnings[0]);
@@ -925,6 +962,398 @@
       event.preventDefault();
       loadLibrary();
     });
+  }
+
+  // ------------------------------------------------------------------ playlists
+
+  /**
+   * The Playlists panel: see what is in one, change it, play it.
+   *
+   * A playlist here is an `.m3u` file in the music root that tunebox wrote, so everything on this
+   * panel is one request and there is no local state to keep in sync — except which row is open,
+   * because that is the one thing the server has no opinion about.
+   *
+   * The first version of this panel could only *create* (from the queue) and *play*, and that was the
+   * wrong half of the feature to ship alone: a playlist was a name with a track count beside it, so
+   * there was no way to see what was in one and no way to fix one song in forty without rebuilding
+   * the whole list. Expanding a row and editing in place is what the rest of this section is.
+   */
+  async function loadPlaylists() {
+    const note = el("pl-note");
+    note.textContent = "Reading the playlists…";
+    const found = await attempt(() => api("/playlists"), "playlists");
+    if (!found) {
+      note.textContent = "";
+      return;
+    }
+    state.playlists = found.map((playlist) => playlist.name);
+    note.textContent = found.length
+      ? `${found.length} playlist${found.length === 1 ? "" : "s"}.`
+      : "";
+    fill(
+      el("playlists"),
+      found.map(playlistRow),
+      "No playlists yet — save the queue above, or start an empty one and add tracks from the Library tab."
+    );
+  }
+
+  /** "4 tracks · 1 missing" — said out loud because OwnTone would skip the missing one silently. */
+  function playlistSubtitle(playlist) {
+    const missing = playlist.missing_count || 0;
+    return (
+      `${playlist.count} track${playlist.count === 1 ? "" : "s"}` +
+      (missing ? ` · ${missing} missing` : "")
+    );
+  }
+
+  /**
+   * One playlist row: tap the name to see inside, **Play**, **Queue**, and `⋯` for rename and delete.
+   *
+   * The name is the control, the same decision the queue's rows made: a row that only carried a count
+   * was a row with nothing to tap, and "what is actually in this?" is the first question anybody has.
+   * Play and Queue stay where a thumb lands; the two destructive-ish verbs stay behind `⋯`.
+   */
+  function playlistRow(playlist) {
+    const li = row(
+      playlist.name,
+      playlistSubtitle(playlist),
+      [
+        button("Play", () => playPlaylist(playlist, "replace", true), "primary"),
+        button("Queue", () => playPlaylist(playlist, "append", false)),
+      ],
+      undefined,
+      () => toggle()
+    );
+    const main = li.querySelector(".row-main");
+    // So a redraw can put keyboard focus back on the row it was on — see `fill`.
+    main.dataset.itemId = playlist.name;
+    main.setAttribute("aria-label", `${playlist.name}, ${playlistSubtitle(playlist)}. Show its tracks`);
+
+    const tracks = make("div", "row-tracks");
+    tracks.id = `pl-tracks-${++rowSeq}`;
+    tracks.hidden = true;
+    main.setAttribute("aria-expanded", "false");
+    main.setAttribute("aria-controls", tracks.id);
+
+    const panel = make("div", "row-confirm");
+    panel.id = `row-confirm-${++rowSeq}`;
+    panel.hidden = true;
+
+    const more = button("⋯", () => reveal(panel.hidden));
+    more.setAttribute("aria-label", `More actions for ${playlist.name}`);
+    more.setAttribute("aria-expanded", "false");
+    more.setAttribute("aria-controls", panel.id);
+    li.querySelector(".row-actions").appendChild(more);
+
+    function reveal(show) {
+      panel.hidden = !show;
+      more.setAttribute("aria-expanded", String(show));
+    }
+
+    async function toggle() {
+      const showing = !tracks.hidden;
+      state.openPlaylist = showing ? null : playlist.name;
+      main.setAttribute("aria-expanded", String(!showing));
+      tracks.hidden = showing;
+      if (!showing) await drawEntries(playlist.name, li, tracks);
+    }
+
+    // Rename, which exists here because nothing else can do it: OwnTone's own web UI cannot edit
+    // these files either (the same config flag that stops it writing one stops it renaming one).
+    const rename = make("form", "row-rename");
+    const field = document.createElement("input");
+    field.type = "text";
+    field.maxLength = 120;
+    field.value = playlist.name;
+    field.setAttribute("aria-label", `New name for ${playlist.name}`);
+    rename.appendChild(field);
+    const saveName = make("button", null, "Rename");
+    saveName.type = "submit";
+    rename.appendChild(saveName);
+    rename.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const wanted = field.value.trim();
+      if (!wanted || wanted === playlist.name) return;
+      saveName.disabled = true;
+      const renamed = await attempt(
+        () =>
+          api(`/playlists/${encodeURIComponent(playlist.name)}`, {
+            method: "PATCH",
+            body: { name: wanted },
+          }),
+        "rename"
+      );
+      saveName.disabled = false;
+      if (!renamed) return;
+      // The server sanitises the name, so it may not be the one that was typed — and whatever it is,
+      // it is the one the next request has to use. Keep the row open under the new name.
+      if (state.openPlaylist === playlist.name) state.openPlaylist = renamed.name;
+      el("pl-note").textContent = `Renamed to ${renamed.name}.`;
+      await loadPlaylists();
+    });
+    panel.appendChild(rename);
+
+    panel.appendChild(
+      make("p", "row-warn", `Delete the playlist “${playlist.name}”? No music is removed.`)
+    );
+    const actions = make("div", "row-actions");
+    const remove = button("Delete", async () => {
+      remove.disabled = true;
+      remove.textContent = "Deleting…";
+      const result = await attempt(
+        () => api(`/playlists/${encodeURIComponent(playlist.name)}`, { method: "DELETE" }),
+        "delete"
+      );
+      if (result) {
+        if (state.openPlaylist === playlist.name) state.openPlaylist = null;
+        el("pl-note").textContent = `Deleted ${playlist.name}.`;
+        await loadPlaylists();
+        return; // the list is being rebuilt, so this row is about to disappear
+      }
+      remove.disabled = false;
+      remove.textContent = "Delete";
+    }, "danger");
+    actions.appendChild(remove);
+    actions.appendChild(button("Cancel", () => reveal(false)));
+    panel.appendChild(actions);
+
+    li.appendChild(tracks);
+    li.appendChild(panel);
+    // Reopened after a redraw, so an edit does not collapse the thing being edited.
+    if (state.openPlaylist === playlist.name) toggle();
+    return li;
+  }
+
+  /** Fetch one playlist and draw its entries into an open row. */
+  async function drawEntries(name, li, tracks) {
+    clear(tracks);
+    tracks.appendChild(make("p", "muted small", "Reading…"));
+    const playlist = await attempt(
+      () => api(`/playlists/${encodeURIComponent(name)}`),
+      "playlist"
+    );
+    if (!playlist) {
+      clear(tracks);
+      return;
+    }
+    renderEntries(name, li, tracks, playlist);
+  }
+
+  /**
+   * The entries of one playlist, numbered, each with ↑ ↓ and ✕.
+   *
+   * Numbered from one on screen and sent zero-based, which is the queue's convention and the API's.
+   * The row shows the **entry** rather than only the track, so a line that resolves to nothing is
+   * visible and removable instead of being a number in a subtitle: that is the state OwnTone will not
+   * mention and the one somebody actually has to fix.
+   */
+  function renderEntries(name, li, tracks, playlist) {
+    clear(tracks);
+    const subtitle = li.querySelector(".row-sub");
+    if (subtitle) subtitle.textContent = playlistSubtitle(playlist);
+    if (!playlist.entries.length) {
+      tracks.appendChild(
+        make("p", "muted small", "Nothing in it yet — add tracks from the Library tab’s ⋯ menu.")
+      );
+      return;
+    }
+    const list = make("ol", "entries");
+    playlist.entries.forEach((entry, index) => {
+      list.appendChild(entryRow(name, li, tracks, playlist, entry, index));
+    });
+    tracks.appendChild(list);
+  }
+
+  function entryRow(name, li, tracks, playlist, entry, index) {
+    const last = index === playlist.entries.length - 1;
+    const title = entry.track ? entry.track.title : entry.entry;
+    const subtitle = entry.track
+      ? [entry.track.artist, entry.track.album].filter(Boolean).join(" · ")
+      : "This file is not there — remove it, or put the track back.";
+
+    /** Every edit answers with the whole playlist, so the list is redrawn from the response. */
+    const after = async (work, label) => {
+      const updated = await attempt(work, label);
+      if (!updated) return;
+      renderEntries(name, li, tracks, updated);
+    };
+
+    const up = button("↑", () =>
+      after(
+        () =>
+          api(`/playlists/${encodeURIComponent(name)}/tracks/${entry.position}`, {
+            method: "PUT",
+            body: { to: entry.position - 1 },
+          }),
+        "move"
+      )
+    );
+    up.disabled = index === 0;
+    up.setAttribute("aria-label", `Move ${title} up`);
+
+    const down = button("↓", () =>
+      after(
+        () =>
+          api(`/playlists/${encodeURIComponent(name)}/tracks/${entry.position}`, {
+            method: "PUT",
+            body: { to: entry.position + 1 },
+          }),
+        "move"
+      )
+    );
+    down.disabled = last;
+    down.setAttribute("aria-label", `Move ${title} down`);
+
+    // No confirmation strip for this one, unlike the Library panel's delete: it removes a line of
+    // text and the track stays on disk, so asking twice would be ceremony for nothing. `positions`
+    // and not the path, so that removing the second of two copies removes the second of two copies.
+    const drop = button("✕", () =>
+      after(
+        () =>
+          api(`/playlists/${encodeURIComponent(name)}/tracks`, {
+            method: "DELETE",
+            body: { positions: [entry.position] },
+          }),
+        "remove"
+      ),
+      "danger"
+    );
+    drop.setAttribute("aria-label", `Remove ${title} from ${name}`);
+
+    const node = row(
+      `${index + 1}. ${title}`,
+      subtitle,
+      [up, down, drop],
+      entry.missing ? "entry missing" : "entry"
+    );
+    node.querySelector(".row-main").dataset.itemId = `${name}:${entry.position}`;
+    return node;
+  }
+
+  /**
+   * Play a playlist, or append it to the queue.
+   *
+   * One request: the server reads the file, resolves every entry under the music root and hands the
+   * lot to the player at once — so a playlist cannot leave the queue half-replaced with playback
+   * already running. The answer *is* the new player state, which is why this redraws from it rather
+   * than polling for it.
+   */
+  function playPlaylist(playlist, mode, start) {
+    return attempt(async () => {
+      const player = await api(`/playlists/${encodeURIComponent(playlist.name)}/play`, {
+        method: "PUT",
+        body: { mode, start },
+      });
+      renderPlayer(player);
+      selectTab("now");
+    }, "playlist");
+  }
+
+  /**
+   * The two ways a playlist starts life, both from the one name field.
+   *
+   * **Save the queue** is the quick one and was the only one at first, which turned out to be the
+   * wrong place to stop: it means a playlist can only be built by first making it the thing that is
+   * playing. **Start empty** is the other half — name it now, then file tracks into it from the
+   * Library panel's `⋯` whenever you come across them.
+   */
+  function wirePlaylists() {
+    const form = el("pl-form");
+    const field = el("pl-name");
+    const fromQueue = form.querySelector('button[type="submit"]');
+    const empty = el("btn-pl-empty");
+
+    async function create(body, describe) {
+      const name = field.value.trim();
+      if (!name) {
+        field.focus();
+        return;
+      }
+      fromQueue.disabled = empty.disabled = true;
+      try {
+        const playlist = await attempt(
+          () => api("/playlists", { method: "POST", body: { name, ...body } }),
+          "playlist"
+        );
+        if (!playlist) return;
+        field.value = "";
+        // Open the new one: with "start empty" especially, the next thing to happen is adding to it,
+        // and a row that opened itself says where the tracks will appear.
+        state.openPlaylist = playlist.name;
+        await loadPlaylists();
+        el("pl-note").textContent = describe(playlist);
+      } finally {
+        fromQueue.disabled = empty.disabled = false;
+      }
+    }
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      create({ from_queue: true }, (playlist) => {
+        const skipped = (playlist.skipped || []).length;
+        return (
+          `Saved ${playlist.name} — ${playlist.count} track${playlist.count === 1 ? "" : "s"}.` +
+          // Queue items that are not library tracks are left out rather than failing the save, so the
+          // count can legitimately differ from the queue length. Saying which is cheap.
+          (skipped ? ` ${skipped} queue item${skipped === 1 ? "" : "s"} skipped.` : "")
+        );
+      });
+    });
+
+    empty.addEventListener("click", () =>
+      create({}, (playlist) => `Created ${playlist.name}. Add tracks from the Library tab.`)
+    );
+  }
+
+  /**
+   * "Add to playlist" for one library track, inside the row's `⋯` strip.
+   *
+   * A `<select>` of existing playlists rather than a free-text field, because creating one lives on
+   * the Playlists panel and two ways to create would be two names for the same thing. Built when the
+   * strip is opened rather than for every row of the listing: a hundred rows would otherwise be a
+   * hundred dropdowns, each holding a copy of the same options that goes stale the moment somebody
+   * saves a queue.
+   */
+  function addToPlaylistControl(track) {
+    const box = make("div", "row-add");
+    if (!state.playlists.length) {
+      box.appendChild(
+        make("p", "muted small", "No playlists yet — make one on the Playlists tab first.")
+      );
+      return box;
+    }
+    const picker = document.createElement("select");
+    picker.setAttribute("aria-label", `Playlist to add ${track.title} to`);
+    state.playlists.forEach((name) => {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      picker.appendChild(option);
+    });
+    box.appendChild(picker);
+    const add = button("Add to playlist", async () => {
+      add.disabled = true;
+      add.textContent = "Adding…";
+      const playlist = await attempt(
+        () =>
+          api(`/playlists/${encodeURIComponent(picker.value)}/tracks`, {
+            method: "POST",
+            body: { paths: [track.path] },
+          }),
+        "playlist"
+      );
+      if (playlist) {
+        // Stays disabled, like the Add button on a search result: the track is in the playlist, and a
+        // second tap would only put it there twice.
+        add.textContent = "Added";
+        el("lib-note").textContent = `Added ${track.title} to ${playlist.name}.`;
+        return;
+      }
+      add.disabled = false;
+      add.textContent = "Add to playlist";
+    });
+    box.appendChild(add);
+    return box;
   }
 
   // -------------------------------------------------------------------- polling
@@ -1029,6 +1458,7 @@
     wireTransport();
     wireSearch();
     wireLibrary();
+    wirePlaylists();
     wireFooter();
     wireVisibility();
     registerWorker();
