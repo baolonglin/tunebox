@@ -38,7 +38,9 @@ DEPLOY = REPO / "deploy"
 INSTALL = DEPLOY / "install.sh"
 OWNTONE = DEPLOY / "owntone-setup.sh"
 START = DEPLOY / "start.sh"
-SCRIPTS = (INSTALL, OWNTONE, START)
+PUSH = DEPLOY / "push.sh"
+OWNTONE_BUILD = DEPLOY / "owntone-build.sh"
+SCRIPTS = (INSTALL, OWNTONE, START, PUSH, OWNTONE_BUILD)
 # The two that parse tunebox.env with sed, and therefore have to undo its quoting by hand.
 SED_READERS = (INSTALL, OWNTONE)
 
