@@ -599,7 +599,13 @@ class TestPlaybackModeControls:
         assert set(labels) == {"off", "all", "single"}
         # The three labels must differ, or the button would report two modes with one word.
         assert len(set(labels.values())) == 3
-        cycle = dict(re.findall(r'(\w+): "(off|all|single)"', script))
+        # Read out of ``REPEAT_NEXT`` specifically rather than by scanning the file for
+        # ``word: "off"``. The looser pattern caught every other object that happens to hold a
+        # repeat mode — ``state.local`` has one, since the phone output keeps its own — and would
+        # therefore fail for a reason that has nothing to do with whether the cycle closes.
+        table = re.search(r"const REPEAT_NEXT = \{([^}]*)\}", script)
+        assert table, "REPEAT_NEXT is where the cycle is defined"
+        cycle = dict(re.findall(r'(\w+): "(off|all|single)"', table.group(1)))
         assert cycle == {"off": "all", "all": "single", "single": "off"}
 
     def test_each_label_names_the_mode_it_belongs_to(self):
@@ -631,11 +637,17 @@ class TestPlaybackModeControls:
 
     def test_it_sends_a_mode_and_never_asks_the_server_to_cycle(self):
         """The session is shared (PLAN.md 2), so an absolute mode is what makes two phones converge.
-        A ``/player/repeat/cycle`` route would also be a second place that knows the order."""
+        A ``/player/repeat/cycle`` route would also be a second place that knows the order.
+
+        Asserted as "the mode is computed from ``REPEAT_NEXT`` and then *sent*" rather than as one
+        exact line, because the handler now has to choose between two outputs first (the house
+        speaker or this phone) and the absolute-mode property is about neither of them."""
         script = self.code("app.js")
-        assert '"/player/repeat", { mode: REPEAT_NEXT[repeatMode(state.player)] }' in script
+        assert "REPEAT_NEXT[repeatMode(state.player)]" in script
+        assert 'command("/player/repeat", { mode })' in script
         assert "/player/repeat/cycle" not in script
-        assert '"/player/shuffle", { enabled: !(state.player && state.player.shuffle) }' in script
+        assert "!(state.player && state.player.shuffle)" in script
+        assert 'command("/player/shuffle", { enabled })' in script
 
     def test_an_unexpected_mode_from_the_daemon_does_not_wedge_the_button(self):
         """``repeat`` is nullable in the API and the daemon is the one filling it in. An unknown value
@@ -878,11 +890,16 @@ class TestDeleteAsksFirst:
 
     def test_both_halves_of_the_screen_are_redrawn_afterwards(self):
         """The queue may have been holding the file that just disappeared, so the listing alone is
-        not enough — and the server is the only source of truth about playback."""
+        not enough.
+
+        ``refreshTransport`` rather than ``refreshPlayer``: the queue that was holding it might be
+        the *phone's*, which no amount of asking the server would correct — so the delete also has
+        to take the track out of the local queue, which is what ``localForget`` is for."""
         code = TestTheAssetsThemselves.code("app.js")
         body = code[code.index("async function deleteTrack(") :]
         assert "await loadLibrary()" in body
-        assert "await refreshPlayer()" in body
+        assert "await refreshTransport()" in body
+        assert "localForget(track.path)" in body
 
 
 class TestPlaylists:

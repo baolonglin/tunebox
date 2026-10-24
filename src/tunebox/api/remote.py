@@ -39,9 +39,10 @@ from fastapi import APIRouter, HTTPException, Request, status
 from ..config import Config
 from ..core.models import Output, PlayerStatus
 from ..core.ports import Player
-from ..errors import LibraryError, PlayerUnavailable
+from ..errors import LibraryError, OutputNeedsPairing, PlayerUnavailable
 from ..library import resolve_track_path
 from .schemas import (
+    OutputSelectRequest,
     OutputView,
     PlayerView,
     QueueAddedView,
@@ -110,11 +111,20 @@ def player_view(player: Player, config: Config, status_: PlayerStatus | None = N
         item_length_ms=state.item_length_ms,
         item_progress_ms=state.item_progress_ms,
         now_playing=QueueItemView(**state.now_playing.as_dict()) if state.now_playing else None,
-        outputs=[OutputView(**output.as_dict()) for output in state.outputs],
+        outputs=[_output_view(output, config) for output in state.outputs],
         queue=[QueueItemView(**item.as_dict()) for item in player.queue()],
-        output=OutputView(**target.as_dict()) if target else None,
+        output=_output_view(target, config) if target else None,
         output_selected=bool(target and target.selected),
         playing_without_output=state.playing and not state.selected_outputs,
+    )
+
+
+def _output_view(output: Output, config: Config) -> OutputView:
+    """One output, plus whether the remote is allowed to switch to it."""
+    return OutputView(
+        **output.as_dict(),
+        selectable=config.allows_output(output.id, output.name),
+        needs_pairing=output.needs_pairing,
     )
 
 
@@ -242,6 +252,96 @@ def set_shuffle(payload: ShuffleRequest, request: Request) -> PlayerView:
     player = _player(request)
     player.set_shuffle(payload.enabled)
     return player_view(player, _config(request))
+
+
+@router.put(
+    "/output",
+    response_model=PlayerView,
+    summary="Choose which speaker the music comes out of",
+)
+def choose_output(payload: OutputSelectRequest, request: Request) -> PlayerView:
+    """Switch playback to one of the daemon's outputs, and switch the others off.
+
+    This is the route behind the remote's device selector, and it is a deliberate softening of the
+    posture its neighbour below was written with. ``PUT /player/output/select`` takes no id *at all*
+    because for as long as there was one configured speaker, accepting one could only ever add risk.
+    A selector listing every speaker in the house cannot work that way — so the id is accepted, and
+    the two things that made the original refusal right are kept as checks instead:
+
+    * **The id must be in the daemon's current output list.** Anything else is a ``404`` raised here,
+      never a string forwarded to OwnTone. That matters beyond tidiness: the daemon answers an
+      unknown id and a speaker that will not wake with the same ``400`` and the same HTML body, so
+      without this check "you typed that wrong" and "the soundbar is asleep" would be one error.
+    * **It must pass ``TUNEBOX_OUTPUT_ALLOW``.** mDNS does not stop at the front door — OwnTone
+      lists a neighbour's Chromecast exactly like your own — and an allowlist is the only thing that
+      can turn "the remote must not control other people's devices" from an intention into a rule.
+      Unrestricted by default, because every existing installation has one speaker and a default
+      that broke them would be a worse answer than a documented one.
+
+    **Exclusive**, because that is what a single-choice selector means: the chosen output is enabled
+    and every other one is switched off (:meth:`~tunebox.player.owntone.OwnTonePlayer.select_only`
+    has the ordering, and why a failure leaves the previous speaker playing rather than silencing
+    the room). Multi-room is therefore not reachable from the remote. That is a real loss and it is
+    the right trade for one household with one soundbar: OwnTone's own web UI still does it, and a
+    picker that could express "these three" is a different control from the one that was asked for.
+
+    The output keeper is told, so that choosing a different speaker is not quietly undone fifteen
+    seconds later — see :meth:`~tunebox.player.selection.OutputKeeper.note_manual_selection`.
+
+    Slow on purpose when the speaker is asleep, exactly like the route below: the adapter retries
+    the enable, so this can take a few seconds before answering ``503``.
+    """
+    player = _player(request)
+    config = _config(request)
+    wanted = payload.id.strip()
+
+    outputs = player.status().outputs
+    target = next((output for output in outputs if output.id == wanted), None)
+    if target is None:
+        # 404 and not 400: the body names a resource, and "it is not there" is the whole answer. A
+        # speaker that is unplugged genuinely is not on the network to be found.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"no output with id {wanted!r} — it may have left the network. "
+                f"Visible now: {', '.join(output.name for output in outputs) or 'none'}"
+            ),
+        )
+    if not config.allows_output(target.id, target.name):
+        # 403 rather than 404: pretending it does not exist would be a lie the UI can already
+        # disprove, since GET /player lists it with selectable=false and says why.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"{target.name!r} is not in TUNEBOX_OUTPUT_ALLOW, so this remote may not "
+                "switch playback to it"
+            ),
+        )
+    if target.needs_pairing:
+        # Already known to want a PIN, so there is nothing to gain from four seconds of retrying
+        # and a 503 telling somebody to try again. The adapter raises the same error when it
+        # *discovers* this mid-attempt; this is the cheap path for the second tap onwards.
+        raise OutputNeedsPairing(
+            f"{target.name!r} needs a PIN or password before it will play. OwnTone has to pair "
+            "with it once: open OwnTone's own web interface, select this speaker there and enter "
+            "the code it shows. tunebox cannot do that for you — it holds no pass-through to the "
+            "daemon's API."
+        )
+
+    exclusive = getattr(player, "select_only", None)
+    if exclusive is not None:
+        exclusive(target.id, volume=config.output_volume)
+    else:  # pragma: no cover - OwnTone and the fake both have select_only()
+        player.select_output(target.id, volume=config.output_volume)
+
+    keeper = getattr(request.app.state, "output_keeper", None)
+    if keeper is not None:
+        configured = configured_output(outputs, config)
+        keeper.note_manual_selection(
+            target.id, is_configured=bool(configured and configured.id == target.id)
+        )
+    log.info("playback switched to output %r (%s)", target.name, target.id)
+    return player_view(player, config)
 
 
 @router.put(

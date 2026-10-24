@@ -25,6 +25,7 @@ from tunebox.config import Config
 from tunebox.core.models import REPEAT_MODES, Output
 from tunebox.errors import (
     ConfigError,
+    OutputNeedsPairing,
     OutputNotFound,
     OutputUnreachable,
     PlayerError,
@@ -531,8 +532,83 @@ class TestOutputs:
         with pytest.raises(OutputUnreachable):
             one.select_output("8365057286ba1880")
 
-        # One attempt, and no listing: with nothing left to retry there is nothing to find out.
-        assert stub.calls() == ["PUT /api/outputs/8365057286ba1880"]
+        # One enable, and the listing is still read — which it was not, until selecting an AirPlay
+        # output produced an error confidently blaming a sleeping Cast device. The listing is no
+        # longer only "is it worth retrying": it is also *which of three errors this is*, and that
+        # question has an answer on the last attempt too.
+        assert stub.count("PUT", "/api/outputs/8365057286ba1880") == 1
+        assert stub.calls() == [
+            "PUT /api/outputs/8365057286ba1880",
+            "GET /api/outputs",
+        ]
+
+    def test_the_final_error_names_the_speaker_and_matches_its_kind(
+        self, config: Config, stub, monkeypatch
+    ):
+        """The bug this family exists to prevent, found in use rather than by a test.
+
+        ``OutputUnreachable``'s message used to be one hard-coded sentence about Cast devices in
+        standby — true of the one speaker Phase 3 had, and wrong for every AirPlay output a device
+        selector lists. Somebody selecting a Mac got told to "try again in a moment" for a failure
+        that would never clear, with the first line asserting a cause the daemon's own log flatly
+        contradicted. A diagnosis in the wrong direction is worse than none, because it gets acted on.
+        """
+        monkeypatch.setattr(owntone.time, "sleep", lambda _seconds: None)
+        airplay = {**OUTPUT_SOUNDBAR, "name": "MacBook Pro", "type": "AirPlay 2"}
+        stub.script("PUT", f"/api/outputs/{airplay['id']}", [(400, None)] * 3)
+        stub.on("GET", "/api/outputs", {"outputs": [airplay]})
+        player = OwnTonePlayer(config)
+
+        with pytest.raises(OutputUnreachable) as caught:
+            player.select_output(airplay["id"])
+
+        message = str(caught.value)
+        assert "MacBook Pro" in message, "name the speaker, not just its id"
+        assert "AirPlay" in message
+        assert "Cast speaker in standby" not in message
+        assert "<html>" not in message
+
+    def test_a_cast_speaker_still_gets_the_standby_explanation(
+        self, config: Config, stub, monkeypatch
+    ):
+        """Because for a Cast device it is the right answer, and it was measured: three enables
+        failed with ``No route to host`` and an attempt fifty-four seconds later played."""
+        monkeypatch.setattr(owntone.time, "sleep", lambda _seconds: None)
+        stub.script("PUT", f"/api/outputs/{OUTPUT_SOUNDBAR['id']}", [(400, None)] * 3)
+        stub.on("GET", "/api/outputs", {"outputs": [OUTPUT_SOUNDBAR]})
+        player = OwnTonePlayer(config)
+
+        with pytest.raises(OutputUnreachable) as caught:
+            player.select_output(OUTPUT_SOUNDBAR["id"])
+
+        assert "Cast speaker in standby" in str(caught.value)
+
+    def test_a_speaker_wanting_a_pin_is_not_retried(self, config: Config, stub, monkeypatch):
+        """``requires_auth`` is **discovered**: measured against OwnTone 29.3, the Mac reported
+        ``false`` until the first enable failed and ``true`` from then on. So the check belongs after
+        a failure rather than before one — and once it is known, retrying is four seconds spent on
+        something that cannot change, under advice ("try again") that can never be right.
+        """
+        monkeypatch.setattr(owntone.time, "sleep", lambda _seconds: None)
+        needs_pin = {
+            **OUTPUT_SOUNDBAR,
+            "name": "MacBook Pro",
+            "type": "AirPlay 2",
+            "requires_auth": True,
+        }
+        stub.script("PUT", f"/api/outputs/{needs_pin['id']}", [(400, None)] * 3)
+        stub.on("GET", "/api/outputs", {"outputs": [needs_pin]})
+        player = OwnTonePlayer(config)
+
+        with pytest.raises(OutputNeedsPairing) as caught:
+            player.select_output(needs_pin["id"])
+
+        assert stub.count("PUT", f"/api/outputs/{needs_pin['id']}") == 1, "no retries"
+        message = str(caught.value)
+        assert "MacBook Pro" in message
+        assert "PIN" in message
+        assert "try again" not in message.lower(), "the one piece of advice that cannot work"
+        assert "web interface" in message, "say where the fix actually is"
 
     def test_a_speaker_that_left_between_listing_and_selecting_is_not_found(
         self, player: OwnTonePlayer, stub, monkeypatch
@@ -959,6 +1035,70 @@ class TestOutputKeeper:
         keeper.check_once()
         assert player.selections == [(player.output_id, 25)]
         assert player.volume == 25
+
+    # ------------------------------------------- somebody chose a device by hand
+
+    def test_choosing_another_speaker_is_not_undone(self):
+        """The device selector's half of the contract.
+
+        Without being told, the keeper would still *eventually* agree — a configured speaker that is
+        visible and off and did not go anywhere is recorded as somebody's decision on the next pass —
+        but "eventually" is up to ``TUNEBOX_OUTPUT_CHECK_INTERVAL`` seconds, and inside that window a
+        speaker that power-cycles is one the keeper switches back on top of the choice just made.
+        """
+        player = FakePlayer(selected=True)
+        keeper = self.keeper(player)
+        keeper.check_once()
+
+        # Somebody picked the kitchen instead, so the configured speaker went off.
+        keeper.note_manual_selection("55267078216198", is_configured=False)
+        player.selected = False
+        assert keeper.check_once() is None
+        assert player.selections == [], "the keeper must not re-select what a person switched off"
+
+    def test_and_stays_not_undone_across_a_power_cycle(self):
+        """The same rule a manual deselection in OwnTone's own web UI gets: what is remembered is the
+        decision, not a snapshot, so neither a power-cycle nor a daemon restart resurrects it."""
+        player = FakePlayer(selected=True)
+        keeper = self.keeper(player)
+        keeper.check_once()
+        keeper.note_manual_selection("55267078216198", is_configured=False)
+        player.selected = False
+        keeper.check_once()
+
+        player.present = False
+        keeper.check_once()
+        player.present = True
+        assert keeper.check_once() is None
+        assert player.selections == []
+
+    def test_choosing_the_configured_speaker_keeps_it_asserted(self):
+        """The same statement in the other direction. Recording it as "off" would mean re-selecting
+        the soundbar by hand left the keeper believing it should be off — and the next power-cycle
+        would lose it, which is the exact silent failure this module was audited for once already."""
+        player = FakePlayer(selected=False)
+        keeper = self.keeper(player)
+        keeper.note_manual_selection(player.output_id, is_configured=True)
+        player.selected = True
+        keeper.check_once()
+
+        player.present = False
+        keeper.check_once()
+        player.present = True
+        player.selected = False
+        assert keeper.check_once() is not None, "a power-cycle must bring it back"
+        assert player.selections == [(player.output_id, None)]
+
+    def test_being_told_does_not_mark_the_output_away(self):
+        """We have just had a successful conversation with the daemon about it, so an immediately
+        following power-cycle is a genuine "came back" rather than a second one."""
+        player = FakePlayer(selected=True)
+        keeper = self.keeper(player)
+        keeper.check_once()
+        before = keeper.recoveries
+        keeper.note_manual_selection(player.output_id, is_configured=True)
+        keeper.check_once()
+        assert keeper.recoveries == before
 
     # ------------------------------------------------------- the speaker leaves
 

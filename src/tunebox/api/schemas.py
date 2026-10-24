@@ -125,6 +125,18 @@ class OutputView(BaseModel):
     selected: bool = False
     volume: int | None = None
     needs_auth_key: bool = False
+    #: The daemon has established that this output wants a PIN or a password, so selecting it will
+    #: fail until somebody pairs it in OwnTone's own web UI. Discovered rather than known — see
+    #: :attr:`tunebox.core.models.Output.requires_auth` — so ``false`` is not a promise it will work.
+    requires_auth: bool = False
+    #: ``requires_auth`` or ``needs_auth_key``: one field for the UI, because the two spellings have
+    #: the same cause and exactly the same fix.
+    needs_pairing: bool = False
+    #: May the remote switch playback to this output? ``TUNEBOX_OUTPUT_ALLOW`` decides, and the
+    #: answer is computed here rather than in the browser so that the rule lives on the side of the
+    #: wire that enforces it — the device selector greys out what ``PUT /player/output`` would
+    #: refuse, instead of offering it and reporting a 403 after the tap.
+    selectable: bool = True
 
 
 class QueueItemView(BaseModel):
@@ -136,6 +148,21 @@ class QueueItemView(BaseModel):
     length_ms: int | None = None
     path: str | None = None
     track_id: str | None = None
+
+
+class OutputSelectRequest(BaseModel):
+    """``PUT /player/output`` body — which speaker the music should come out of.
+
+    The one request body in this project that takes an identifier the *daemon* owns, which is why
+    the route around it does two checks the others do not need: the id must be in the daemon's
+    current output list (so a made-up one is a ``404`` from here and is never forwarded), and it
+    must pass ``TUNEBOX_OUTPUT_ALLOW``. OwnTone lists every Cast and AirPlay device it can see over
+    mDNS, and mDNS does not stop at the front door.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=200, description="an id from GET /player's `outputs`")
 
 
 class PlayerView(BaseModel):
@@ -289,6 +316,45 @@ class LibraryDeletedView(BaseModel):
     #: Non-fatal problems, currently only "the player could not be told to re-index". The file is
     #: gone either way, which is why this is a field and not a status code.
     warnings: list[str] = Field(default_factory=list)
+
+
+# ------------------------------------------------- playing on the phone itself
+#
+# The one thing a browser needs from the server in order to be an output: a URL it can put in
+# ``<audio src>``. See :mod:`tunebox.api.media` for why that cannot be a token-protected URL and
+# :mod:`tunebox.core.tickets` for what makes a capability URL an acceptable substitute.
+
+
+class MediaTicketRequest(BaseModel):
+    """``POST /library/tickets`` body — the same ``{"paths": [...]}`` shape as everything else.
+
+    A list rather than one path per request because the caller is building a queue: a phone that
+    minted one ticket per track would make a request per tap, and the whole point of this route is
+    that it is the *only* thing phone-local playback asks the server for.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    paths: list[str] = Field(min_length=1, max_length=100)
+
+
+class MediaTicketView(BaseModel):
+    """One capability URL. ``path`` is echoed so a caller can match it to what it asked for."""
+
+    path: str
+    #: Relative to this service, e.g. ``/media/eyJ…``. Relative on purpose: the page already knows
+    #: the host it loaded from, and an absolute URL would have to guess at it from the server side —
+    #: the same mistake ``TUNEBOX_OWNTONE_UI`` exists to avoid.
+    url: str
+    #: What the response will be labelled, so a client can decide whether it can play the file at
+    #: all before fetching a note of it.
+    content_type: str
+
+
+class MediaTicketsView(BaseModel):
+    tickets: list[MediaTicketView] = Field(default_factory=list)
+    #: Seconds these are good for. Advisory — the ticket carries its own expiry, signed.
+    expires_in: int
 
 
 # ------------------------------------------------------------------ playlists

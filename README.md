@@ -7,7 +7,11 @@ the reasoning behind both — this README only covers running the code.
 
 **Phases 1–4 (this code): CLI, HTTP service, host-owned playback, and one web remote.** Search,
 ingest, a job queue, an API, playback on a Chromecast speaker driven by OwnTone, and a single
-installable page that does all of it — the phone is a remote, never the audio path. One known
+installable page that does all of it. The remote has **one device selector**: this device, plus
+every speaker OwnTone can see. Everything on the screen then means whichever one you picked. A
+shared speaker is the default, because the phone leaving should not stop the music — and **each
+device keeps its own queue**, which is the whole design: see
+[Where the music plays](#where-the-music-plays). One known
 shortfall: the soundbar's own display stays blank, because OwnTone's Cast output is screen-mirroring
 and carries no track metadata. See [PLAN.md](PLAN.md) Phase 0.
 
@@ -109,13 +113,16 @@ reachable from outside the house (PLAN.md 3.2).
 | `DELETE /jobs/{id}` | cancel a job that has not started (`409` once it is running) |
 | `GET /library?q=…&limit=…` | music files under the music root, newest first, paths relative to it |
 | `DELETE /library` | delete tracks — `{"paths": [...]}`, all-or-nothing, and there is no trash |
+| `POST /library/tickets` | capability URLs for streaming tracks to *this* device — `{"paths": [...]}` |
+| `GET /media/{ticket}` | the audio itself, with byte ranges. **The one route the token does not guard**: the ticket is the credential |
 | `GET /player` | transport state, volume, now playing, queue and outputs, in one response |
 | `PUT /player/play`&nbsp;`pause`&nbsp;`toggle`&nbsp;`stop`&nbsp;`next`&nbsp;`previous` | transport; each answers with the new state |
 | `PUT /player/volume` | `{"volume": 0–100}` or `{"step": ±n}`, exactly one |
 | `PUT /player/seek` | `{"position_ms": n}` |
 | `PUT /player/repeat` | `{"mode": "off" \| "all" \| "single"}` — nothing, the whole queue, or one song |
 | `PUT /player/shuffle` | `{"enabled": true \| false}` |
-| `PUT /player/output/select` | enable the configured speaker (no id is taken from the caller); `503` if it is listed but will not start |
+| `PUT /player/output` | `{"id": "..."}` — switch to one of the daemon's outputs and switch the others off; `404` if the id is not currently reported, `403` if `TUNEBOX_OUTPUT_ALLOW` excludes it, `409` if it needs pairing |
+| `PUT /player/output/select` | enable the *configured* speaker (no id taken from the caller); `503` if it is listed but will not start |
 | `GET`&nbsp;`POST`&nbsp;`DELETE /player/queue` | list, add library files, or empty it |
 | `PUT /player/queue/{id}/play` | jump to an item already in the queue — `404` if it has since gone |
 | `GET`&nbsp;`POST /playlists` | list playlists, or create one — from library paths, from the queue, or empty |
@@ -265,6 +272,202 @@ when every speaker fails to start, OwnTone keeps reporting `state: play` and kee
 track position, so a remote that trusted the transport would draw a confident progress bar for a
 silent room — measured, for three minutes. The page says *"Playing, but no speaker is attached"*
 instead.
+
+### Where the music plays
+
+One selector, at the top of Now playing, listing every device this remote can drive:
+
+```
+Playing on:  ┌──────────────────────────────────┐
+             │ This device                      │
+             │   This device                    │
+             │ Shared speakers                  │
+             │   Living Room speaker · Chromecast
+             │   MacBook Pro · AirPlay 2        │
+             │   [LG] webOS TV · AirPlay 2      │
+             └──────────────────────────────────┘
+```
+
+Everything else on the screen then means whichever one you picked: the transport, the volume, the
+queue rows, repeat, shuffle, and Play and Queue over in the Library and Playlists panels. The choice
+is remembered on that device and sent nowhere.
+
+**Each device keeps its own queue, and that is the design rather than a limitation.** A queue belongs
+to an output, not to a page:
+
+| Device | Queue lives in | Who can change it | Why that is right |
+|---|---|---|---|
+| A shared speaker | OwnTone, on the host | anyone with the token | one speaker, one room. Somebody skipping a track they dislike is the feature — and the music keeps playing when your phone sleeps, leaves or dies |
+| This device | that device's own storage | only that device | one pair of headphones. Nobody else gets to skip your song |
+
+So two phones both set to *This device* are two independent players, and two phones both pointed at
+the soundbar are two remotes for one player. An earlier draft of this had the two sharing a single
+queue, which reads well until you follow it through: somebody pressing **Clear** in the kitchen would
+empty what another person was listening to on headphones, and there is no sense in which that is
+"changing the music in the room".
+
+**Moving the music between them is a button, not a side effect.** *Continue on Living Room speaker*
+(and, from a speaker, *Continue on this device*) copies the queue and the playback position across,
+starts it there, and pauses the side you left — paused rather than stopped, so whoever was listening
+in the room can press play and carry on from where it was. A copy somebody asked for cannot reach
+into what a stranger is hearing; an implicitly shared list can.
+
+Switching the selector to a speaker **enables that speaker and switches the others off**, because
+that is what a single-choice control means. Multi-room is therefore not reachable from the remote;
+OwnTone's own web UI still does it.
+
+#### Playing on the device you are holding
+
+A soundbar does not reach every room, somebody else is sometimes using it, and headphones exist. What
+*This device* buys, and what it costs:
+
+- **The lockscreen works.** Track title, artist, and the play/pause/skip controls on the lockscreen
+  and on headphone buttons — via the Media Session API, which needs the audio to be coming out of
+  the browser and therefore could never work on the OwnTone path. This is the one thing a local
+  device can do that a shared speaker cannot.
+- **The music stops when that device does.** Locked for long enough, out of Wi-Fi range, battery
+  dead, tab closed: the audio was coming out of it. The panel says so rather than leaving it to be
+  discovered. This is the exact property PLAN.md 2 chose the host-owned session to avoid, which is
+  why a shared speaker is still the default.
+- **It needs no OwnTone at all.** Its queue was never the daemon's, so a host with no player
+  installed still plays music on the phone in your hand. The selector simply says *"No speakers
+  visible"*.
+- **The volume slider does not work on iOS.** `HTMLMediaElement.volume` is read-only there, and
+  Apple does not say so — assignments are silently ignored. So the page detects it, disables the
+  slider and the ± buttons, and says *"use the phone's own volume buttons"*. Nothing is more
+  annoying than a control that looks like it worked.
+- **The queue survives closing the app**, because it is in that device's storage. The playback
+  *position* does not: resuming a track to the second is a promise this cannot keep.
+
+#### Which speakers the remote may use
+
+`PUT /player/output` takes an id, which is a deliberate change of posture: for as long as there was
+one configured speaker, the selection route took no id at all, because accepting one could only add
+risk. A selector listing the speakers in the house cannot work that way, so the two things that made
+the original refusal right are kept as checks instead:
+
+- **the id must be one the daemon is currently reporting.** Anything else is a `404` from tunebox and
+  is never forwarded. That earns its place beyond tidiness: OwnTone answers an unknown id and a
+  speaker that will not wake with the same `400` and the same HTML body, so without the check "you
+  typed that wrong" and "the soundbar is asleep" would be one error;
+- **it must pass `TUNEBOX_OUTPUT_ALLOW`.** mDNS does not stop at the front door — the daemon lists a
+  neighbour's Chromecast exactly like your own — and an allowlist is the only thing that can turn
+  "this remote must not control other people's devices" from an intention into a rule. Unrestricted
+  by default, because every installation that predates the selector has one speaker. Set it to the
+  ids or names you own:
+
+```bash
+TUNEBOX_OUTPUT_ALLOW='Living Room speaker,2345877078'
+```
+
+An excluded speaker is listed and **greyed out** rather than hidden, because "that speaker exists and
+is not yours to use" is a different statement from "there is no such speaker". `GET /player` reports
+`selectable` per output, so the page greys out exactly what the route would refuse instead of
+offering it and reporting a `403` after the tap. The configured speaker is always allowed, even if an
+allowlist forgets it — otherwise `TUNEBOX_OUTPUT` and `TUNEBOX_OUTPUT_ALLOW` could disagree, and the
+symptom would be the output keeper selecting a speaker the remote refuses to show as selectable.
+
+#### A speaker that will not play, and why it says which kind it is
+
+Not every output OwnTone lists can be used, and the three ways one fails need three different
+answers. Getting this wrong is worse than saying nothing: the first version of the selector answered
+an AirPlay failure with Cast prose ending in *"try again in a moment"*, for a failure that would
+never clear.
+
+| What happened | What you get | What to do |
+|---|---|---|
+| it left the network | `404` naming what is visible instead | plug it in, or pick something else |
+| it is listed and will not wake | `503`, retried three times first | a Cast speaker in standby does this; try again in a moment |
+| it wants a PIN or a password | `409`, **not retried at all** | pair it once in OwnTone's own web UI |
+
+The third one is the one worth knowing about, because an AirPlay 2 receiver is the common case and
+retrying it is four seconds spent on something that cannot change. Measured on this host against
+OwnTone 29.3 — a Mac advertising itself as an AirPlay receiver:
+
+```
+airplay: Status flags from 'MacBook Pro' was 516: ... one time pairing 1 ...
+airplay: Starting device pairing for 'MacBook Pro', go to the web interface and enter PIN
+airplay: Response to PIN start from 'MacBook Pro' was negative, aborting (403 Forbidden)
+player: The AirPlay 2 device 'MacBook Pro' requires a valid PIN or password
+```
+
+**tunebox cannot do that pairing**, and that is the same decision as everywhere else: it is `POST
+/api/outputs/{id}/verification` on the daemon, and there is no pass-through to OwnTone (PLAN.md 3.2).
+So the honest answer is to name the speaker and point at the daemon's own web UI, which the footer
+already links to. Once paired, OwnTone stops reporting `requires_auth` and the speaker becomes
+selectable on the next poll with nothing to clear here.
+
+`requires_auth` is **discovered, not known**: the same Mac reported `false` until the first enable
+attempt failed and `true` from then on. So an output that is not flagged is not a promise that it
+will work — it is only a promise that nothing has found out otherwise yet. The selector greys out
+and labels *(needs pairing in OwnTone)* the ones the daemon has learned about, which is why the
+first tap on a new speaker can still produce the `409`.
+
+Choosing a speaker from the remote also **tells the output keeper**, so that picking a different one
+is not quietly undone fifteen seconds later. The keeper would have got there on its own — a
+configured speaker that is visible, off and did not go anywhere is already recorded as somebody's
+decision — but not before the next check, and inside that window a speaker that power-cycles is one
+it would switch back on top of the choice you just made.
+
+#### How the audio gets there, and why there is a token-free route
+
+`<audio src="…">` is a request the *browser* makes, and a page cannot put a header on it. So the
+one route that carries audio cannot be guarded by `X-Tunebox-Token` like everything else. The three
+ways out of that are a cookie, the token in a query string, and a capability URL, and only the third
+fits what this project already decided:
+
+- **a cookie** would be attached by the browser to requests a third-party page could cause, which is
+  the one property the header token was chosen for;
+- **`?token=`** would write the master credential into uvicorn's access log once per track, and
+  keeping it out of that log is why the remote carries it in a URL *fragment* and strips it on
+  arrival (PLAN.md 3.2);
+- **a capability URL** is what `tunebox.api.auth`'s `exempt_prefixes` was reserved for back in
+  Phase 3 — "the capability URL a Cast-pulled `/media/{id}` would need". The Cast path never needed
+  it; this one does.
+
+```bash
+T=$TUNEBOX_TOKEN
+curl -s -H "X-Tunebox-Token: $T" -H 'Content-Type: application/json' \
+     -d '{"paths":["Kraftwerk/Singles/Autobahn (Single version 1974).m4a"]}' \
+     http://127.0.0.1:8080/library/tickets
+# -> {"tickets":[{"path":"Kraftwerk/Singles/Autobahn (Single version 1974).m4a",
+#                 "url":"/media/eyJlIjoxNzkyNzE4OTQwLCJwIjoiS3JhZnR3ZXJrL1Npbmds…",
+#                 "content_type":"audio/mp4"}],"expires_in":21600}
+
+curl -s -r 0-1 -D - -o /dev/null http://127.0.0.1:8080/media/eyJlIjoxNzky…   # no token
+# HTTP/1.1 206 Partial Content
+# content-range: bytes 0-1/4194304
+```
+
+A ticket is an HMAC over the library path and an expiry, keyed by a value derived from
+`TUNEBOX_TOKEN`. What makes it acceptable in a log line is everything it is *not*:
+
+- **it names one file**, signed, so it cannot be re-pointed at another — and the path is still
+  re-resolved through `library.resolve_track_path` on every request, so a ticket is never trusted to
+  have been minted for something sane. A bug in the minting route cannot become a file-read
+  primitive;
+- **it expires** (`TUNEBOX_MEDIA_TICKET_TTL`, six hours — longer than any queue this household
+  builds, shorter than the gap to the next time anyone is in the room);
+- **it is read-only**, and the response carries `nosniff` and a `default-src 'none'` CSP of its own
+  so it cannot be anything but bytes;
+- **it dies with the token.** Rotating `TUNEBOX_TOKEN` invalidates every outstanding ticket, with no
+  state anywhere to clear — there is no table of tickets, deliberately: it would be a second
+  database (PLAN.md 3.1), it would need pruning, and it would not survive the restart an upgrade
+  performs mid-song.
+- **the minting route is not inside the exempt prefix.** `POST /library/tickets` requires the token
+  like everything else, and lives under `/library/` rather than `/media/` precisely because
+  `/media/` is the prefix that is exempt. A route that handed out capability URLs to anyone who
+  asked would be a capability worth nothing.
+
+`TUNEBOX_LOCAL_PLAYBACK=0` removes the `/media/` routes **and** their auth exemption together, the
+same way `TUNEBOX_UI=0` does for the shell — so a household that only ever plays on the soundbar can
+run a service with no token-free way to read a byte of audio.
+
+**Byte ranges are implemented, not inherited**, and that is not gold-plating: iOS Safari opens a
+track by asking for `bytes=0-1` and will not play a reply that comes back `200` with the whole file
+instead of `206`. Seeking is a range request on every browser there is. A multi-range request is
+answered with the whole file, which RFC 9110 permits and which is much better than the pile of code
+a correct `multipart/byteranges` body would be.
 
 ### What this does not do
 
@@ -437,9 +640,12 @@ it in `localStorage`; **Forget token** in the footer removes it again.
 
 Four panels:
 
-- **Now playing** — title and artist of the current track, a progress bar, previous/play-pause/next/stop,
+- **Now playing** — the **device selector** (this device, plus every speaker OwnTone can see — see
+  [Where the music plays](#where-the-music-plays)), the title and artist of the current
+  track, a progress bar, previous/play-pause/next/stop,
   a volume slider with ± buttons, a **repeat** button that cycles off → the queue → one song, a
-  **shuffle** toggle, the queue, and the state of the speaker. **Tapping a track in the queue plays
+  **shuffle** toggle, the queue, and the state of the chosen device. Every one of those means
+  whichever device is selected, and each device has its own queue. **Tapping a track in the queue plays
   it** — the row is the button, so track seven is one tap and not six presses of ⏭; the row already
   playing restarts it, and its label says so. When the speaker is visible
   but switched off, a button appears to turn it back on; that is the one case the output keeper
@@ -536,20 +742,33 @@ an hour while the host served the new one.
 
 ### What is and is not exposed
 
-The **app shell** — `/`, `/sw.js`, `/manifest.webmanifest` and `/ui/*` — is the only thing served
-without the token, because a browser cannot put a header on the document request it makes on your
-behalf. It carries no data: it is the same markup, CSS, script and icons that are in this repository,
-and its first action is to ask for a token and check it against `/healthz`. Every route that can read
-the library, queue an ingest or touch the player still requires it. `TUNEBOX_UI=0` removes the routes
-and the exemption together.
+**Two things are served without the token, and no more.**
+
+The **app shell** — `/`, `/sw.js`, `/manifest.webmanifest` and `/ui/*` — because a browser cannot put
+a header on the document request it makes on your behalf. It carries no data: it is the same markup,
+CSS, script and icons that are in this repository, and its first action is to ask for a token and
+check it against `/healthz`. Every route that can read the library, queue an ingest or touch the
+player still requires it. `TUNEBOX_UI=0` removes the routes and the exemption together.
+
+**`GET /media/{ticket}`** — because `<audio src>` is a request the browser makes, and a page cannot
+put a header on that either. The ticket in the path is the credential: signed, expiring, scoped to
+one file and read-only, and the route that *mints* one requires the token like everything else. See
+[How the audio gets there](#how-the-audio-gets-there-and-why-there-is-a-token-free-route) for the
+full reasoning. `TUNEBOX_LOCAL_PLAYBACK=0` removes the routes and the exemption together.
+
+The two are different shapes on purpose: the shell is a list of **exact paths**, because `/` as a
+prefix would exempt the whole API, while `/media/` is a **prefix**, because the credential is in the
+path. `tunebox.api.auth` refuses `/` or an empty string as a prefix outright rather than trusting a
+future caller to notice the difference.
 
 Some deliberate absences, each with a test:
 
 - **There is no pass-through to OwnTone.** tunebox holds the daemon's credentials and talks to it
   from a network it trusts, so a route that forwarded arbitrary paths would hand every caller the
   daemon's whole API — including one that switches *off* every speaker absent from its argument.
-  What the remote may do is the sixteen `/player/*` routes listed above, all of them through the
-  `Player` port. Validation is on this side too, and not only as good manners: `state=bogus` on
+  What the remote may do is the `/player/*` routes listed above, all of them through the
+  `Player` port — including the one that takes an output id, which is checked against the daemon's
+  live list and against `TUNEBOX_OUTPUT_ALLOW` here rather than forwarded. Validation is on this side too, and not only as good manners: `state=bogus` on
   OwnTone's own repeat and shuffle routes is answered `204` and silently taken as "off", so a mode
   outside `off|all|single` is a `422` here rather than a success that changed the mode. The one
   route that takes an id in its path checks the queue for it first, so an id that is no longer
@@ -568,8 +787,10 @@ Some deliberate absences, each with a test:
   now-playing screen showing a track that stopped ten minutes ago, with a pause button that does
   nothing, is worse than no screen.
 
-What the remote does **not** give you is lockscreen or hardware-volume-button control — the accepted
-cost of the phone not being the audio path (PLAN.md 2).
+What the remote does **not** give you on the house-speaker path is lockscreen or
+hardware-volume-button control — the accepted cost of the phone not being the audio path (PLAN.md
+2). Select **This device** and both work, because then it is: see
+[Where the music plays](#where-the-music-plays).
 
 ## Deploying
 
@@ -947,8 +1168,11 @@ night, not a test.
 | `TUNEBOX_OUTPUT_VOLUME` | — | volume to set when first selecting; unset leaves whatever the speaker remembers |
 | `TUNEBOX_OUTPUT_CHECK_INTERVAL` | `15` | seconds between selection checks; `0` disables the keeper |
 | `TUNEBOX_OUTPUT_SELECT_ATTEMPTS` | `3` | tries per "turn the speaker on"; a Cast device in standby refuses the first connection and accepts a later one |
+| `TUNEBOX_OUTPUT_ALLOW` | — | ids or names, comma-separated, the device selector may switch to. Empty means every speaker the daemon can see — **including a neighbour's**, since mDNS does not stop at the front door. The configured output is always allowed |
 | `TUNEBOX_RESCAN_AFTER_INGEST` | `1` | trigger a library rescan after each ingest that produced a new file |
 | `TUNEBOX_UI` | `1` | serve the web remote; `0` removes the shell routes *and* their auth exemption |
+| `TUNEBOX_LOCAL_PLAYBACK` | `1` | offer **This device** in the selector; `0` removes the `/media/` routes *and* their auth exemption, leaving no token-free way to read audio |
+| `TUNEBOX_MEDIA_TICKET_TTL` | `21600` | seconds a streaming capability URL stays valid. Six hours: longer than an evening's queue, short enough that the URL in an access log stops being useful |
 | `TUNEBOX_OWNTONE_UI` | derived | absolute URL for the "full library in OwnTone" link; by default the browser joins its own hostname to the player's port |
 | `TUNEBOX_LIBRARY_MAX_FILES` | `50000` | ceiling on the `GET /library` directory walk; the answer says when it was truncated |
 | `TUNEBOX_PLAYLISTS_DIR` | `Playlists` | directory under the music root holding the `.m3u` files. One name, not a path, and never starting with a dot — a music scanner skips dot-entries, so the playlists would never be indexed |
@@ -993,6 +1217,19 @@ silently stops a button working. None of that substitutes for opening the page: 
 Phase 4 that mattered was invisible to every DOM-level assertion and obvious in a browser
 (PLAN.md Phase 4 has the story).
 
+Playback on the device you are holding is tested in `tests/test_media.py`, and the two tests there
+worth knowing about run the **queue state machine and the device selector under deno**. The capability tickets are pure, so they are tested
+directly and hard — forging a signature, editing the path or the expiry inside a valid ticket, and
+reusing one signed with a different token all have a test, as does the defence-in-depth property that
+matters most: a ticket minted *with the server's own key* for `../../../etc/passwd` is still refused,
+because the path is re-resolved on every request rather than trusted because a signature matched.
+Byte ranges get their own class, including the `bytes=0-1` probe iOS Safari opens a track with and
+the `bytes=-16` suffix form that is easy to implement backwards. And the browser half — "what does ⏭
+do on the last track with repeat off", "does turning shuffle on skip the song that is playing" — is
+a question with a *behaviour* for an answer, so those functions are lifted out of `app.js` and run
+under deno against a stub audio element, with `Math.random` replaced by a fixed sequence so that
+"shuffled" is checkable rather than merely different.
+
 The Phase 5 machinery is tested by injecting every piece of I/O, which is not a style preference: a
 canary that could only be tested by downloading from YouTube, or a rollback that could only be tested
 by installing packages, would be a rollback nobody had ever run — precisely the failure those features
@@ -1011,12 +1248,13 @@ launchd plists are written for real by running the installer's own functions in 
 `launchctl` shim, since a `--dry-run` cannot show the contents of a file it does not write and the
 contents are the whole point.
 
-1276 tests at the end of Phase 5; 1562 with playlists.
+1276 tests at the end of Phase 5; 1562 with playlists; 1742 with playback on the phone.
 
 ## Layout
 
 ```
-src/tunebox/core/      domain: models, ports, naming and path safety — no I/O, no yt-dlp
+src/tunebox/core/      domain: models, ports, naming, path safety and media capability tickets —
+                       no I/O, no yt-dlp
 src/tunebox/sources/   yt-dlp adapter: URL allowlist, subprocess calls, tag mapping
 src/tunebox/ingest.py  the use case, wired from injected ports
 src/tunebox/tagging.py mutagen tag writer — the authority on file metadata
@@ -1024,7 +1262,8 @@ src/tunebox/library.py atomic placement under the music root, and listing what i
 src/tunebox/playlists.py the M3U reader/writer — a playlist is a file in the library, not a table
 src/tunebox/jobs/      SQLite job queue + the worker that drains it
 src/tunebox/player/    OwnTone adapter, output keeper, rescan hook — behind the Player port
-src/tunebox/api/       FastAPI app, token middleware, routes, the remote's routes, the app shell
+src/tunebox/api/       FastAPI app, token middleware, routes, the remote's routes, the app shell,
+                       and media.py — the capability-URL audio route the phone output streams from
 src/tunebox/web/       the one page: hand-written HTML/CSS/JS, manifest, service worker, icons
 src/tunebox/ops/       Phase 5: canary, yt-dlp update + rollback, backup/restore, health, alerts,
                        exposure audit, and the one nightly job that composes them. Nothing in the

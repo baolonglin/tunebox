@@ -36,6 +36,7 @@
     data-version="__TUNEBOX_VERSION__"
     data-owntone-url="__OWNTONE_URL__"
     data-player-port="__PLAYER_PORT__"
+    data-local-playback="__LOCAL_PLAYBACK__"
   >
     <noscript>
       <p class="noscript">
@@ -127,6 +128,64 @@
       <main>
         <!-- ------------------------------------------------------------ now playing -->
         <section id="panel-now" role="tabpanel" aria-labelledby="tab-now" tabindex="0">
+          <!--
+            Where the music comes out. One selector for every device this remote can drive: the
+            device you are holding, and the shared speakers OwnTone can see.
+
+            A native <select> rather than a row of buttons, which the first version of this was. Two
+            reasons, and the second is the one that settled it: a phone renders a <select> as the
+            OS's own picker, which is a better target than anything drawable here, and the list is
+            *not* two items — this household has four outputs (two Chromecast, two AirPlay 2), so a
+            control sized for two was wrong about the hardware it shipped on.
+
+            The optgroups carry the distinction that matters, and it is not cosmetic: the speakers
+            are shared, so their queue is public and anybody in the house can change it, while this
+            device's queue is its own and nobody else can reach it. An output the allowlist excludes
+            is rendered disabled rather than hidden — "that speaker exists and is not yours to use"
+            is a different statement from "there is no such speaker".
+          -->
+          <div class="card device">
+            <label for="device">Playing on</label>
+            <select id="device">
+              <optgroup id="device-self" label="This device">
+                <option value="local">This device</option>
+              </optgroup>
+              <optgroup id="device-speakers" label="Shared speakers"></optgroup>
+            </select>
+            <p id="device-note" class="muted small"></p>
+            <!--
+              The one state where everything else on this screen looks fine and the room is silent:
+              the daemon reports `play` and advances the clock with no speaker attached. `role=status`
+              rather than `alert` because it is polite — it is announced after whatever the user was
+              doing, and it is not an error they caused. In this device's own mode it carries a track
+              that would not load, which is the same question ("why is it quiet?").
+            -->
+            <p id="speaker-alert" class="error" role="status" hidden></p>
+            <div class="device-actions">
+              <button type="button" id="btn-select" hidden>Turn the speaker on</button>
+              <!--
+                Explicit handoff, and explicit is the whole point. Switching the selector moves your
+                attention; this moves the music — it copies the queue and the position across and
+                pauses the side you left. A copy somebody asked for cannot disturb what another
+                person is listening to; an implicit shared queue can, which is why there is a button
+                here rather than one queue behind both.
+              -->
+              <button type="button" id="btn-handoff" hidden></button>
+            </div>
+          </div>
+
+          <!--
+            The audio path, when this device is the one playing. In the markup rather than created by
+            the script so that it is one named element with one owner — and so it is visible in an
+            inspector when somebody is working out why a track will not start.
+
+            `preload="metadata"` and no `src`: nothing is fetched until a track is loaded, and the
+            src is always a short-lived capability URL (/media/{ticket}), never a library path. No
+            `controls`, because the transport below is the control and two sets of buttons that
+            disagree is worse than one.
+          -->
+          <audio id="local-audio" preload="metadata"></audio>
+
           <div class="card now">
             <p id="np-title" class="np-title">Nothing loaded</p>
             <p id="np-artist" class="np-artist muted"></p>
@@ -162,6 +221,14 @@
               <button type="button" id="btn-volup" aria-label="Volume up">+</button>
               <output id="vol-out" for="vol">0</output>
             </div>
+            <!--
+              iOS refuses to let a page set an audio element's volume at all — HTMLMediaElement
+              .volume is read-only there, silently, so a slider would move and change nothing. When
+              that is detected in phone mode the controls are disabled and this says why; the
+              hardware buttons are the volume control in that mode, which is a thing the house
+              speaker path cannot offer at all.
+            -->
+            <p id="vol-note" class="muted small" hidden></p>
           </div>
 
           <!--
@@ -177,18 +244,6 @@
           <div class="card modes" role="group" aria-label="Playback modes">
             <button type="button" id="btn-repeat" data-mode="off">Repeat off</button>
             <button type="button" id="btn-shuffle" aria-pressed="false">Shuffle off</button>
-          </div>
-
-          <div class="card speaker">
-            <p id="speaker-state" class="muted">Speaker: unknown</p>
-            <!--
-              The one state where everything else on this screen looks fine and the room is silent:
-              the daemon reports `play` and advances the clock with no speaker attached. `role=status`
-              rather than `alert` because it is polite — it is announced after whatever the user was
-              doing, and it is not an error they caused.
-            -->
-            <p id="speaker-alert" class="error" role="status" hidden></p>
-            <button type="button" id="btn-select" hidden>Turn the speaker on</button>
           </div>
 
           <h2>Queue <span id="queue-count" class="muted"></span></h2>

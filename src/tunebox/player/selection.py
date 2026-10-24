@@ -234,6 +234,35 @@ class OutputKeeper:
             self._wanted = False
             return None
 
+    def note_manual_selection(self, output_id: str, *, is_configured: bool) -> None:
+        """Somebody chose an output from the remote. Stop having an opinion that contradicts them.
+
+        Called by ``PUT /player/output``. Without it the keeper would still *eventually* reach the
+        right answer — a configured speaker that has been switched off is "visible, off and not
+        away" on the next pass, which already records the decision — but "eventually" is up to
+        ``TUNEBOX_OUTPUT_CHECK_INTERVAL`` seconds, and inside that window a speaker that
+        power-cycles is one the keeper resurrects on top of the choice somebody just made. Being
+        told directly closes that window and, more importantly, makes the intent explicit rather
+        than emergent: this is the one method whose existence says "a person outranks the
+        reconciler".
+
+        ``is_configured`` is decided by the caller rather than re-derived here, because the question
+        "is this the configured speaker" has two spellings — an id or a case-folded name — and
+        :func:`tunebox.api.remote.configured_output` is already the one place that knows the
+        precedence between them. Choosing the configured speaker is the same statement in the other
+        direction, so it *sets* ``_wanted``: otherwise re-selecting the soundbar by hand would leave
+        the keeper believing it should be off, and the next power-cycle would lose it.
+        """
+        with self._lock:
+            self._wanted = bool(is_configured)
+            # Not away: we have just had a successful conversation with the daemon about it.
+            self._away = False
+            log.info(
+                "output %s chosen from the remote; keeper will %s the configured speaker",
+                output_id,
+                "keep asserting" if is_configured else "leave alone",
+            )
+
     def _note_away(self, message: str, exc: Exception) -> None:
         """Record that the output is out of sight, without deciding *why*.
 

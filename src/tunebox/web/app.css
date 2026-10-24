@@ -385,6 +385,69 @@ form.card {
   margin: 0;
 }
 
+/*
+ * The device selector: where the music comes out.
+ *
+ * A native <select>, so a phone gets the OS's own picker — a better target than anything drawable
+ * here, and it scales to the four outputs this household actually has rather than the two the first
+ * version of this control assumed.
+ */
+.device {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.device p {
+  margin: 0;
+}
+
+.device label {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.device select {
+  width: 100%;
+  min-height: var(--tap);
+  padding: 0 0.6rem;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.device-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.device-actions button {
+  flex: 1;
+  font-size: 0.9rem;
+}
+
+/*
+ * The audio element is the audio path in local mode and has no business taking up space: the
+ * transport above it is the control, and `display: none` would stop some browsers from playing it
+ * at all, so it is laid out at zero size instead.
+ */
+#local-audio {
+  width: 0;
+  height: 0;
+  position: absolute;
+  left: -9999px;
+}
+
+/* A control that cannot do anything has to look like it — see `canSetVolume` in app.js. */
+button:disabled,
+input:disabled,
+select:disabled,
+option:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* -------------------------------------------------------------------- lists */
 
 .list {

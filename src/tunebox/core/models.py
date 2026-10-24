@@ -87,8 +87,10 @@ class Progress:
 class Output:
     """One speaker the player daemon can send audio to (PLAN.md Phase 3).
 
-    ``type`` is the daemon's own word for the transport — on this household's hardware the only
-    one that matters is ``Chromecast``, because the SN9YG offers no AirPlay (PLAN.md 3.1).
+    ``type`` is the daemon's own word for the transport. Phase 3 only had to care about
+    ``Chromecast``, because the household's soundbar offers no AirPlay — but the device selector
+    lists everything the daemon can see, and on this network that is two Chromecasts *and* two
+    AirPlay 2 devices, which fail in entirely different ways. Hence :attr:`needs_pairing`.
     """
 
     id: str
@@ -99,10 +101,27 @@ class Output:
     #: Cast devices never ask for this, but AirPlay 2 does, and a speaker stuck waiting for a PIN
     #: looks exactly like one that refuses to play. Surfaced so the CLI can say which it is.
     needs_auth_key: bool = False
+    #: The daemon has established that this output wants a PIN or a password. **Discovered rather
+    #: than known**: measured against OwnTone 29.3 on 2026-10-24, a Mac advertising itself as an
+    #: AirPlay receiver reported ``requires_auth: false`` until the first enable attempt failed, and
+    #: ``true`` from then on. So this being false is not a promise that a speaker will work; this
+    #: being true is a promise that it will not, until somebody pairs it.
+    requires_auth: bool = False
 
     @property
     def is_cast(self) -> bool:
         return self.type.lower() in ("chromecast", "cast")
+
+    @property
+    def needs_pairing(self) -> bool:
+        """Will this output refuse to start until somebody enters a PIN or a password?
+
+        The distinction worth having, because the fix is completely different from the one for every
+        other selection failure: retrying cannot help, and nothing tunebox does can help either —
+        the pairing happens in OwnTone's own web UI (``POST /api/outputs/{id}/verification``), which
+        is deliberately not proxied here (PLAN.md 3.2).
+        """
+        return self.requires_auth or self.needs_auth_key
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -112,6 +131,7 @@ class Output:
             "selected": self.selected,
             "volume": self.volume,
             "needs_auth_key": self.needs_auth_key,
+            "requires_auth": self.requires_auth,
         }
 
 

@@ -34,6 +34,7 @@ from ..errors import (
     ConfigError,
     InvalidURLError,
     LibraryError,
+    OutputNeedsPairing,
     OutputNotFound,
     OutputUnreachable,
     PlayerError,
@@ -51,7 +52,7 @@ from ..player.owntone import OwnTonePlayer
 from ..player.selection import OutputKeeper
 from ..sources.ytdlp import YtDlpSource
 from ..tagging import write_tags
-from . import ui
+from . import media, ui
 from .auth import TokenAuthMiddleware
 from .playlists import router as playlists_router
 from .remote import router as remote_router
@@ -124,16 +125,27 @@ def create_app(
     # Phase 4. Built before the middleware so that a wheel with no assets in it fails here, with the
     # missing filename, rather than on a phone in a kitchen.
     ui_router = ui.create_ui_router(config) if config.ui_enabled else None
+    # Phase 7: the phone as an output. The exemption and the routes are installed together or not at
+    # all — ``TUNEBOX_LOCAL_PLAYBACK=0`` must leave no token-free way to read audio, not merely a
+    # route that 404s.
+    media_router = media.create_media_router(token) if config.local_playback else None
+    if media_router is not None:
+        app.state.media_key = media.media_key(token)
     app.add_middleware(
         TokenAuthMiddleware,
         token=token,
         exempt_paths=ui.exempt_paths() if ui_router is not None else (),
-        exempt_prefixes=ui.exempt_prefixes() if ui_router is not None else (),
+        exempt_prefixes=(
+            (ui.exempt_prefixes() if ui_router is not None else ())
+            + (media.exempt_prefixes() if media_router is not None else ())
+        ),
     )
     _install_error_handlers(app)
     app.include_router(router)
     app.include_router(remote_router)
     app.include_router(playlists_router)
+    if media_router is not None:
+        app.include_router(media_router)
     if ui_router is not None:
         # Last, so a hand-written asset path can never shadow an API route: FastAPI matches in
         # registration order, and the API is the part that must not move.
@@ -174,6 +186,14 @@ def _install_error_handlers(app: FastAPI) -> None:
     async def _no_output(request: Request, exc: OutputNotFound) -> JSONResponse:
         # A genuinely missing resource: an unplugged soundbar is not on the network to be found.
         return error(404, str(exc))
+
+    @app.exception_handler(OutputNeedsPairing)
+    async def _output_needs_pairing(request: Request, exc: OutputNeedsPairing) -> JSONResponse:
+        # 409 rather than 503: the request is well formed and the speaker is right there, and what
+        # stands in the way is state the caller must change elsewhere first. 503 would mean "try
+        # again", which is the one piece of advice that can never work here — see the class.
+        log.info("output needs pairing: %s", exc)
+        return error(409, str(exc))
 
     @app.exception_handler(OutputUnreachable)
     async def _output_asleep(request: Request, exc: OutputUnreachable) -> JSONResponse:

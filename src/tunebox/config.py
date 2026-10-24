@@ -94,6 +94,19 @@ DEFAULT_LIBRARY_MAX_FILES = 50_000
 #: daemon ever indexed. Hence the validation in :meth:`Config.__post_init__`.
 DEFAULT_PLAYLISTS_DIRNAME = "Playlists"
 
+#: How long a media capability URL stays valid, in seconds. Six hours.
+#:
+#: The number is a trade between two concrete things. A ticket is spent by ``<audio src>``, so it has
+#: to outlive the gap between "the queue was built" and "the ninth track starts" — an evening, not a
+#: minute — and a page that had to re-mint mid-queue would stall between tracks on a phone whose
+#: screen is off. Against that, the URL appears in uvicorn's access log, so its lifetime is how long
+#: that log line is worth anything to somebody who can read it. Six hours is longer than any queue
+#: this household builds and shorter than the gap to the next time anyone is in the room.
+#:
+#: It is not a session: nothing is remembered, so this is also the longest a *deleted* track's URL
+#: could keep working — except that it cannot, because the path is re-resolved on every request.
+DEFAULT_MEDIA_TICKET_TTL = 6 * 60 * 60.0
+
 # ------------------------------------------------------------------ Phase 5: hardening
 
 #: The canary video. "Me at the zoo" — the first video ever uploaded to YouTube, 19 seconds long.
@@ -209,6 +222,28 @@ def _env_bool(env: Mapping[str, str], key: str, default: bool = False) -> bool:
     if value in ("0", "false", "no", "off"):
         return False
     raise ConfigError(f"{key} must be a boolean (1/0, true/false), got {raw!r}")
+
+
+def _output_allow(env: Mapping[str, str]) -> tuple[str, ...]:
+    """Parse ``TUNEBOX_OUTPUT_ALLOW`` — the speakers the remote may switch to.
+
+    Comma-separated, each entry an output **id or name**, matched case-insensitively. Empty (the
+    default) means no restriction.
+
+    Why this exists at all: OwnTone lists every Cast and AirPlay device it can see over mDNS, and
+    mDNS does not stop at the front door — a neighbour's Chromecast is in that list. For as long as
+    tunebox only ever selected the one configured speaker that did not matter, but the device
+    selector is a list of everything the daemon can see, so "the remote must not control devices
+    that are not ours" needs a way to be *said* rather than merely hoped for.
+
+    Comma-separated, which cannot express a name containing a comma — and the fix for that is the
+    same one :attr:`Config.output_id` already exists for: use the id, which is stable anyway, where
+    a name is whatever somebody last typed into the Google Home app.
+    """
+    raw = env.get("TUNEBOX_OUTPUT_ALLOW")
+    if raw is None:
+        return ()
+    return tuple(entry.strip() for entry in raw.split(",") if entry.strip())
 
 
 #: Spellings of "I have thought about backups and do not want one". Accepted as values of
@@ -336,6 +371,11 @@ class Config:
     #: the first connection, so one attempt is a button that fails for a reason that has already
     #: gone away by the time somebody reads the error.
     output_select_attempts: int = DEFAULT_OUTPUT_SELECT_ATTEMPTS
+    #: Which speakers the remote's device selector may switch to, as ids or names. Empty means
+    #: every output the daemon can see — see :func:`_output_allow` for why that default is a
+    #: deliberate choice rather than an oversight, and why a household with a neighbour in the list
+    #: should set this.
+    output_allow: tuple[str, ...] = ()
     #: Trigger a library rescan after each successful ingest (PLAN.md Phase 3). On by default; it
     #: is the whole reason a freshly ingested track is playable without waiting for a periodic
     #: scan.
@@ -360,6 +400,21 @@ class Config:
     #: checks containment before it joins anything, and a convenience accessor that skipped those
     #: steps would be a second answer to "where are the playlists" that could disagree with the first.
     playlists_dirname: str = DEFAULT_PLAYLISTS_DIRNAME
+
+    # ----------------------------------------- Phase 7: the phone as an output
+    #: Let the remote play library audio through the browser it is running in — "This phone" in the
+    #: output picker, instead of the house speaker.
+    #:
+    #: On by default, and it is the one setting here that *adds* an unauthenticated route, so the
+    #: reasoning is worth having in one place. ``<audio src>`` is a request the browser makes and a
+    #: page cannot put a header on it, so ``/media/{ticket}`` is reached with a signed capability URL
+    #: rather than the shared token (:mod:`tunebox.core.tickets`). Turning this off removes the
+    #: ``/media/`` routes **and** their auth exemption, exactly as ``TUNEBOX_UI=0`` does for the
+    #: shell — so a household that only ever plays on the soundbar can have a service with no
+    #: token-free way to read a byte of audio.
+    local_playback: bool = True
+    #: Lifetime of a media capability URL, in seconds. See :data:`DEFAULT_MEDIA_TICKET_TTL`.
+    media_ticket_ttl: float = DEFAULT_MEDIA_TICKET_TTL
 
     # ------------------------------------------------ Phase 5: keeping it alive
     #: The video the canary ingest downloads. See :data:`DEFAULT_CANARY_URL` for why this one.
@@ -432,6 +487,14 @@ class Config:
             raise ConfigError(f"output volume must be 0-100, got {self.output_volume}")
         if self.library_max_files < 1:
             raise ConfigError(f"library max files must be at least 1, got {self.library_max_files}")
+        if self.media_ticket_ttl <= 0:
+            # Zero is not "no streaming" — it is a ticket that has already expired when it is
+            # handed over, so every track would fail with a 403 that looked like a bug. Saying no is
+            # the kinder answer; TUNEBOX_LOCAL_PLAYBACK=0 is how the feature is switched off.
+            raise ConfigError(
+                f"media ticket ttl must be positive, got {self.media_ticket_ttl} "
+                "(set TUNEBOX_LOCAL_PLAYBACK=0 to turn phone playback off instead)"
+            )
         playlists = self.playlists_dirname.strip()
         if not playlists or playlists in (".", ".."):
             raise ConfigError("playlists directory must be a name, not empty")
@@ -484,6 +547,31 @@ class Config:
     def player_base_url(self) -> str:
         """The daemon's base URL without a trailing slash, so joining a path is unambiguous."""
         return self.player_url.rstrip("/")
+
+    def allows_output(self, output_id: str, output_name: str) -> bool:
+        """May the remote switch playback to this output?
+
+        ``True`` for everything when :attr:`output_allow` is empty, which is the default and keeps
+        every existing installation working. Otherwise the id or the name must be listed — id *or*
+        name rather than id-and-name, because the two are different kinds of answer: an id is what a
+        careful configuration carries, a name is what somebody can read off the speaker.
+
+        The configured output is **always** allowed, even if somebody writes an allowlist that
+        forgets it. Otherwise ``TUNEBOX_OUTPUT`` and ``TUNEBOX_OUTPUT_ALLOW`` could disagree, and
+        the way that would show up is the output keeper selecting a speaker the remote then refuses
+        to show as selectable — a contradiction in the one part of this system that is supposed to
+        need no attention.
+        """
+        if not self.output_allow:
+            return True
+        if self.output_id and output_id == self.output_id:
+            return True
+        folded = {entry.casefold() for entry in self.output_allow}
+        if output_id.strip().casefold() in folded:
+            return True
+        if output_name.strip().casefold() in folded:
+            return True
+        return output_name.strip().casefold() == self.output_name.strip().casefold()
 
     @property
     def player_port(self) -> int:
@@ -643,6 +731,7 @@ class Config:
             output_select_attempts=_env_int(
                 env, "TUNEBOX_OUTPUT_SELECT_ATTEMPTS", DEFAULT_OUTPUT_SELECT_ATTEMPTS
             ),
+            output_allow=_output_allow(env),
             rescan_after_ingest=_env_bool(env, "TUNEBOX_RESCAN_AFTER_INGEST", True),
             ui_enabled=_env_bool(env, "TUNEBOX_UI", True),
             owntone_ui_url=(env.get("TUNEBOX_OWNTONE_UI") or "").strip() or None,
@@ -651,6 +740,10 @@ class Config:
             ),
             playlists_dirname=(env.get("TUNEBOX_PLAYLISTS_DIR") or "").strip()
             or DEFAULT_PLAYLISTS_DIRNAME,
+            local_playback=_env_bool(env, "TUNEBOX_LOCAL_PLAYBACK", True),
+            media_ticket_ttl=_env_float(
+                env, "TUNEBOX_MEDIA_TICKET_TTL", DEFAULT_MEDIA_TICKET_TTL
+            ),
             canary_url=(env.get("TUNEBOX_CANARY_URL") or DEFAULT_CANARY_URL).strip(),
             ytdlp_channel=(env.get("TUNEBOX_YTDLP_CHANNEL") or "stable").strip().lower(),
             auto_update=_env_bool(env, "TUNEBOX_AUTO_UPDATE", True),

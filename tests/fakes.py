@@ -168,6 +168,14 @@ class FakePlayer:
     #: Raised by :meth:`rescan` when set, so the "a rescan failure is not an ingest failure" rule
     #: can be tested rather than asserted in a docstring.
     rescan_error: Exception | None = None
+    #: Extra outputs beyond the configured one, so the device selector can be tested against a
+    #: household that has more than one speaker — which is what this one turned out to have: two
+    #: Chromecasts and two AirPlay devices (measured 2026-10-24).
+    others: list[Output] = field(default_factory=list)
+    #: Which of :attr:`others` are currently enabled. A set rather than a flag on each ``Output``
+    #: because ``Output`` is immutable, and rebuilding the list on every read is what keeps the
+    #: fake's answer and its state from drifting apart.
+    selected_others: set[str] = field(default_factory=set)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     # ----------------------------------------------------------------- plumbing
@@ -179,6 +187,8 @@ class FakePlayer:
     def _outputs(self) -> list[Output]:
         if not self.present:
             return []
+        import dataclasses
+
         return [
             Output(
                 id=self.output_id,
@@ -186,7 +196,11 @@ class FakePlayer:
                 type=self.output_type,
                 selected=self.selected,
                 volume=self.volume,
-            )
+            ),
+            *(
+                dataclasses.replace(other, selected=other.id in self.selected_others)
+                for other in self.others
+            ),
         ]
 
     # ------------------------------------------------------------------- status
@@ -230,13 +244,37 @@ class FakePlayer:
             raise PlayerUnavailable("the speaker went away between listing and selecting")
         with self._lock:
             self.selections.append((output_id, volume))
-            self.selected = True
+            if any(other.id == output_id for other in self.others):
+                self.selected_others.add(output_id)
+            else:
+                # The configured output, or — for the many tests that pass an id they never
+                # registered — whatever was asked for. Lenient on purpose: this fake predates
+                # having more than one output, and tightening it here would fail a dozen tests
+                # about something else entirely.
+                self.selected = True
             if volume is not None:
                 self.volume = volume
 
     def deselect_output(self, output_id: str) -> None:
         self._guard()
+        if output_id in self.selected_others:
+            self.selected_others.discard(output_id)
+            return
         self.selected = False
+
+    def select_only(self, output_id: str, *, volume: int | None = None) -> list[str]:
+        """Select one output and switch the rest off — the real adapter's ordering, kept.
+
+        Target first, then the others, so a failing enable leaves the previous speaker playing.
+        """
+        self.select_output(output_id, volume=volume)
+        turned_off: list[str] = []
+        for output in self._outputs():
+            if output.id == output_id or not output.selected:
+                continue
+            self.deselect_output(output.id)
+            turned_off.append(output.id)
+        return turned_off
 
     def set_volume(self, volume: int, *, output_id: str | None = None) -> None:
         self._guard()

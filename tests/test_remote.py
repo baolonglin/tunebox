@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 
 from tunebox import library
 from tunebox.config import Config
+from tunebox.core.models import Output
 from tunebox.errors import OutputUnreachable
 from tunebox.jobs.store import JobStore
 
@@ -98,6 +99,7 @@ ROUTES = (
     ("PUT", "/player/seek"),
     ("PUT", "/player/repeat"),
     ("PUT", "/player/shuffle"),
+    ("PUT", "/player/output"),
     ("PUT", "/player/output/select"),
     ("GET", "/player/queue"),
     ("POST", "/player/queue"),
@@ -382,8 +384,11 @@ class TestOutputSelection:
         assert player.selections == [(player.output_id, None)]
 
     def test_no_id_is_taken_from_the_caller(self, client: TestClient):
-        """Accepting one would let the remote enable a *neighbour's* Cast device, which is reachable
-        from a home network and is nobody's idea of a feature."""
+        """This route still takes none, and that is now a division of labour rather than the whole
+        policy: it is the "enable the speaker this installation is configured for" button, which is
+        what the output keeper and the remote's *wake* button want. Choosing *which* speaker is
+        ``PUT /player/output`` below, where the id is checked against the daemon's live list and
+        against ``TUNEBOX_OUTPUT_ALLOW``."""
         assert client.put("/player/output/select", headers=AUTH, json={"output_id": "x"}).status_code in (
             200,
             422,
@@ -412,6 +417,221 @@ class TestOutputSelection:
         assert response.status_code == 503
         assert "<html>" not in response.json()["error"]
         assert "try again in a moment" in response.json()["error"]
+
+
+class TestChoosingADevice:
+    """``PUT /player/output`` — the route behind the remote's device selector.
+
+    It is a deliberate softening of the posture ``/player/output/select`` was written with, so these
+    tests are mostly about the two things kept in place of the original flat refusal: the id must be
+    one the daemon is currently reporting, and it must pass the allowlist. The third property is
+    exclusivity, which is what makes a single-choice selector mean what it says.
+
+    The extra outputs here are the ones a real OwnTone reported on this host (two Chromecast, two
+    AirPlay 2, measured 2026-10-24) — this household has four, which is why a two-button control was
+    the wrong shape in the first place.
+    """
+
+    KITCHEN = Output(id="55267078216198", name="MacBook Pro", type="AirPlay 2")
+    TV = Output(id="2345877078", name="Living Room TV", type="Chromecast")
+
+    @pytest.fixture
+    def player(self) -> FakePlayer:
+        return FakePlayer(others=[self.KITCHEN, self.TV])
+
+    def test_it_switches_playback_to_the_named_output(
+        self, client: TestClient, player: FakePlayer
+    ):
+        body = client.put("/player/output", headers=AUTH, json={"id": self.TV.id}).json()
+        assert self.TV.id in player.selected_others
+        assert any(output["id"] == self.TV.id and output["selected"] for output in body["outputs"])
+
+    def test_it_switches_the_others_off(self, client: TestClient, player: FakePlayer):
+        """What a single-choice selector means. The adapter's ``select_output`` deliberately does
+        *not* do this — it is the keeper's primitive, which asserts one speaker and has no opinion
+        about the rest — so ``select_only`` exists for the question a person asked."""
+        player.selected = True
+        client.put("/player/output", headers=AUTH, json={"id": self.TV.id})
+        assert player.selected is False, "the previously selected speaker was switched off"
+        assert player.selected_others == {self.TV.id}
+
+    def test_the_target_is_enabled_before_the_others_are_switched_off(
+        self, client: TestClient, player: FakePlayer
+    ):
+        """Ordering, and it is the difference between a failed handoff and a silent house: a speaker
+        that refuses to wake must leave the one that was working still playing."""
+        player.selected = True
+        player.select_error = OutputUnreachable("the TV will not come up")
+        assert client.put("/player/output", headers=AUTH, json={"id": self.TV.id}).status_code == 503
+        assert player.selected is True, "the working speaker must not be switched off on a failure"
+
+    def test_an_id_the_daemon_does_not_report_is_404(self, client: TestClient):
+        """Raised here, never forwarded. Beyond tidiness: OwnTone answers an unknown id and a
+        speaker that will not wake with the same ``400`` and the same HTML body, so without this
+        check "you typed that wrong" and "the soundbar is asleep" would be one error."""
+        response = client.put("/player/output", headers=AUTH, json={"id": "999999"})
+        assert response.status_code == 404
+        assert "999999" in response.json()["error"]
+
+    def test_the_404_says_what_is_visible_instead(self, client: TestClient):
+        response = client.put("/player/output", headers=AUTH, json={"id": "nope"})
+        assert SOUNDBAR in response.json()["error"]
+
+    def test_nothing_is_selected_when_the_id_is_refused(
+        self, client: TestClient, player: FakePlayer
+    ):
+        client.put("/player/output", headers=AUTH, json={"id": "999999"})
+        assert player.selections == []
+
+    @pytest.mark.parametrize("body", [{}, {"id": ""}, {"id": 7}, {"output_id": "1"}, {"id": "1", "volume": 5}])
+    def test_a_malformed_body_is_422(self, client: TestClient, body):
+        assert client.put("/player/output", headers=AUTH, json=body).status_code == 422
+
+    def test_a_dead_daemon_is_503(self, client: TestClient, player: FakePlayer):
+        player.unavailable = True
+        assert client.put("/player/output", headers=AUTH, json={"id": self.TV.id}).status_code == 503
+
+
+class TestTheOutputAllowlist:
+    """``TUNEBOX_OUTPUT_ALLOW`` — what turns "the remote must not control other people's devices"
+    from an intention into a rule.
+
+    It exists because mDNS does not stop at the front door: OwnTone lists a neighbour's Chromecast
+    exactly like your own, and the device selector is a list of everything the daemon can see. Empty
+    by default, because every installation that predates the selector has one speaker and a default
+    that broke them would be the wrong answer.
+    """
+
+    NEIGHBOUR = Output(id="900900900", name="Nextdoor Nest Mini", type="Chromecast")
+
+    @pytest.fixture
+    def player(self) -> FakePlayer:
+        return FakePlayer(others=[self.NEIGHBOUR])
+
+    @pytest.fixture
+    def config(self, config: Config) -> Config:
+        return replace(config, output_allow=(SOUNDBAR,))
+
+    def test_an_output_outside_the_allowlist_cannot_be_chosen(
+        self, client: TestClient, player: FakePlayer
+    ):
+        response = client.put("/player/output", headers=AUTH, json={"id": self.NEIGHBOUR.id})
+        assert response.status_code == 403
+        assert "Nextdoor Nest Mini" in response.json()["error"]
+        assert player.selections == []
+
+    def test_it_is_403_rather_than_404(self, client: TestClient):
+        """Pretending it does not exist would be a lie the UI can already disprove: ``GET /player``
+        lists it with ``selectable: false``, which is how the selector greys it out."""
+        assert (
+            client.put("/player/output", headers=AUTH, json={"id": self.NEIGHBOUR.id}).status_code
+            == 403
+        )
+
+    def test_the_allowed_speaker_still_works(self, client: TestClient, player: FakePlayer):
+        assert (
+            client.put("/player/output", headers=AUTH, json={"id": player.output_id}).status_code
+            == 200
+        )
+
+    def test_get_player_says_which_outputs_are_selectable(self, client: TestClient):
+        """Computed on this side of the wire, so the selector greys out exactly what the route would
+        refuse rather than offering it and reporting a 403 after the tap."""
+        outputs = {o["name"]: o["selectable"] for o in client.get("/player", headers=AUTH).json()["outputs"]}
+        assert outputs[SOUNDBAR] is True
+        assert outputs["Nextdoor Nest Mini"] is False
+
+    def test_everything_is_selectable_when_the_allowlist_is_empty(
+        self, client: TestClient, config: Config, store: JobStore, player: FakePlayer
+    ):
+        app = create_app(
+            replace(config, output_allow=()),
+            store=store,
+            source=FakeSource(),
+            tag_writer=RecordingTagWriter(),
+            run_worker=False,
+            player=player,
+            keep_output=False,
+        )
+        with TestClient(app) as unrestricted:
+            outputs = unrestricted.get("/player", headers=AUTH).json()["outputs"]
+            assert all(output["selectable"] for output in outputs)
+
+    def test_the_configured_speaker_is_allowed_even_if_the_list_forgets_it(
+        self, client: TestClient, config: Config, store: JobStore, player: FakePlayer
+    ):
+        """Otherwise ``TUNEBOX_OUTPUT`` and ``TUNEBOX_OUTPUT_ALLOW`` could disagree, and the way that
+        would surface is the output keeper selecting a speaker the remote then refuses to show as
+        selectable — a contradiction in the one part of this system meant to need no attention."""
+        app = create_app(
+            replace(config, output_allow=("Some other room",)),
+            store=store,
+            source=FakeSource(),
+            tag_writer=RecordingTagWriter(),
+            run_worker=False,
+            player=player,
+            keep_output=False,
+        )
+        with TestClient(app) as client2:
+            assert (
+                client2.put("/player/output", headers=AUTH, json={"id": player.output_id}).status_code
+                == 200
+            )
+
+
+class TestASpeakerThatWantsAPin:
+    """An AirPlay output that will not play until somebody pairs it — found in use, not by design.
+
+    Selecting a Mac advertising itself as an AirPlay receiver came back as ``OutputUnreachable``,
+    whose message is Cast prose ending in "try again in a moment". The daemon's own log said
+    otherwise, in as many words (OwnTone 29.3, 2026-10-24): *"The AirPlay 2 device 'MacBook Pro'
+    requires a valid PIN or password"*, after the receiver answered ``403 Forbidden`` to PIN start.
+    Retrying that forever is the one thing that cannot work, which is why it has its own status code
+    and its own sentence.
+    """
+
+    MAC = Output(
+        id="55267078216198", name="MacBook Pro", type="AirPlay 2", requires_auth=True
+    )
+
+    @pytest.fixture
+    def player(self) -> FakePlayer:
+        return FakePlayer(others=[self.MAC])
+
+    def test_choosing_it_is_409_not_503(self, client: TestClient):
+        """``503`` means "try again", which is exactly the advice that cannot help. ``409`` says the
+        request was fine and some state has to change first — elsewhere, in OwnTone's own UI."""
+        response = client.put("/player/output", headers=AUTH, json={"id": self.MAC.id})
+        assert response.status_code == 409
+
+    def test_the_message_names_the_speaker_and_the_actual_fix(self, client: TestClient):
+        error = client.put("/player/output", headers=AUTH, json={"id": self.MAC.id}).json()["error"]
+        assert "MacBook Pro" in error
+        assert "PIN" in error
+        assert "web interface" in error, "say where the pairing happens"
+        assert "try again" not in error.lower()
+        assert "Cast" not in error, "the cause this used to assert, wrongly"
+
+    def test_it_is_not_even_attempted(self, client: TestClient, player: FakePlayer):
+        """Once the daemon has told us, a tap must not cost four seconds of retrying to rediscover
+        it. The adapter raises the same error when it *finds out* mid-attempt; this is the cheap
+        path from the second tap onwards."""
+        client.put("/player/output", headers=AUTH, json={"id": self.MAC.id})
+        assert player.selections == []
+
+    def test_get_player_flags_it_so_the_selector_can_grey_it_out(self, client: TestClient):
+        """Rather than offering it and reporting a 409 after the tap — the same rule the allowlist
+        follows. ``needs_pairing`` folds OwnTone's two spellings into the one the UI needs."""
+        outputs = {o["name"]: o for o in client.get("/player", headers=AUTH).json()["outputs"]}
+        assert outputs["MacBook Pro"]["needs_pairing"] is True
+        assert outputs["MacBook Pro"]["requires_auth"] is True
+        assert outputs[SOUNDBAR]["needs_pairing"] is False
+
+    def test_a_working_speaker_is_unaffected(self, client: TestClient, player: FakePlayer):
+        assert (
+            client.put("/player/output", headers=AUTH, json={"id": player.output_id}).status_code
+            == 200
+        )
 
 
 class TestPlayingIntoNothing:

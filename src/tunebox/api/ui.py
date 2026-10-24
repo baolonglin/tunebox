@@ -28,11 +28,12 @@ so blocking a native submission costs nothing, and it means a broken script cann
 token into a URL — and therefore into uvicorn's access log — by falling back to a GET of the
 enclosing page.
 
-**Templated once, at startup.** Four placeholders are substituted — the version (displayed in the
-footer), the **build id** (which busts the phone's cache and names the service worker's cache) and
-two facts about where OwnTone's own web UI can be found. Doing it when the app is built rather than
-per request means the shell costs one dictionary lookup to serve, which is what a Raspberry Pi
-should spend on a static file.
+**Templated once, at startup.** Five placeholders are substituted — the version (displayed in the
+footer), the **build id** (which busts the phone's cache and names the service worker's cache), two
+facts about where OwnTone's own web UI can be found, and whether this host offers the phone itself as
+an output (``TUNEBOX_LOCAL_PLAYBACK``). Doing it when the app is built rather than per request means
+the shell costs one dictionary lookup to serve, which is what a Raspberry Pi should spend on a static
+file.
 
 **The build id is a digest of the assets, not the version** — see :func:`build_id`. The version is
 what a release is called; the build id is what the *bytes* are, and the phone's cache has to be keyed
@@ -115,6 +116,10 @@ _SECURITY_HEADERS = {
             "script-src 'self'",
             "style-src 'self'",
             "img-src 'self'",
+            # Phase 7: the phone as an output. `<audio src="/media/…">` is same-origin, so this is
+            # the narrowest directive that permits it — and without it `default-src 'none'` blocks
+            # the element silently, with the audio element reporting only a generic decode error.
+            "media-src 'self'",
             "connect-src 'self'",
             "manifest-src 'self'",
             "base-uri 'none'",
@@ -174,6 +179,11 @@ def _substitutions(config: Config) -> dict[str, str]:
         # only the browser knows. See Config.owntone_ui_link.
         "__OWNTONE_URL__": config.owntone_ui_link,
         "__PLAYER_PORT__": str(config.player_port),
+        # Whether the output picker offers "This phone" at all. Decided here rather than discovered
+        # by the page probing ``/media/`` for a 404: a feature that is switched off should not be
+        # something the UI has to go and find out about, and a `data-` attribute is already how the
+        # other two server facts reach the script (there is no inline script — see the CSP above).
+        "__LOCAL_PLAYBACK__": "1" if config.local_playback else "0",
     }
 
 

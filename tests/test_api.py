@@ -59,6 +59,7 @@ ROUTES = (
     ("PUT", "/player/seek", "/player/seek"),
     ("PUT", "/player/repeat", "/player/repeat"),
     ("PUT", "/player/shuffle", "/player/shuffle"),
+    ("PUT", "/player/output", "/player/output"),
     ("PUT", "/player/output/select", "/player/output/select"),
     ("GET", "/player/queue", "/player/queue"),
     ("POST", "/player/queue", "/player/queue"),
@@ -75,7 +76,17 @@ ROUTES = (
     ("DELETE", "/playlists/{name}/tracks", "/playlists/x/tracks"),
     ("PUT", "/playlists/{name}/tracks/{position}", "/playlists/x/tracks/0"),
     ("PUT", "/playlists/{name}/play", "/playlists/x/play"),
+    # The phone as an output. The *minting* route is behind the token like everything else, which is
+    # the half of that feature's design this matrix exists to pin down: it lives under ``/library/``
+    # precisely because ``/media/`` is the exempt prefix, and a route that hands out capability URLs
+    # must never be inside it. Behaviour lives in ``tests/test_media.py``.
+    ("POST", "/library/tickets", "/library/tickets"),
 )
+
+#: Served without the token because ``<audio src>`` is a request the browser makes and a page
+#: cannot put a header on it. The ticket in the path *is* the credential — signed, expiring and
+#: scoped to one file (see ``tunebox/core/tickets.py``). Held to account in ``tests/test_media.py``.
+MEDIA_ROUTES = ("/media/{ticket}",)
 
 #: Added by FastAPI itself, outside our router — and therefore the reason auth is middleware.
 DOC_ROUTES = ("/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc")
@@ -268,21 +279,32 @@ class TestAuth:
 
     def test_the_auth_matrix_covers_every_route(self, app):
         registered = {route.path for route in app.routes}
-        considered = {template for _, template, _ in ROUTES} | set(DOC_ROUTES) | set(SHELL_ROUTES)
+        considered = (
+            {template for _, template, _ in ROUTES}
+            | set(DOC_ROUTES)
+            | set(SHELL_ROUTES)
+            | set(MEDIA_ROUTES)
+        )
         assert registered <= considered, "a new route needs an entry in ROUTES"
 
-    def test_only_the_shell_is_exempt(self, app):
+    def test_only_the_shell_and_the_media_capability_are_exempt(self, app):
         """The exemption list is small, deliberate, and worth failing a test over: it is the one
-        hole PLAN.md 3.2's "checked on *every* route" has ever had."""
-        from tunebox.api import ui
+        hole PLAN.md 3.2's "checked on *every* route" has ever had.
+
+        There are now two exemptions rather than one, and they are different shapes. The shell is a
+        set of *exact paths* carrying no data. ``/media/`` is a *prefix*, because the credential is
+        in the path — and it is the thing ``exempt_prefixes`` was reserved for in Phase 3."""
+        from tunebox.api import media, ui
 
         exempt = set(ui.exempt_paths())
         assert exempt == {"/", "/sw.js", "/manifest.webmanifest"}
         assert ui.exempt_prefixes() == ("/ui/",)
+        assert media.exempt_prefixes() == ("/media/",)
+        prefixes = ui.exempt_prefixes() + media.exempt_prefixes()
         api_paths = {template for _, template, _ in ROUTES}
         for path in api_paths:
             assert path not in exempt
-            assert not any(path.startswith(prefix) for prefix in ui.exempt_prefixes())
+            assert not any(path.startswith(prefix) for prefix in prefixes)
 
     def test_serving_without_a_token_is_refused(self, tmp_path: Path):
         config = Config(music_root=tmp_path, db_path=tmp_path / "jobs.db", api_token=None)

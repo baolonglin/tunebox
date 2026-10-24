@@ -16,6 +16,12 @@
  *    and the soundbar's remote all touching it — optimistic local state would be wrong regularly
  *    and confusingly rather than rarely.
  *
+ *    **The one exception is the phone-as-output mode**, and it is an exception because the premise
+ *    is reversed: when "This phone" is the output, this page *is* the player, so there is no server
+ *    state to be the truth. The queue, the transport and the modes are held in `state.local` and
+ *    the only thing asked of the server is a URL for one file. The two halves never share a queue —
+ *    see the "the phone as an output" section for why mirroring them would be worse than not.
+ *
  * 3. **Polling stops when the page is hidden.** A phone in a pocket must not spend its battery
  *    asking about a track it is not showing. The Page Visibility API is how a web remote gets to be
  *    nearly free when idle, and it is also why there is no websocket here: the data is two small
@@ -29,6 +35,21 @@
   const TOKEN_KEY = "tunebox.token";
   const POLL_MS = 2000;
 
+  /**
+   * Whether this host offers the phone itself as an output (TUNEBOX_LOCAL_PLAYBACK).
+   *
+   * Read from the server-templated attribute rather than probed, so a host that has the feature off
+   * never draws a picker. See the `data-local-playback` comment in index.html.
+   */
+  const LOCAL_PLAYBACK = CONST.localPlayback === "1";
+
+  /** Which device this remote last chose. Per device, which is the only scope that makes sense. */
+  const OUTPUT_KEY = "tunebox.output";
+  /** This device's own queue, so closing the app and reopening it does not lose the list. */
+  const LOCAL_QUEUE_KEY = "tunebox.local";
+  /** The value of `state.device` that means "play here, in this browser". */
+  const LOCAL_DEVICE = "local";
+
   /** Elements are looked up once: this page's DOM is static, only its contents change. */
   const el = (id) => document.getElementById(id);
 
@@ -36,8 +57,46 @@
     token: null,
     tab: "now",
     player: null,
+    /**
+     * Where this remote is sending audio: `"local"` (this browser is the audio path) or the id of
+     * one of the daemon's outputs.
+     *
+     * Per device and never sent to the server. That asymmetry is the heart of the design: a speaker
+     * is a shared thing, so its queue is the daemon's and anybody in the house may change it, while
+     * "I am listening on headphones" is nobody else's business and must not reach into what another
+     * phone is playing. One page, one selector, and a queue per device.
+     */
+    device: LOCAL_DEVICE,
+    /**
+     * The daemon's outputs, as last seen. Cached rather than read on demand because the selector
+     * needs them in *both* modes, and in this device's own mode nothing else polls `GET /player` —
+     * on a host with no OwnTone at all that poll would be a 503 in the banner every two seconds,
+     * underneath a screen that is playing music perfectly well.
+     */
+    outputs: [],
+    /**
+     * This device's own playback. See the "this device as an output" section.
+     *
+     * `queue` is the list as drawn; `order` is the order it is *played* in (identity, or a shuffle)
+     * and `cursor` indexes into `order`. Two arrays rather than shuffling `queue` itself, so turning
+     * shuffle off restores the order somebody built rather than leaving it scrambled.
+     */
+    local: {
+      queue: [],
+      order: [],
+      cursor: -1,
+      repeat: "off",
+      shuffle: false,
+      /** Set when a track will not load — a deleted file, or an expired ticket. */
+      error: null,
+    },
     /** What the queue was last drawn from, so an unchanged poll leaves its nodes (and focus) alone. */
     queueKey: null,
+    /**
+     * What the device selector was last drawn from. Same reason as `queueKey` and one more: a poll
+     * that rebuilt the `<option>` list would close the OS picker while somebody had it open.
+     */
+    deviceKey: null,
     /** Locally ticked between polls so the progress bar moves at one frame a second, not one per poll. */
     progressMs: 0,
     /** True while a volume drag is in flight, so a poll cannot yank the slider out from under a thumb. */
@@ -304,6 +363,10 @@
     // Up front rather than on the tab switch, because the *library* panel needs the names too: a
     // row's "add to playlist" must have something to offer the first time somebody opens one.
     loadPlaylists();
+    // The selector's contents, and the one chance to notice that the device this page was last
+    // pointed at is no longer there. Deliberately not awaited: a daemon that is down must not hold
+    // up a screen that can play perfectly well without it.
+    refreshDevices();
     return true;
   }
 
@@ -392,6 +455,18 @@
       el("vol").value = String(player.volume);
       el("vol-out").textContent = String(player.volume);
     }
+    // Volume is the one control that is not simply "the same thing, elsewhere": iOS refuses to let
+    // a page set an audio element's volume, silently, so in phone mode on an iPhone the slider has
+    // to be turned off and explained rather than left to move and do nothing. See `canSetVolume`.
+    const volumeUsable = !player.local || canSetVolume();
+    ["vol", "btn-volup", "btn-voldown"].forEach((id) => {
+      el(id).disabled = !volumeUsable;
+    });
+    const volumeNote = el("vol-note");
+    volumeNote.textContent = volumeUsable
+      ? ""
+      : "This browser will not let a page set the volume — use the phone's own volume buttons.";
+    volumeNote.hidden = volumeUsable;
 
     const mode = repeatMode(player);
     const repeat = el("btn-repeat");
@@ -404,32 +479,33 @@
     shuffle.textContent = player.shuffle ? "Shuffle on" : "Shuffle off";
     shuffle.setAttribute("aria-pressed", player.shuffle ? "true" : "false");
 
-    const speaker = el("speaker-state");
-    const select = el("btn-select");
-    if (!player.output) {
-      speaker.textContent = "Speaker: not visible on the network";
-      select.hidden = true;
-    } else if (player.output_selected) {
-      speaker.textContent = `Speaker: ${player.output.name} — on`;
-      select.hidden = true;
-    } else {
-      speaker.textContent = `Speaker: ${player.output.name} — off`;
-      select.hidden = false;
-    }
+    // The daemon's outputs are the selector's contents, so a house-mode poll refreshes them for
+    // free. In this device's own mode `localView` hands back the cached list instead.
+    if (!player.local && player.outputs) state.outputs = player.outputs;
+    renderDevices(player);
+    renderDeviceNote(player);
+    renderHandoff(player);
+
+    // "Turn the speaker on" — the one case the output keeper deliberately will not handle (a
+    // speaker somebody switched off on purpose). Only meaningful for the speaker this page is
+    // pointed at, so it is hidden in this device's own mode and when the speaker is already on.
+    const output = player.local ? null : currentOutput() || player.output;
+    el("btn-select").hidden = !output || output.selected;
 
     // Playing with nothing attached. Everything above this line — the title, the moving progress
     // bar, the ⏸ glyph — is true of the daemon's queue and a lie about the room, so the fact that
     // no audio exists anywhere has to be said outright rather than left to be inferred from a
     // "— off" at the end of a muted line. Measured: OwnTone keeps `state: play` and keeps counting
     // after `All selected speakers failed to start`.
+    //
+    // In this device's own mode the equivalent failure is a track that will not load, which
+    // `player.error` carries — the same place on screen, because it is the same question.
     const alert = el("speaker-alert");
-    if (player.playing_without_output) {
-      alert.textContent = "Playing, but no speaker is attached — nothing is coming out.";
-      alert.hidden = false;
-    } else {
-      alert.textContent = "";
-      alert.hidden = true;
-    }
+    const problem = player.playing_without_output
+      ? "Playing, but no speaker is attached — nothing is coming out."
+      : player.error || "";
+    alert.textContent = problem;
+    alert.hidden = !problem;
 
     renderQueue(player);
   }
@@ -512,6 +588,7 @@
    * queue. `attempt` puts that in the banner and the next poll removes the row.
    */
   function playQueueItem(itemId) {
+    if (localMode()) return localPlayItem(itemId);
     return command(`/player/queue/${encodeURIComponent(itemId)}/play`);
   }
 
@@ -548,7 +625,12 @@
     button.disabled = true;
     button.textContent = "Waking the speaker…";
     try {
-      await command("/player/output/select");
+      // The *selected* device when that is a speaker, falling back to the configured one — which is
+      // what this button meant before there was a selector, and still means on a fresh page whose
+      // cached output list has not arrived yet.
+      const output = currentOutput();
+      if (output) await command("/player/output", { id: output.id });
+      else await command("/player/output/select");
     } finally {
       button.disabled = false;
       button.textContent = label;
@@ -556,24 +638,42 @@
   }
 
   function wireTransport() {
-    el("btn-toggle").addEventListener("click", () => command("/player/toggle"));
-    el("btn-prev").addEventListener("click", () => command("/player/previous"));
-    el("btn-next").addEventListener("click", () => command("/player/next"));
-    el("btn-stop").addEventListener("click", () => command("/player/stop"));
+    // One handler per button, dispatched on the chosen output. The *button* is the same in both
+    // modes and the thing it commands is not, so the branch belongs here rather than inside twelve
+    // handlers — and a control that exists in only one mode (`btn-select`) is simply not wired to
+    // the other, rather than being wired to something that quietly does nothing.
+    el("btn-toggle").addEventListener("click", () =>
+      localMode() ? localToggle() : command("/player/toggle")
+    );
+    el("btn-prev").addEventListener("click", () =>
+      localMode() ? localPrev() : command("/player/previous")
+    );
+    el("btn-next").addEventListener("click", () =>
+      localMode() ? localNext(true) : command("/player/next")
+    );
+    el("btn-stop").addEventListener("click", () =>
+      localMode() ? localStop() : command("/player/stop")
+    );
     el("btn-select").addEventListener("click", waking);
 
     // The *absolute* next mode, not "advance": the session is shared, so a relative command from a
     // phone holding a two-second-old poll could land somewhere neither phone asked for. Sending the
     // mode this button's own label implied is idempotent, and the response redraws the label.
-    el("btn-repeat").addEventListener("click", () =>
-      command("/player/repeat", { mode: REPEAT_NEXT[repeatMode(state.player)] })
-    );
-    el("btn-shuffle").addEventListener("click", () =>
-      command("/player/shuffle", { enabled: !(state.player && state.player.shuffle) })
-    );
+    el("btn-repeat").addEventListener("click", () => {
+      const mode = REPEAT_NEXT[repeatMode(state.player)];
+      return localMode() ? localSetRepeat(mode) : command("/player/repeat", { mode });
+    });
+    el("btn-shuffle").addEventListener("click", () => {
+      const enabled = !(state.player && state.player.shuffle);
+      return localMode() ? localSetShuffle(enabled) : command("/player/shuffle", { enabled });
+    });
 
-    el("btn-volup").addEventListener("click", () => command("/player/volume", { step: 5 }));
-    el("btn-voldown").addEventListener("click", () => command("/player/volume", { step: -5 }));
+    el("btn-volup").addEventListener("click", () =>
+      localMode() ? localSetVolume({ step: 5 }) : command("/player/volume", { step: 5 })
+    );
+    el("btn-voldown").addEventListener("click", () =>
+      localMode() ? localSetVolume({ step: -5 }) : command("/player/volume", { step: -5 })
+    );
 
     const slider = el("vol");
     slider.addEventListener("input", () => {
@@ -583,16 +683,28 @@
     // On `change`, not `input`: a drag across the slider fires input for every pixel, and each one
     // would be a request to the daemon. The number beside it updates live regardless.
     slider.addEventListener("change", async () => {
-      await command("/player/volume", { volume: Number(slider.value) });
+      const volume = Number(slider.value);
+      if (localMode()) await localSetVolume({ volume });
+      else await command("/player/volume", { volume });
       state.holdingVolume = false;
     });
 
-    el("btn-clear").addEventListener("click", () =>
-      attempt(async () => {
+    el("btn-clear").addEventListener("click", () => {
+      if (localMode()) return localClear();
+      return attempt(async () => {
         await api("/player/queue", { method: "DELETE" });
         await refreshPlayer();
-      }, "queue")
-    );
+      }, "queue");
+    });
+  }
+
+  /** Redraw the transport from whichever player owns it. */
+  async function refreshTransport() {
+    if (localMode()) {
+      localRender();
+      return;
+    }
+    await refreshPlayer();
   }
 
   async function refreshPlayer() {
@@ -610,6 +722,849 @@
           : `player: ${error.message}`
       );
     }
+  }
+
+  // ----------------------------------------------------- this device as an output
+
+  /**
+   * Playing on the device you are holding — a phone, a tablet, the laptop this page is open on.
+   *
+   * The rest of this project is built on the host owning the session so that music survives the
+   * phone leaving (PLAN.md 2), and that is still the default. This mode is the deliberate opposite,
+   * for the cases a shared speaker does not cover: headphones, a room with no speaker in it, somebody
+   * else using the living room, or a household that never set OwnTone up at all.
+   *
+   * Three decisions worth knowing before reading the code.
+   *
+   * **There is no server-side session for it, and no sharing between devices.** A mirrored queue
+   * would be state that outlived the
+   * only thing able to play it — a device that walked out of the house would leave a queue behind
+   * that nothing was the output for, and a second phone would then be able to "skip" a track it
+   * could not hear. That last one is the decisive argument: two people on headphones are two
+   * independent listeners, and one list behind both would let either of them clear the other's. So
+   * the queue lives in `state.local`, persisted to this device's storage and nowhere else. The
+   * honest consequence is on screen: in this mode the music stops when this device does.
+   *
+   * **The only thing the server provides is a URL.** `POST /library/tickets` signs a short-lived
+   * capability URL per track, because `<audio src>` is a request the browser makes and a page
+   * cannot put the shared token on it. See tunebox/core/tickets.py for why that is a capability URL
+   * rather than a cookie or `?token=`.
+   *
+   * **A queue item's id is its index**, which would be wrong for a shared speaker's queue and is
+   * right here: that queue has many writers, so a position is only true of the poll it came from
+   * (see `queueRow`), while this one has exactly one writer — this page.
+   */
+
+  /** The element that actually makes the sound. */
+  const audio = () => el("local-audio");
+
+  /**
+   * Can this browser be told what volume to play at?
+   *
+   * iOS says no, and says it by *ignoring the assignment* rather than by throwing — so the only way
+   * to find out is to set it and read it back. Without this check the slider would move under a
+   * thumb and change nothing, which is the most expensive kind of broken control: it looks like it
+   * worked. Memoised, because the answer cannot change while the page is open.
+   */
+  let volumeWritable = null;
+  function canSetVolume() {
+    if (volumeWritable === null) {
+      const probe = document.createElement("audio");
+      try {
+        probe.volume = 0.5;
+        volumeWritable = probe.volume === 0.5;
+      } catch (error) {
+        volumeWritable = false;
+      }
+    }
+    return volumeWritable;
+  }
+
+  /** The track at the play cursor, or `null`. */
+  function localTrack() {
+    const { queue, order, cursor } = state.local;
+    if (cursor < 0 || cursor >= order.length) return null;
+    return queue[order[cursor]] || null;
+  }
+
+  /**
+   * Rebuild the play order from the queue and the shuffle setting.
+   *
+   * `keep` is the queue index that must stay under the cursor, so that turning shuffle on does not
+   * also skip the song that is playing. Fisher–Yates over the rest, which gives every remaining
+   * track an equal chance of being next — "random next track" picked independently each time would
+   * instead replay songs while others never came up at all.
+   */
+  function localReorder(keep) {
+    const local = state.local;
+    const indices = local.queue.map((_, index) => index);
+    if (!local.shuffle) {
+      local.order = indices;
+      local.cursor = keep === null || keep === undefined ? local.cursor : keep;
+      if (local.cursor >= local.order.length) local.cursor = local.order.length - 1;
+      return;
+    }
+    const rest = indices.filter((index) => index !== keep);
+    for (let i = rest.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [rest[i], rest[j]] = [rest[j], rest[i]];
+    }
+    local.order = keep === null || keep === undefined ? rest : [keep, ...rest];
+    local.cursor = local.order.length ? 0 : -1;
+  }
+
+  /**
+   * The local state, shaped exactly like `GET /player`.
+   *
+   * One renderer for both modes is the point: `renderPlayer` draws the title, the progress bar, the
+   * transport glyph, the modes and the queue, and a second copy of it for this mode would be a
+   * second place for the screen to be subtly different. The one extra field is `local`, which is
+   * how `renderPlayer` knows to describe the output as a phone rather than a speaker.
+   */
+  function localView() {
+    const local = state.local;
+    const element = audio();
+    const track = localTrack();
+    const loaded = Boolean(track);
+    const length = Number.isFinite(element.duration) ? element.duration * 1000 : null;
+    return {
+      local: true,
+      state: !loaded ? "stop" : element.paused ? "pause" : "play",
+      volume: canSetVolume() ? Math.round(element.volume * 100) : null,
+      repeat: local.repeat,
+      shuffle: local.shuffle,
+      consume: false,
+      item_id: loaded ? `local-${local.order[local.cursor]}` : null,
+      item_length_ms: length !== null ? length : track && track.length_ms ? track.length_ms : null,
+      item_progress_ms: element.currentTime * 1000,
+      now_playing: track
+        ? { id: null, title: track.title, artist: track.artist, album: track.album, path: track.path }
+        : null,
+      outputs: state.outputs,
+      queue: local.queue.map((item, index) => ({
+        id: `local-${index}`,
+        title: item.title,
+        artist: item.artist,
+        album: item.album,
+        path: item.path,
+      })),
+      output: null,
+      output_selected: false,
+      // Impossible in this mode by construction: the output is the device running the page.
+      playing_without_output: false,
+      error: local.error,
+    };
+  }
+
+  /** Draw the screen from `state.local`. The counterpart of `refreshPlayer` for this mode. */
+  function localRender() {
+    renderPlayer(localView());
+    mediaSession();
+  }
+
+  /**
+   * Mint a capability URL for one track.
+   *
+   * One request per track rather than one for the whole queue, deliberately: a 40-track queue would
+   * be 40 signatures the phone would mostly never spend, and the URL has a lifetime, so minting at
+   * the moment of use is also what keeps the ticket fresh for the ninth song of an evening.
+   */
+  async function localTicket(path) {
+    const answer = await api("/library/tickets", { method: "POST", body: { paths: [path] } });
+    const ticket = answer && answer.tickets && answer.tickets[0];
+    if (!ticket) throw new ApiError(0, "no streaming URL came back");
+    return ticket.url;
+  }
+
+  /**
+   * Point the element at the track under the cursor, and optionally start it.
+   *
+   * `play()` is only called when asked, because a browser will reject it outside a user gesture —
+   * so the gesture has to be the tap that got here. Once the element has played once the browser
+   * stops asking, which is what lets `ended` advance to the next track on its own.
+   */
+  async function localLoad({ autoplay }) {
+    const element = audio();
+    const track = localTrack();
+    if (!track) {
+      element.removeAttribute("src");
+      element.load();
+      localRender();
+      return;
+    }
+    state.local.error = null;
+    let url;
+    try {
+      url = await localTicket(track.path);
+    } catch (error) {
+      if (error.status === 401) return;
+      state.local.error = `Cannot play ${track.title || track.path}: ${error.message}`;
+      localRender();
+      return;
+    }
+    element.src = url;
+    if (autoplay) {
+      try {
+        await element.play();
+      } catch (error) {
+        // Autoplay refused, or the file will not decode. Either way the screen must not claim to be
+        // playing — and the message differs, so it is the browser's own rather than ours.
+        state.local.error = `Could not start playback: ${error.message || error.name}`;
+      }
+    }
+    localPersist();
+    localRender();
+  }
+
+  /**
+   * Add tracks to the phone's queue. The local half of `enqueue`.
+   *
+   * `tracks` carry their own title and artist because nothing on this side can read a file's tags:
+   * the Library panel, the Ingests list and a playlist all already have them, so they are passed
+   * along rather than looked up again.
+   */
+  async function localEnqueue(tracks, mode, start) {
+    const local = state.local;
+    const usable = tracks.filter((track) => track && track.path);
+    if (!usable.length) return;
+    const first = mode === "replace" ? 0 : local.queue.length;
+    if (mode === "replace") {
+      local.queue = usable.slice();
+      local.cursor = -1;
+    } else {
+      local.queue = local.queue.concat(usable);
+    }
+    const playing = localTrack();
+    localReorder(playing ? local.queue.indexOf(playing) : mode === "replace" ? first : undefined);
+    if (mode === "replace" || start) {
+      local.cursor = local.order.indexOf(first);
+      if (local.cursor < 0) local.cursor = 0;
+    }
+    // Appending to a queue that had nothing loaded still has to leave something *selected*, or the
+    // play button is drawn next to a list of songs and does nothing when pressed — "nothing loaded"
+    // with a full queue is a state the house speaker can be in and this one must not.
+    if (local.cursor < 0 && local.order.length) local.cursor = 0;
+    localPersist();
+    if (start) {
+      await localLoad({ autoplay: true });
+    } else {
+      localRender();
+    }
+  }
+
+  /** Jump to a row in the phone's queue. `id` is `local-<index>` — see the section comment. */
+  function localPlayItem(id) {
+    const index = Number(String(id).replace("local-", ""));
+    if (!Number.isInteger(index)) return Promise.resolve();
+    const at = state.local.order.indexOf(index);
+    if (at < 0) return Promise.resolve();
+    state.local.cursor = at;
+    return localLoad({ autoplay: true });
+  }
+
+  function localToggle() {
+    const element = audio();
+    if (!localTrack()) return Promise.resolve();
+    if (!element.getAttribute("src")) return localLoad({ autoplay: true });
+    if (element.paused) return element.play().then(localRender, localRender);
+    element.pause();
+    localRender();
+    return Promise.resolve();
+  }
+
+  /**
+   * Next track. `manual` separates a tap on ⏭ from a track ending, and the difference is repeat:
+   * "repeat one song" must replay on its own and must *not* trap the skip button on one track.
+   */
+  function localNext(manual) {
+    const local = state.local;
+    if (!local.order.length) return Promise.resolve();
+    if (!manual && local.repeat === "single") return localLoad({ autoplay: true });
+    const last = local.cursor >= local.order.length - 1;
+    if (last) {
+      if (local.repeat === "off" && !manual) return localStop();
+      // A shuffled queue is re-shuffled when it wraps, so "repeat the queue" is not the same twenty
+      // songs in the same order forever.
+      if (local.shuffle) localReorder(undefined);
+      local.cursor = 0;
+    } else {
+      local.cursor += 1;
+    }
+    localPersist();
+    return localLoad({ autoplay: true });
+  }
+
+  /**
+   * Previous track — or the start of this one, which is what every music player does and what makes
+   * the button usable: three seconds into a song, ⏮ means "I missed the beginning".
+   */
+  function localPrev() {
+    const local = state.local;
+    const element = audio();
+    if (!local.order.length) return Promise.resolve();
+    if (element.currentTime > 3 || local.cursor <= 0) {
+      element.currentTime = 0;
+      if (element.paused) return localToggle();
+      localRender();
+      return Promise.resolve();
+    }
+    local.cursor -= 1;
+    localPersist();
+    return localLoad({ autoplay: true });
+  }
+
+  /** Stop: unload the track, keep the queue. The same meaning as `PUT /player/stop`. */
+  function localStop() {
+    const element = audio();
+    element.pause();
+    element.removeAttribute("src");
+    element.load();
+    // The cursor stays where it was, so ⏯ plays that track again from the beginning rather than
+    // jumping back to the top of the list — a stop is "that is enough", not "start over".
+    if (!state.local.order.length) state.local.cursor = -1;
+    localPersist();
+    localRender();
+    return Promise.resolve();
+  }
+
+  function localClear() {
+    state.local.queue = [];
+    state.local.order = [];
+    state.local.cursor = -1;
+    return localStop();
+  }
+
+  function localSetRepeat(mode) {
+    state.local.repeat = mode;
+    // `loop` as well as the handler: the element looping itself is gapless, where waiting for
+    // `ended` and re-assigning `src` is a re-fetch and an audible seam.
+    audio().loop = mode === "single";
+    localPersist();
+    localRender();
+    return Promise.resolve();
+  }
+
+  function localSetShuffle(enabled) {
+    state.local.shuffle = enabled;
+    const playing = localTrack();
+    localReorder(playing ? state.local.queue.indexOf(playing) : undefined);
+    localPersist();
+    localRender();
+    return Promise.resolve();
+  }
+
+  function localSetVolume({ volume, step }) {
+    if (!canSetVolume()) return Promise.resolve();
+    const element = audio();
+    const current = Math.round(element.volume * 100);
+    const wanted = volume !== undefined ? volume : current + step;
+    element.volume = Math.max(0, Math.min(100, wanted)) / 100;
+    localPersist();
+    localRender();
+    return Promise.resolve();
+  }
+
+  /** Drop every copy of a path from the phone's queue — what a library delete has to do here. */
+  function localForget(path) {
+    const local = state.local;
+    if (!local.queue.some((track) => track.path === path)) return;
+    const playing = localTrack();
+    local.queue = local.queue.filter((track) => track.path !== path);
+    const keep = playing && playing.path !== path ? local.queue.indexOf(playing) : undefined;
+    localReorder(keep);
+    if (playing && playing.path === path) localStop();
+    else {
+      localPersist();
+      localRender();
+    }
+  }
+
+  // ---------------------------------------------- the phone's queue, across reloads
+
+  /**
+   * Keep the phone's queue on the phone.
+   *
+   * The house queue survives a restart because OwnTone holds it; this one would not survive a tab
+   * being reopened, and a list somebody built disappearing because they switched apps is the sort of
+   * loss a remote should not inflict. Only the list and the settings are stored — not the playback
+   * position, because resuming a track to the second is a promise this cannot keep (the element is
+   * gone, and so is the ticket).
+   */
+  function localPersist() {
+    try {
+      const local = state.local;
+      window.localStorage.setItem(
+        LOCAL_QUEUE_KEY,
+        JSON.stringify({
+          queue: local.queue,
+          cursor: local.cursor,
+          order: local.order,
+          repeat: local.repeat,
+          shuffle: local.shuffle,
+          volume: canSetVolume() ? audio().volume : undefined,
+        })
+      );
+    } catch (error) {
+      /* storage disabled; the queue is then good for this session only */
+    }
+  }
+
+  function localRestore() {
+    let saved;
+    try {
+      saved = JSON.parse(window.localStorage.getItem(LOCAL_QUEUE_KEY) || "null");
+    } catch (error) {
+      saved = null;
+    }
+    if (!saved || !Array.isArray(saved.queue)) return;
+    const local = state.local;
+    // Validated rather than trusted: this came out of storage, which a previous version of this
+    // script wrote and a future one has to survive reading.
+    local.queue = saved.queue
+      .filter((track) => track && typeof track.path === "string")
+      .map((track) => ({
+        path: track.path,
+        title: track.title || track.path,
+        artist: track.artist || null,
+        album: track.album || null,
+      }));
+    local.repeat = Object.prototype.hasOwnProperty.call(REPEAT_NEXT, saved.repeat)
+      ? saved.repeat
+      : "off";
+    local.shuffle = saved.shuffle === true;
+    const order = Array.isArray(saved.order)
+      ? saved.order.filter((index) => Number.isInteger(index) && index < local.queue.length)
+      : [];
+    local.order = order.length === local.queue.length ? order : local.queue.map((_, i) => i);
+    local.cursor = Number.isInteger(saved.cursor) && saved.cursor < local.order.length ? saved.cursor : -1;
+    if (canSetVolume() && typeof saved.volume === "number") {
+      audio().volume = Math.max(0, Math.min(1, saved.volume));
+    }
+    audio().loop = local.repeat === "single";
+  }
+
+  // ------------------------------------------------------- lockscreen and events
+
+  /**
+   * Hand the track to the OS, so the lockscreen and the headphone buttons work.
+   *
+   * This is the one thing local playback can do that a shared speaker cannot: the Media
+   * Session API needs the audio to be coming out of *this* browser, so on the OwnTone path there is
+   * nothing to give it (README: "what the remote does not give you is lockscreen control — the
+   * accepted cost of the phone not being the audio path"). Here it costs twenty lines.
+   *
+   * No artwork, for the same reason nothing else on this page loads an image: tunebox does not
+   * extract embedded cover art, and the alternative is fetching one from the internet.
+   */
+  function mediaSession() {
+    const session = navigator.mediaSession;
+    if (!session || !window.MediaMetadata) return;
+    const track = localMode() ? localTrack() : null;
+    if (!track) {
+      session.metadata = null;
+      session.playbackState = "none";
+      return;
+    }
+    session.metadata = new window.MediaMetadata({
+      title: track.title || track.path,
+      artist: track.artist || "",
+      album: track.album || "",
+    });
+    session.playbackState = audio().paused ? "paused" : "playing";
+  }
+
+  function wireMediaSession() {
+    const session = navigator.mediaSession;
+    if (!session || typeof session.setActionHandler !== "function") return;
+    const handlers = {
+      play: () => localToggle(),
+      pause: () => localToggle(),
+      stop: () => localStop(),
+      previoustrack: () => localPrev(),
+      nexttrack: () => localNext(true),
+      seekto: (details) => {
+        if (details && typeof details.seekTime === "number") audio().currentTime = details.seekTime;
+      },
+    };
+    Object.entries(handlers).forEach(([action, handler]) => {
+      try {
+        session.setActionHandler(action, handler);
+      } catch (error) {
+        /* an action this browser does not know about; the rest still work */
+      }
+    });
+  }
+
+  function wireAudio() {
+    const element = audio();
+    // Four frames a second from the element rather than a one-second interval of our own: this is
+    // the only mode where the true position is known locally, so there is no reason to guess at it.
+    element.addEventListener("timeupdate", () => {
+      if (!localMode()) return;
+      state.progressMs = element.currentTime * 1000;
+      drawProgress();
+    });
+    // The length is not known until the browser has read the container's header, and the progress
+    // bar has no scale until it is.
+    element.addEventListener("loadedmetadata", localRender);
+    element.addEventListener("play", localRender);
+    element.addEventListener("pause", localRender);
+    element.addEventListener("ended", () => localNext(false));
+    element.addEventListener("error", () => {
+      if (!localMode()) return;
+      // `load()` on an element whose src has just been removed fires this too, so an unloaded
+      // element is not an error — `localStop` is a thing somebody asked for.
+      if (!element.getAttribute("src")) return;
+      const track = localTrack();
+      // The element's own error says almost nothing useful ("MEDIA_ELEMENT_ERROR"), so this names
+      // the track instead — which is the half somebody can act on, since the usual causes are a
+      // file deleted since the queue was built and a format this browser cannot decode.
+      state.local.error = track
+        ? `Could not play ${track.title || track.path} — the file may have gone, or this browser cannot decode it.`
+        : "Could not play that track.";
+      localRender();
+    });
+  }
+
+  // ----------------------------------------------------------- the device selector
+
+  /**
+   * One selector, every device this remote can drive.
+   *
+   * The thing it encodes, which took two attempts to get right: **a queue belongs to an output, not
+   * to a page.** A shared speaker is one speaker in one room, so its queue is the daemon's and
+   * anybody holding the token may skip a track — that is the feature. This device is one pair of
+   * headphones, so its queue is its own and nobody else can reach it. An earlier draft had the two
+   * sharing one list, which would have let somebody pressing Clear in the kitchen empty what another
+   * person was listening to on headphones. There is no sense in which that is "changing the music in
+   * the room".
+   *
+   * So switching the selector changes *which session this page is showing and controlling*, and
+   * nothing else. Moving the music is a separate, deliberate button — see `handoff`.
+   */
+
+  function localMode() {
+    return LOCAL_PLAYBACK && state.device === LOCAL_DEVICE;
+  }
+
+  /** The output `state.device` names, from the cached list, or `null` in this device's own mode. */
+  function currentOutput() {
+    if (localMode()) return null;
+    return state.outputs.find((output) => output.id === state.device) || null;
+  }
+
+  /** The speaker a handoff would go to: the one selected, else the first one we may use. */
+  function handoffTarget() {
+    const usable = (output) => output.selectable && !output.needs_pairing;
+    return (
+      state.outputs.find((output) => output.id === state.device && usable(output)) ||
+      state.outputs.find((output) => output.selected && usable(output)) ||
+      state.outputs.find(usable) ||
+      null
+    );
+  }
+
+  function readStoredDevice() {
+    try {
+      return window.localStorage.getItem(OUTPUT_KEY) || LOCAL_DEVICE;
+    } catch (error) {
+      return LOCAL_DEVICE;
+    }
+  }
+
+  function storeDevice(device) {
+    try {
+      window.localStorage.setItem(OUTPUT_KEY, device);
+    } catch (error) {
+      /* see readStoredToken */
+    }
+  }
+
+  /**
+   * Point this page at a device.
+   *
+   * Switching *to* a speaker enables it, exclusively — `PUT /player/output` turns the others off,
+   * because that is what a single-choice selector means. Switching away from this device pauses it
+   * for the one reason worth coding for: two things playing at once is the only outcome nobody
+   * wants, and a phone singing in a pocket while its owner wonders why the room sounds doubled is
+   * how that presents.
+   */
+  async function selectDevice(device) {
+    const previous = state.device;
+    if (device === previous) return;
+
+    if (device !== LOCAL_DEVICE) {
+      const node = el("device");
+      const label = node.disabled;
+      node.disabled = true;
+      // Slow on purpose: a Cast speaker in standby refuses its first connection, so the server
+      // retries for a few seconds. The selector saying nothing for that long reads as a selector
+      // that did nothing.
+      el("device-note").textContent = "Waking the speaker…";
+      const player = await attempt(
+        () => api("/player/output", { method: "PUT", body: { id: device } }),
+        "speaker"
+      );
+      node.disabled = label;
+      if (!player) {
+        // 403 (not ours to use), 404 (it left the network) or 503 (it will not wake). The banner
+        // has the sentence; the selector goes back to where it was rather than lying about what is
+        // playing where.
+        renderDevices(state.player);
+        return;
+      }
+      if (previous === LOCAL_DEVICE) audio().pause();
+      state.device = device;
+      storeDevice(device);
+      renderPlayer(player);
+      return;
+    }
+
+    state.device = LOCAL_DEVICE;
+    storeDevice(LOCAL_DEVICE);
+    // The speaker is left exactly as it is — still selected, still holding its queue. Taking this
+    // page's attention away from a shared speaker must not stop a room somebody else is sitting in.
+    localRender();
+  }
+
+  /**
+   * Draw the selector from the cached output list. Rebuilt only when that list changes.
+   *
+   * `player` is whichever document was just rendered, so this works for both modes: in this
+   * device's own mode `localView` carries the same cached outputs, which is what lets one renderer
+   * draw one selector.
+   */
+  function renderDevices(player) {
+    const outputs = (player && player.outputs) || state.outputs;
+    const key = JSON.stringify([
+      state.device,
+      LOCAL_PLAYBACK,
+      outputs.map((o) => [o.id, o.name, o.type, o.selected, o.selectable, o.needs_pairing]),
+    ]);
+    if (key === state.deviceKey) return;
+    state.deviceKey = key;
+
+    const node = el("device");
+    const speakers = el("device-speakers");
+    clear(speakers);
+    outputs.forEach((output) => {
+      const option = make("option", null, `${output.name}${output.type ? ` · ${output.type}` : ""}`);
+      option.value = output.id;
+      // Two different reasons a speaker cannot be chosen, and they are shown rather than hidden
+      // because they are different statements with different fixes. Disabled rather than omitted:
+      // "that speaker exists and you cannot use it" is not "there is no such speaker".
+      if (!output.selectable) {
+        option.disabled = true;
+        option.textContent += " (not available to this remote)";
+      } else if (output.needs_pairing) {
+        // The daemon has already established this one wants a PIN, so a tap could only ever be a
+        // 409. Nothing tunebox can do: the pairing is OwnTone's own, and the footer links to it.
+        option.disabled = true;
+        option.textContent += " (needs pairing in OwnTone)";
+      }
+      speakers.appendChild(option);
+    });
+    speakers.hidden = outputs.length === 0;
+    // Hidden when the host does not offer it at all (TUNEBOX_LOCAL_PLAYBACK=0), because an option
+    // that cannot be chosen is worse than an option that is not there.
+    el("device-self").hidden = !LOCAL_PLAYBACK;
+    node.value = state.device;
+    // A `state.device` naming a speaker that has since left the network leaves the select with no
+    // matching option, and a <select> with no match shows its first entry — which would quietly
+    // claim the music is playing somewhere it is not.
+    if (node.selectedIndex < 0) node.value = LOCAL_PLAYBACK ? LOCAL_DEVICE : "";
+  }
+
+  /** The line under the selector: where the sound is, and what that costs. */
+  function renderDeviceNote(player) {
+    const note = el("device-note");
+    if (player && player.local) {
+      note.textContent =
+        "Playing here, on this device only. Its queue is private, and the music stops if this " +
+        "device sleeps, locks for long enough, or leaves.";
+      return;
+    }
+    const output = currentOutput();
+    if (!output) {
+      note.textContent = state.outputs.length
+        ? "That speaker is not visible on the network."
+        : "No speakers visible — is OwnTone running?";
+      return;
+    }
+    note.textContent =
+      `${output.name} — ${output.selected ? "on" : "off"}. ` +
+      "This queue is shared, so anyone in the house can change it.";
+  }
+
+  /**
+   * Move the music, rather than just the page's attention.
+   *
+   * Copies the queue *and the position* to the other side, starts it there, and pauses the side you
+   * left. Symmetric, which is why it is one button with two labels: "continue on the speaker" and
+   * "continue here" are the same operation in opposite directions.
+   *
+   * A copy, never a shared list. That is the whole reason this is a button somebody presses rather
+   * than one queue behind both devices: a copy cannot reach into what another person is listening
+   * to, and the implicit version could.
+   */
+  function renderHandoff(player) {
+    const button = el("btn-handoff");
+    const local = Boolean(player && player.local);
+    const target = handoffTarget();
+    const houseQueue = !local && player ? (player.queue || []).length : null;
+    if (local) {
+      const have = state.local.queue.length;
+      button.hidden = !have || !target;
+      if (!button.hidden) button.textContent = `Continue on ${target.name}`;
+    } else {
+      button.hidden = !LOCAL_PLAYBACK || !houseQueue;
+      if (!button.hidden) button.textContent = "Continue on this device";
+    }
+  }
+
+  async function handoff() {
+    const button = el("btn-handoff");
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = "Moving the music…";
+    try {
+      if (localMode()) await handoffToSpeaker();
+      else await handoffToHere();
+    } finally {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  }
+
+  /** This device → a speaker: copy the list, select it, start at the same track and second. */
+  async function handoffToSpeaker() {
+    const target = handoffTarget();
+    const track = localTrack();
+    if (!target || !state.local.queue.length) return;
+    const paths = state.local.queue.map((item) => item.path);
+    const index = track ? state.local.queue.indexOf(track) : 0;
+    const positionMs = Math.floor(audio().currentTime * 1000);
+
+    await attempt(async () => {
+      // The queue first and the output second, so a speaker that refuses to wake does not leave a
+      // half-moved handoff: the list is in the daemon either way, and the selector simply stays here.
+      const added = await api("/player/queue", {
+        method: "POST",
+        body: { paths, mode: "replace", start: false },
+      });
+      const player = await api("/player/output", { method: "PUT", body: { id: target.id } });
+      audio().pause();
+      state.device = target.id;
+      storeDevice(target.id);
+
+      const item = (added && added.queue && added.queue[index]) || null;
+      if (item && item.id) {
+        await api(`/player/queue/${encodeURIComponent(item.id)}/play`, { method: "PUT" });
+        if (positionMs > 0) {
+          await api("/player/seek", { method: "PUT", body: { position_ms: positionMs } });
+        }
+      }
+      await refreshPlayer();
+      if (!item) renderPlayer(player);
+    }, "handoff");
+  }
+
+  /** A speaker → this device: copy the list, start at the same track and second, pause the room. */
+  async function handoffToHere() {
+    await attempt(async () => {
+      const player = await api("/player");
+      const items = (player.queue || []).filter((item) => item.path);
+      if (!items.length) {
+        banner("That speaker's queue has nothing this device can play.");
+        return;
+      }
+      const index = Math.max(
+        0,
+        items.findIndex((item) => item.id && item.id === player.item_id)
+      );
+      const positionMs = player.item_progress_ms || 0;
+
+      // Paused rather than stopped, and that is a deliberate kindness to the room: pause keeps the
+      // daemon's own position, so whoever was listening there can press play and carry on from
+      // where the music was when somebody took it away.
+      if (player.state === "play") await api("/player/pause", { method: "PUT" });
+
+      state.device = LOCAL_DEVICE;
+      storeDevice(LOCAL_DEVICE);
+      state.local.queue = items.map((item) => ({
+        path: item.path,
+        title: item.title || item.path,
+        artist: item.artist || null,
+        album: item.album || null,
+      }));
+      state.local.shuffle = false;
+      localReorder(index);
+      state.local.cursor = state.local.order.indexOf(index);
+      if (state.local.cursor < 0) state.local.cursor = 0;
+      localPersist();
+      await localLoad({ autoplay: true });
+      if (positionMs > 0) audio().currentTime = positionMs / 1000;
+      localRender();
+    }, "handoff");
+  }
+
+  /**
+   * Read the daemon's output list without making it a poll.
+   *
+   * Called on unlock and whenever the selector is opened, and **silent on failure**: in this
+   * device's own mode a host with no OwnTone is a perfectly good configuration, so "no speakers
+   * visible" is a sentence under the selector rather than an error in the banner.
+   */
+  async function refreshDevices() {
+    try {
+      const player = await api("/player");
+      state.outputs = player.outputs || [];
+      reconcileDevice();
+      const view = localMode() ? localView() : player;
+      renderDevices(view);
+      renderDeviceNote(view);
+      renderHandoff(view);
+    } catch (error) {
+      if (error.status === 401) return;
+      state.outputs = [];
+      state.deviceKey = null;
+      renderDevices(null);
+    }
+  }
+
+  /**
+   * Make sure `state.device` names something that exists.
+   *
+   * Three ways it can stop doing so: the host turned local playback off, the speaker this device
+   * was pointed at left the network, or storage carries an id from an installation ago. All three
+   * end the same way — pointed at whatever is actually playing, or at this device. The one outcome
+   * ruled out is a selector showing a name while the transport underneath it belongs to something
+   * else.
+   */
+  function reconcileDevice() {
+    if (localMode()) return;
+    if (state.outputs.some((output) => output.id === state.device)) return;
+    const fallback =
+      state.outputs.find((output) => output.selected && output.selectable) ||
+      state.outputs.find((output) => output.selectable);
+    if (LOCAL_PLAYBACK && (!fallback || state.device === LOCAL_DEVICE)) {
+      state.device = LOCAL_DEVICE;
+    } else if (fallback) {
+      state.device = fallback.id;
+    } else if (LOCAL_PLAYBACK) {
+      state.device = LOCAL_DEVICE;
+    }
+    state.deviceKey = null;
+  }
+
+  function wireDevices() {
+    const node = el("device");
+    node.addEventListener("change", () => selectDevice(node.value));
+    // Opening the picker is the moment the list has to be right: a speaker that was switched on
+    // since the last poll should be in it, and in this device's own mode nothing else is asking.
+    node.addEventListener("focus", () => {
+      if (localMode()) refreshDevices();
+    });
   }
 
   // ------------------------------------------------------------ search + ingest
@@ -735,13 +1690,22 @@
         if (job.state === "done" && job.path) {
           // The reason this list is on the same screen as the transport: the thing you want to do
           // with a track that just finished downloading is play it.
+          //
+          // The tags go with the path, not only the path: on the phone output there is nothing that
+          // can read a file's metadata, and the job already knows what it just wrote.
+          const finished = {
+            path: job.path,
+            title: (job.tags && job.tags.title) || title,
+            artist: (job.tags && job.tags.artist) || null,
+            album: (job.tags && job.tags.album) || null,
+          };
           li.appendChild(
             (() => {
               const box = make("div", "row-actions");
               box.appendChild(
-                button("Play", () => enqueue(job.path, "replace", true), "primary")
+                button("Play", () => enqueue(finished, "replace", true), "primary")
               );
-              box.appendChild(button("Queue", () => enqueue(job.path, "append", false)));
+              box.appendChild(button("Queue", () => enqueue(finished, "append", false)));
               return box;
             })()
           );
@@ -820,16 +1784,24 @@
   // -------------------------------------------------------------------- library
 
   /**
-   * Queue one track. `path` is whatever the API gave us for it: `GET /library` answers with paths
-   * relative to the music root, `GET /jobs` with the absolute path the ingest wrote. Both are
-   * accepted and both are re-checked against the music root server-side, so traversal is not
-   * filtered here — it is impossible there.
+   * Queue one track, on whichever output is chosen.
+   *
+   * Takes a *track* rather than a path because the two modes need different things from it. The
+   * house speaker needs only the path — `GET /library` answers with paths relative to the music
+   * root, `GET /jobs` with the absolute path the ingest wrote, both are accepted and both are
+   * re-checked against the music root server-side, so traversal is not filtered here but is
+   * impossible there. The phone needs the title and artist too, because on that side there is
+   * nothing that can read a file's tags: every caller already has them, so they come along.
    */
-  function enqueue(path, mode, start) {
+  function enqueue(track, mode, start) {
+    if (localMode()) {
+      selectTab("now");
+      return localEnqueue([track], mode, start);
+    }
     return attempt(async () => {
       await api("/player/queue", {
         method: "POST",
-        body: { paths: [path], mode, start },
+        body: { paths: [track.path], mode, start },
       });
       await refreshPlayer();
       selectTab("now");
@@ -877,8 +1849,8 @@
   function libraryRow(track) {
     const subtitle = [track.artist, track.album].filter(Boolean).join(" · ");
     const li = row(track.title, subtitle, [
-      button("Play", () => enqueue(track.path, "replace", true), "primary"),
-      button("Queue", () => enqueue(track.path, "append", false)),
+      button("Play", () => enqueue(track, "replace", true), "primary"),
+      button("Queue", () => enqueue(track, "append", false)),
     ]);
 
     const panel = make("div", "row-confirm");
@@ -940,7 +1912,11 @@
     );
     if (!result) return null;
     await loadLibrary();
-    await refreshPlayer();
+    // Both outputs: the house queue may have been holding this file (and a 409 is the answer when it
+    // is the track currently loaded), and the phone's queue would otherwise keep a row that can only
+    // ever fail to load — the one place where "the server is the truth" needs a local counterpart.
+    localForget(track.path);
+    await refreshTransport();
     const pruned = (result.removed_directories || []).length;
     const lists = (result.playlists_updated || []).length;
     el("lib-note").textContent =
@@ -1233,12 +2209,45 @@
   /**
    * Play a playlist, or append it to the queue.
    *
-   * One request: the server reads the file, resolves every entry under the music root and hands the
-   * lot to the player at once — so a playlist cannot leave the queue half-replaced with playback
-   * already running. The answer *is* the new player state, which is why this redraws from it rather
-   * than polling for it.
+   * On the house speaker this is one request: the server reads the file, resolves every entry under
+   * the music root and hands the lot to the player at once — so a playlist cannot leave the queue
+   * half-replaced with playback already running. The answer *is* the new player state, which is why
+   * that branch redraws from it rather than polling for it.
+   *
+   * On the phone it is two: read the playlist, then enqueue the tracks here. There is no third
+   * option — `PUT /playlists/{name}/play` means "tell the daemon to play this", and the daemon is
+   * not the output. Entries that resolve to nothing are left out with a count, which is the same
+   * thing the server-side path does and the one failure a playlist is most likely to have (see
+   * README, Playlists).
    */
   function playPlaylist(playlist, mode, start) {
+    if (localMode()) {
+      return attempt(async () => {
+        const full = await api(`/playlists/${encodeURIComponent(playlist.name)}`);
+        const entries = (full && full.entries) || [];
+        const tracks = entries
+          .filter((entry) => !entry.missing && entry.track)
+          .map((entry) => ({
+            path: entry.track.path,
+            title: entry.track.title,
+            artist: entry.track.artist,
+            album: entry.track.album,
+          }));
+        if (!tracks.length) {
+          banner(`${playlist.name} has nothing playable in it.`);
+          return;
+        }
+        selectTab("now");
+        await localEnqueue(tracks, mode, start);
+        const missing = entries.length - tracks.length;
+        if (missing) {
+          banner(
+            `${missing} track${missing === 1 ? "" : "s"} in ${playlist.name} ` +
+              `${missing === 1 ? "is" : "are"} missing and ${missing === 1 ? "was" : "were"} skipped.`
+          );
+        }
+      }, "playlist");
+    }
     return attempt(async () => {
       const player = await api(`/playlists/${encodeURIComponent(playlist.name)}/play`, {
         method: "PUT",
@@ -1362,6 +2371,9 @@
     stopPolling();
     tick();
     state.ticker = window.setInterval(() => {
+      // In phone mode the element's own `timeupdate` is the clock — it knows the real position four
+      // times a second, so adding a second per second here would double-count it.
+      if (localMode()) return;
       if (state.player && state.player.state === "play" && state.player.item_length_ms) {
         state.progressMs += 1000;
         drawProgress();
@@ -1377,7 +2389,10 @@
 
   async function tick() {
     if (!state.token) return;
-    await refreshPlayer();
+    // `refreshTransport`, so phone mode does not ask OwnTone about a session it is not using: on a
+    // host with no player at all that would be a 503 in the banner every two seconds, under a
+    // screen that is playing music perfectly well.
+    await refreshTransport();
     // Jobs are only worth polling while something is in flight or the ingest tab is on screen.
     if (state.jobsActive || state.tab === "add") await refreshJobs();
     if (!state.token) return;
@@ -1387,6 +2402,9 @@
   function wireVisibility() {
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") {
+        // Note what is *not* stopped: the audio element. In phone mode the whole point is that the
+        // music keeps going with the screen off — only the polling and the progress redraw stop,
+        // because nothing is looking at them.
         stopPolling();
       } else if (state.token) {
         // Redraw immediately rather than after a poll interval: coming back to a stale screen and
@@ -1461,7 +2479,18 @@
     wirePlaylists();
     wireFooter();
     wireVisibility();
+    wireDevices();
+    wireAudio();
+    wireMediaSession();
     registerWorker();
+
+    el("btn-handoff").addEventListener("click", handoff);
+
+    // Restored before the gate, so unlocking lands on the device this page was last pointed at
+    // rather than flicking over to it a moment later.
+    state.device = LOCAL_PLAYBACK ? readStoredDevice() : "";
+    localRestore();
+    renderDevices(null);
 
     el("gate-form").addEventListener("submit", async (event) => {
       event.preventDefault();

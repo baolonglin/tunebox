@@ -43,7 +43,13 @@ from typing import Any, Sequence
 
 from ..config import Config
 from ..core.models import REPEAT_MODES, Output, PlayerStatus, QueueItem
-from ..errors import OutputNotFound, OutputUnreachable, PlayerError, PlayerUnavailable
+from ..errors import (
+    OutputNeedsPairing,
+    OutputNotFound,
+    OutputUnreachable,
+    PlayerError,
+    PlayerUnavailable,
+)
 
 log = logging.getLogger(__name__)
 
@@ -329,6 +335,7 @@ class OwnTonePlayer:
         attempts = max(1, int(self._config.output_select_attempts))
         delay = _ENABLE_BACKOFF
         last: PlayerError | None = None
+        known: Output | None = None
 
         for attempt in range(1, attempts + 1):
             try:
@@ -346,10 +353,21 @@ class OwnTonePlayer:
                     attempts,
                     exc,
                 )
+                # Raises OutputNotFound if it has gone, which ends this loop with the truth.
+                known = self.find_output(output_id=output_id)
+                if known.needs_pairing:
+                    # A PIN or password, which no amount of retrying will supply. Asked *after* the
+                    # failure rather than before it because the daemon does not know either until it
+                    # has tried: measured on OwnTone 29.3, this output reported requires_auth=false
+                    # until the first enable failed and true from then on.
+                    raise OutputNeedsPairing(
+                        f"{known.name!r} needs a PIN or password before it will play. "
+                        "OwnTone has to pair with it once: open OwnTone's own web interface, "
+                        "select this speaker there and enter the code it shows. tunebox cannot do "
+                        "that for you — it holds no pass-through to the daemon's API."
+                    ) from exc
                 if attempt == attempts:
                     break
-                # Raises OutputNotFound if it has gone, which ends this loop with the truth.
-                self.find_output(output_id=output_id)
                 time.sleep(delay)
                 delay *= 2
                 continue
@@ -357,17 +375,49 @@ class OwnTonePlayer:
                 log.info("output %s came up on attempt %d of %d", output_id, attempt, attempts)
             return
 
-        raise OutputUnreachable(
-            f"the player has output {output_id} listed but could not bring it up after "
-            f"{attempts} attempt(s). A Cast speaker in standby does exactly this: it is still "
-            "advertised on the network while it stops answering, so try again in a moment. "
-            'The reason is in the player\'s own log (look for "Could not connect").'
-        ) from last
+        raise OutputUnreachable(_unreachable_message(output_id, known, attempts)) from last
 
     def deselect_output(self, output_id: str) -> None:
         self._client.put(
             f"/api/outputs/{urllib.parse.quote(output_id, safe='')}", body={"selected": False}
         )
+
+    def select_only(self, output_id: str, *, volume: int | None = None) -> list[str]:
+        """Enable one output and switch every other one off. Returns the ids it switched off.
+
+        This is what a single-choice device selector means, and it is deliberately the *opposite* of
+        :meth:`select_output`, whose whole docstring is about not touching the other outputs. Both
+        exist because they answer different questions: the output keeper asserts "the soundbar
+        should be on" and has no opinion about the kitchen, while somebody tapping a name in a list
+        headed "where the music plays" has said that the music plays *there*.
+
+        **Not** ``PUT /api/outputs/set``, which does exactly this in one atomic call, and which the
+        obvious reading of the task would reach for. The reason is the retry: a Cast device in
+        standby refuses its first connection (see :meth:`select_output`), and ``/outputs/set`` has
+        nowhere to put that retry — a sleeping speaker would come back as a flat failure having
+        *already* switched off the one that was working. Selecting the target first and only then
+        deselecting the rest means a failure leaves the previous speaker playing, which is the
+        behaviour to have when the thing being asked for is "move the music".
+
+        Deselecting is best-effort for the same reason it happens second. An output that will not
+        switch off is not a reason to fail a selection that already succeeded — the music is
+        playing where it was asked to play, and the worst case is one extra speaker, which is
+        audible and fixable rather than silent.
+        """
+        self.select_output(output_id, volume=volume)
+        turned_off: list[str] = []
+        for other in self.outputs():
+            if other.id == output_id or not other.selected:
+                continue
+            try:
+                self.deselect_output(other.id)
+            except PlayerError as exc:
+                log.warning("could not switch off output %r: %s", other.name, exc)
+                continue
+            turned_off.append(other.id)
+        if turned_off:
+            log.info("switched off %d other output(s) for %s", len(turned_off), output_id)
+        return turned_off
 
     def set_volume(self, volume: int, *, output_id: str | None = None) -> None:
         self._client.put("/api/player/volume", volume=_clamp_volume(volume), output_id=output_id)
@@ -614,7 +664,44 @@ def _output(raw: dict[str, Any]) -> Output:
         selected=bool(raw.get("selected")),
         volume=_as_int(raw.get("volume")),
         needs_auth_key=bool(raw.get("needs_auth_key")),
+        requires_auth=bool(raw.get("requires_auth")),
     )
+
+
+def _unreachable_message(output_id: str, output: Output | None, attempts: int) -> str:
+    """Why a speaker would not start, in words that match the *kind* of speaker.
+
+    This used to be one hard-coded sentence about Cast devices in standby, which was true of the one
+    speaker Phase 3 had and became wrong the moment a selector listed the whole house. Selecting an
+    AirPlay output got back advice to "try again in a moment" for a failure that would never clear —
+    and the first line of it asserted a cause the log flatly contradicted. A diagnosis in the wrong
+    direction is worse than no diagnosis, because somebody acts on it.
+
+    Nothing of the daemon's own answer is included, which is the part that has not changed: that
+    answer is a full HTML error page, and a remote whose error text is a markup fragment in a toast
+    is the failure this whole method exists to avoid. The daemon's text is in the log and on
+    ``__cause__``.
+    """
+    name = output.name if output else output_id
+    head = (
+        f"{name!r} is listed by the player but would not start after {attempts} attempt(s). "
+        if output
+        else f"the player has output {output_id} listed but could not bring it up after "
+        f"{attempts} attempt(s). "
+    )
+    if output is None or output.is_cast:
+        why = (
+            "A Cast speaker in standby does exactly this: it is still advertised on the network "
+            "while it stops answering, so try again in a moment."
+        )
+    else:
+        # AirPlay, or anything else the daemon supports. Standby is not the usual story there; being
+        # switched off as a receiver, or on a different network segment, is.
+        why = (
+            "Check that the device is awake and still has AirPlay receiving switched on — an "
+            "AirPlay receiver that is advertised is not necessarily accepting connections."
+        )
+    return head + why + ' The reason is in the player\'s own log (look for "Could not connect").'
 
 
 def _queue_item(raw: dict[str, Any]) -> QueueItem:

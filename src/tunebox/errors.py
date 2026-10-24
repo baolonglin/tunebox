@@ -92,3 +92,33 @@ class OutputUnreachable(PlayerError):
     the message says "try again in a moment" because on the measured failure a later attempt
     connected with nothing else changed.
     """
+
+
+class OutputNeedsPairing(PlayerError):
+    """The speaker will not start until somebody enters a PIN or a password for it.
+
+    The third distinct way selecting an output fails, after :class:`OutputNotFound` ("it is not
+    there") and :class:`OutputUnreachable` ("it is there and will not wake"). It earns its own class
+    because the *advice* is different in the one way that matters: the other two end with "try
+    again", and this one can never be fixed by trying again.
+
+    Found in use rather than designed for. Selecting an AirPlay 2 output — a Mac advertising itself
+    as a receiver — produced :class:`OutputUnreachable`, whose message is Cast prose: *"A Cast
+    speaker in standby does exactly this ... so try again in a moment."* Every word of that was
+    wrong for the actual failure, which OwnTone's own log stated plainly (measured against OwnTone
+    29.3, 2026-10-24)::
+
+        airplay: Status flags from 'MacBook Pro' was 516: ... one time pairing 1 ...
+        airplay: Starting device pairing for 'MacBook Pro', go to the web interface and enter PIN
+        airplay: Response to PIN start from 'MacBook Pro' was negative, aborting (403 Forbidden)
+        player: The AirPlay 2 device 'MacBook Pro' requires a valid PIN or password
+
+    Mapped to ``409``: the request is well formed and the speaker exists, and what stands in the way
+    is state the caller can see and must change elsewhere first — which is exactly what ``409``
+    means and what ``503`` ("try again") does not.
+
+    tunebox cannot do the pairing itself, deliberately. It is ``POST
+    /api/outputs/{id}/verification`` on the daemon, and there is no pass-through to OwnTone
+    (PLAN.md 3.2), so the honest answer is to name the speaker and point at the daemon's own web UI —
+    which the remote's footer already links to.
+    """
