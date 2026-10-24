@@ -811,6 +811,19 @@ the three things a deployment normally has to decide are decided by looking:
 - **the JavaScript runtime** is whichever of deno/node/quickjs/bun the host has, which is why no
   step of this asks what architecture the Pi is.
 
+**On a headless Pi, `deploy/push.sh` is the one to run instead**, from your laptop: it tars the
+working tree, copies it over ssh, and runs the installer there — so an uncommitted change is
+testable on the real hardware, and git, credentials and ssh keys stay off the Pi entirely.
+[deploy/DEPLOY-PI.md](deploy/DEPLOY-PI.md) is the end-to-end guide: the address reservation, the
+push, the OwnTone source build, and — if you want the remote to work away from the house — the
+router's VPN rather than a forwarded port.
+
+```bash
+./deploy/push.sh --music-root /mnt/ssd/music --api-host 192.168.50.93
+./deploy/push.sh --dry-run       # print every step, change nothing
+./deploy/push.sh -- --no-deps    # everything after `--` is passed to install.sh
+```
+
 What it creates:
 
 | Path | What |
@@ -850,10 +863,14 @@ Useful flags: `--music-root DIR` (on a Pi, point it at the USB SSD, not the SD c
 
 ### Playback: pointing OwnTone at the library
 
-The installer does not install OwnTone. That is the one step that genuinely differs per platform — a
-source build on macOS, a package on Debian — and a script that guessed wrong would leave a half-built
-daemon behind. Install it (see the [OwnTone
-docs](https://owntone.github.io/owntone-server/installation/)), then:
+The installer does not install OwnTone. On macOS that is a source build, and on Raspberry Pi OS it is
+*also* a source build — measured on this project's Pi (trixie, 2026-10), neither `owntone` nor
+`forked-daapd` exists in Debian or the Raspberry Pi archive, so `apt install owntone` is not a route
+on that hardware. `deploy/owntone-build.sh` is the Debian/Pi build, and it passes
+`--enable-chromecast` and then asserts it, because a daemon built without it fails at the only thing
+this project needs it for and the failure looks like a speaker that is never listed. See
+[deploy/DEPLOY-PI.md](deploy/DEPLOY-PI.md). On macOS, install it by hand (see the [OwnTone
+docs](https://owntone.github.io/owntone-server/installation/)). Then, on either:
 
 ```bash
 ./deploy/owntone-setup.sh            # configure, supervise, find the speaker
@@ -937,9 +954,16 @@ token byte-identical, and `--uninstall` leaving the music and config in place.
 The **Linux path has not been run on a Pi.** What is tested is the code that generates it: the suite
 puts `uname`/`systemctl`/`sudo` shims on `PATH` and runs the installer's Linux branch on macOS,
 asserting the unit's hardening directives, its `ReadWritePaths`, `WantedBy=multi-user.target`, and
-that the dependency on OwnTone is `Wants` and not `Requires`. Whether `apt-get` has the packages, and
-whether OwnTone's Debian build enables Chromecast, cannot be established from here — the scripts
-check and report rather than assume.
+that the dependency on OwnTone is `Wants` and not `Requires`. One thing that *was* established on
+the hardware: there is no OwnTone package in Raspberry Pi OS trixie or the Raspberry Pi archive, so
+the Chromecast question that used to be open here is moot — there is no Debian build to ask about,
+and `deploy/owntone-build.sh` enables the option itself and asserts it. Whether `apt-get` has the
+rest of the packages is still unestablished from here; the scripts check and report rather than
+assume.
+
+The **router steps in [deploy/DEPLOY-PI.md](deploy/DEPLOY-PI.md) are unverified** — written from
+knowledge of ASUSWRT rather than from a run against a router, whose web UI has been reorganised
+more than once across firmware generations.
 
 ## Keeping it alive
 
@@ -1270,7 +1294,8 @@ src/tunebox/ops/       Phase 5: canary, yt-dlp update + rollback, backup/restore
                        request path imports it, so a bug here cannot break ingest or playback
 src/tunebox/cli.py     search / ingest / doctor / serve / player / exposure / update / healthcheck /
                        backup / restore / maintain
-deploy/                install.sh (macOS + Raspberry Pi), owntone-setup.sh, and start.sh for this Mac
+deploy/                install.sh (macOS + Raspberry Pi), push.sh and owntone-build.sh for a
+                       headless Pi, owntone-setup.sh, start.sh for this Mac, and DEPLOY-PI.md
 tools/make_icons.py    regenerates the PNG icons from the same drawing as icon.svg
 ```
 

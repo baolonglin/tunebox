@@ -453,6 +453,21 @@ This service downloads arbitrary URLs and executes ffmpeg. It must never be an o
 - **No public exposure, and no port forwarding — ever.** Bind to the LAN address only. Do not
   enable UPnP on the router for this. Home-only scope means there is no legitimate reason for
   a packet from the internet to reach it.
+  **Status 2026-10-24: still holds, and a VPN is not the exception it looks like.** Remote access
+  turned out to be wanted — for *playback* away from the house, not only the ingest this section
+  anticipated — so `deploy/DEPLOY-PI.md` documents terminating a WireGuard tunnel on the router.
+  That keeps this requirement rather than bending it, and the distinction is worth writing down
+  because the next person will read "no port forwarding" and see a contradiction. What is forbidden
+  here is *an endpoint that answers*: port 8080 would reply over plaintext HTTP, guarded by one
+  shared token with no rate limiting, on a route that runs yt-dlp. WireGuard replies to nothing it
+  cannot already authenticate by public key — a scan shows filtered, with no banner and no handshake
+  with a stranger — so there is nothing to brute-force because there is nothing that responds. The
+  property being protected is "no packet from the internet reaches the ingest API", and a tunnel
+  preserves it exactly: packets from the internet reach the router's crypto, and only an
+  already-authenticated peer becomes a packet on the LAN. This is the same argument as the Tailscale
+  bullet below, with the tunnel ending on the router instead of the host — which is also why it
+  needs no change to the LAN-only bind, and why `tunebox exposure` still reports no mapping to this
+  host afterwards.
 - **The LAN is not a trust boundary.** A flat home network typically includes a smart TV, a
   vacuum, and a lightbulb running firmware from 2019. Put a password on the ingest API even
   though it is LAN-only — a single shared token in a header is enough at this scale, checked
@@ -588,7 +603,10 @@ becomes an opt-in flag later, per ingest.
 - [x] Confirm scope: personal/self-hosted, private, **home network only**.
 - [x] Confirm Alternative B vs A. → B.
 - [x] Host hardware: Raspberry Pi + USB SSD (or an existing always-on box).
-- [x] Access path: LAN-only bind. Tailscale optional, for remote *ingest* only.
+- [x] Access path: LAN-only bind. Tailscale optional, for remote *ingest* only. → **Revised
+      2026-10-24:** the bind is unchanged, but remote access turned out to be wanted for *playback*
+      as well, which is a wider scope than this line recorded. Either a WireGuard tunnel on the
+      router or Tailscale on the host; both keep the LAN-only bind. See `deploy/DEPLOY-PI.md`.
 - [x] Soundbar identified: **LG SN9YG**. **Chromecast built-in only — no AirPlay** (confirmed by
       mDNS sweep and by the vendor's own spec). Also Bluetooth, HDMI in, HDMI out/eARC, optical.
       Nothing needs buying.
@@ -1184,7 +1202,11 @@ unreachable without it — an icon on a phone needs something that is always run
 - [ ] Navidrome alongside OwnTone over the same folder, if a native Subsonic client with
       offline caching or lockscreen controls turns out to be wanted after all.
 - [ ] Snapcast for synchronised multi-room, if a second speaker ever appears.
-- [ ] Tailscale, if queueing tracks from outside the house turns out to be wanted.
+- [x] Remote access, which turned out to be wanted for playback rather than only for queueing
+      tracks: documented in `deploy/DEPLOY-PI.md` as a WireGuard tunnel on the router (nothing on
+      the host changes) or Tailscale on the host (`tailscale serve`, because the LAN-only bind does
+      not answer on the tailnet interface). Neither is implemented *in* tunebox, deliberately —
+      there is no code here to own it, which is the point.
 - [ ] Source adapter interface + a licence-clean source, keeping Alternative E open.
 - [ ] Playlist import; "album mode" ingest.
 
