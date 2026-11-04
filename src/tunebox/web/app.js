@@ -49,6 +49,12 @@
   const LOCAL_QUEUE_KEY = "tunebox.local";
   /** The value of `state.device` that means "play here, in this browser". */
   const LOCAL_DEVICE = "local";
+  /**
+   * How many tracks ahead this device holds a streaming URL for. See `localPrefetchNext`: the
+   * number is what decides how many track boundaries a phone in a pocket can cross without the
+   * network, because a throttled page cannot complete a fetch to replace one it has spent.
+   */
+  const AHEAD_DEPTH = 3;
 
   /** Elements are looked up once: this page's DOM is static, only its contents change. */
   const el = (id) => document.getElementById(id);
@@ -89,6 +95,17 @@
       shuffle: false,
       /** Set when a track will not load — a deleted file, or an expired ticket. */
       error: null,
+      /**
+       * Streaming URLs already minted for the tracks coming next, as `[{ path, url }]`, up to
+       * `AHEAD_DEPTH` of them. The whole point of it is that a track boundary contains no network
+       * request: see `localPrefetchNext` and `localAdvanceOnEnded`.
+       */
+      ahead: [],
+      /**
+       * `{ path, ms }` read out of storage at startup — where this device was in the track when it
+       * was last closed. Consumed by the first `localLoad`, and only if it is still the same track.
+       */
+      resume: null,
     },
     /** What the queue was last drawn from, so an unchanged poll leaves its nodes (and focus) alone. */
     queueKey: null,
@@ -759,6 +776,60 @@
   const audio = () => el("local-audio");
 
   /**
+   * The looping silence that keeps iOS's audio session open, and the page scheduled. See the
+   * `local-silence` comment in index.html for the measurements that put it there.
+   */
+  const silence = () => el("local-silence");
+
+  /**
+   * Hold or release iOS's audio session, in the three states this device can be in.
+   *
+   * `"playing"` and `"idle"` are obvious. `"paused"` is the one that took three measurements to get
+   * right, and it is a genuine conflict rather than a missing trick:
+   *
+   * * **Let the channel go on pause** and the system state is honest — nothing shows as playing,
+   *   nothing competes for the channel, no battery is spent. But a backgrounded page with no audio
+   *   is a page iOS stops scheduling, so the `play` command from the lockscreen is not answered
+   *   *at all*. Measured: pause from the pull-down while in another app, and playback cannot be
+   *   resumed from there.
+   * * **Keep it** and the lockscreen works both ways. But the system's Now Playing state follows
+   *   whether audio is really running rather than `mediaSession.playbackState`, so it reports
+   *   "playing" for a track nobody is listening to, within a second of the pause.
+   *
+   * Being unable to resume is worse than a button that looks wrong, so the channel is kept — with a
+   * deadline. `SESSION_GRACE_MS` after a pause it is released, which covers the case a pause is
+   * actually for (a word with somebody, then carry on) and caps what the wrong state costs. Come
+   * back after that and the app is a tap away, which is where you already are.
+   */
+  const SESSION_GRACE_MS = 5 * 60 * 1000;
+  let sessionRelease = null;
+  function audioSession(state) {
+    const keeper = silence();
+    if (!keeper) return;
+    if (sessionRelease !== null) {
+      window.clearTimeout(sessionRelease);
+      sessionRelease = null;
+    }
+    if (state !== "idle" && !localMode()) return;
+    if (state === "idle") {
+      if (!keeper.paused) keeper.pause();
+      return;
+    }
+    if (keeper.paused) {
+      const started = keeper.play();
+      if (started && typeof started.catch === "function") started.catch(() => {});
+    }
+    if (state === "paused") {
+      sessionRelease = window.setTimeout(() => {
+        sessionRelease = null;
+        // Only if it is still paused: a resume inside the window cancels this, but a second pause
+        // re-arms it, and the two must not race into releasing the channel under live playback.
+        if (audio().paused) audioSession("idle");
+      }, SESSION_GRACE_MS);
+    }
+  }
+
+  /**
    * Can this browser be told what volume to play at?
    *
    * iOS says no, and says it by *ignoring the assignment* rather than by throwing — so the only way
@@ -886,10 +957,14 @@
   async function localLoad({ autoplay }) {
     const element = audio();
     const track = localTrack();
+    // Before the await, deliberately: this is still inside the tap that got here, which is the only
+    // kind of event that may start audio on iOS.
+    audioSession(track && autoplay ? "playing" : "idle");
     if (!track) {
       element.removeAttribute("src");
       element.load();
       localRender();
+      localPrefetchNext();
       return;
     }
     state.local.error = null;
@@ -903,17 +978,195 @@
       return;
     }
     element.src = url;
+    localResumeInto(track);
+    // **No `await` between assigning the `src` and the prefetch below.** Measured on this
+    // household's phone: on a backgrounded page the promise `play()` returns does not settle, so an
+    // `await` on it is the end of the function — and with the prefetch behind that await, a pocket
+    // crossed exactly one track boundary and then stalled, because the thing that makes the *next*
+    // boundary free never ran. The audio itself is unaffected either way: assigning `src` is what
+    // starts the fetch and the decode.
+    localPersist();
+    localRender();
     if (autoplay) {
+      let started;
       try {
-        await element.play();
+        started = element.play();
       } catch (error) {
-        // Autoplay refused, or the file will not decode. Either way the screen must not claim to be
-        // playing — and the message differs, so it is the browser's own rather than ours.
+        started = null;
         state.local.error = `Could not start playback: ${error.message || error.name}`;
+        localRender();
       }
+      if (started && typeof started.catch === "function") {
+        started.catch((error) => {
+          // Autoplay refused, or the file will not decode. Either way the screen must not claim to
+          // be playing — and the message differs, so it is the browser's own rather than ours.
+          state.local.error = `Could not start playback: ${error.message || error.name}`;
+          localRender();
+        });
+      }
+    }
+    // Last, and deliberately *after* playback has been asked for rather than before it: this issues
+    // three requests, and nothing that merely makes the next track cheap may sit between a tap and
+    // the sound. There is no `await` above, so a backgrounded page still reaches this line.
+    localPrefetchNext();
+  }
+
+  /**
+   * Put the element back where this device was when it was last closed.
+   *
+   * Only ever for the track that was playing then, and consumed on the first load either way: this
+   * is "carry on where I was", not a bookmark per track. The seek waits for `loadedmetadata`
+   * because `currentTime` on an element that has not read the container's header yet is ignored.
+   */
+  function localResumeInto(track) {
+    const resume = state.local.resume;
+    state.local.resume = null;
+    if (!resume || resume.path !== track.path || resume.ms < 2000) return;
+    const element = audio();
+    const seconds = resume.ms / 1000;
+    element.addEventListener(
+      "loadedmetadata",
+      () => {
+        // Never to the very end: a track saved two seconds before it finished would otherwise
+        // resume into its own `ended`.
+        if (Number.isFinite(element.duration) && seconds > element.duration - 2) return;
+        try {
+          element.currentTime = seconds;
+        } catch (error) {
+          /* the browser would not seek; the track plays from the beginning, which is not a failure */
+        }
+      },
+      { once: true }
+    );
+  }
+
+  /**
+   * The track `steps` boundaries ahead, or `null` when that is not knowable yet.
+   *
+   * Pure, and separate from `localNext` for one reason: it is what can be prefetched. Three of the
+   * cases are deliberately `null` rather than a guess — repeat-one never fires `ended` at all
+   * (`element.loop` does the repeating), the end of the queue with repeat off is a stop, and a
+   * shuffled queue that is about to wrap gets re-shuffled *by* the wrap, so which track comes next
+   * genuinely does not exist yet. The last of those is the one boundary in an evening that still
+   * takes the slow path.
+   */
+  function localAheadTrack(steps) {
+    const local = state.local;
+    const wanted = steps === undefined ? 1 : steps;
+    if (local.cursor < 0 || !local.order.length) return null;
+    if (local.repeat === "single") return null;
+    let at = local.cursor;
+    for (let i = 0; i < wanted; i += 1) {
+      if (at < local.order.length - 1) {
+        at += 1;
+      } else if (local.repeat === "all" && !local.shuffle) {
+        at = 0;
+      } else {
+        return null;
+      }
+    }
+    return local.queue[local.order[at]] || null;
+  }
+
+  /**
+   * Mint the next few tracks' capability URLs *now*, while this one is still playing.
+   *
+   * This exists because of one measured iOS behaviour: a backgrounded page is kept alive while its
+   * audio element is playing and throttled the moment it is not — and `ended` is exactly that
+   * moment. The original code had to `await localTicket()` before it could assign a `src`, so on a
+   * phone in a pocket the fetch was suspended mid-flight and the music simply stopped at the end of
+   * the track.
+   *
+   * **`AHEAD_DEPTH` is 3 rather than 1, and that is the second half of the same lesson.** Holding
+   * exactly one URL buys exactly one boundary: crossing it empties the store, and refilling it is a
+   * fetch — which is the thing that does not come back while the page is throttled. So a pocket got
+   * one good track change and then stalled on the next. Three means three boundaries with no
+   * network at all, by which time the phone has usually been looked at. It is three signatures, not
+   * forty: minting the whole queue up front was rejected (README) because most of them are never
+   * spent, and that argument is about a queue, not about the next few minutes.
+   *
+   * Idempotent, and keyed by **path** rather than by position: a held URL names a file, so it stays
+   * good when the queue is reordered around it and is simply dropped when the track is no longer
+   * coming. Failure is silent on purpose — `localAdvanceOnEnded` falls back to the slow path that
+   * was always there, and a toast about a track that has not started yet would be noise.
+   */
+  function localPrefetchNext() {
+    const local = state.local;
+    const wanted = [];
+    for (let step = 1; step <= AHEAD_DEPTH; step += 1) {
+      const track = localAheadTrack(step);
+      if (!track) break;
+      // A queue shorter than the depth, on repeat: one URL per file is all there is to hold.
+      if (wanted.indexOf(track.path) >= 0) break;
+      wanted.push(track.path);
+    }
+    const held = (path) => local.ahead.some((ticket) => ticket.path === path);
+    // Synchronous, so it is still correct on a page that cannot complete a fetch: a track that is no
+    // longer coming loses its URL whether or not the replacements arrive.
+    local.ahead = local.ahead.filter((ticket) => wanted.indexOf(ticket.path) >= 0);
+    const missing = wanted.filter((path) => !held(path));
+    if (!missing.length) return Promise.resolve();
+    return Promise.all(
+      missing.map((path) =>
+        localTicket(path).then(
+          (url) => {
+            // The queue may have moved on while the request was in flight. Checked against what is
+            // wanted *now*, not against what was wanted when it was sent.
+            for (let step = 1; step <= AHEAD_DEPTH; step += 1) {
+              const track = localAheadTrack(step);
+              if (track && track.path === path && !held(path)) {
+                local.ahead.push({ path, url });
+                return;
+              }
+            }
+          },
+          () => {
+            /* no prefetch for that one; the end of the track will mint it the slow way */
+          }
+        )
+      )
+    );
+  }
+
+  /**
+   * A track finished on its own.
+   *
+   * **Synchronous from `ended` to `play()`**, and that is the whole value of this function: no
+   * `await`, no fetch, no promise between the event and the assignment, because on a backgrounded
+   * iOS page there may be no later turn of the event loop to come back to. The cursor arithmetic is
+   * the same as `localNext(false)`'s, over the one case `localAheadTrack` already proved is a plain
+   * step: either one forward, or round to the top of a queue on repeat.
+   *
+   * Anything else — no held URL for the track that is next, the end of the queue, repeat-one — is
+   * handed to `localNext`, which is still correct and merely slower.
+   */
+  function localAdvanceOnEnded() {
+    const local = state.local;
+    if (!localMode()) return Promise.resolve();
+    const next = localAheadTrack(1);
+    const ticket = next && local.ahead.filter((candidate) => candidate.path === next.path)[0];
+    if (!ticket) return localNext(false);
+    const element = audio();
+    local.cursor = local.cursor < local.order.length - 1 ? local.cursor + 1 : 0;
+    local.error = null;
+    element.src = ticket.url;
+    let started;
+    try {
+      started = element.play();
+    } catch (error) {
+      started = null;
+    }
+    if (started && typeof started.catch === "function") {
+      // A rejected `play()` here means the ticket expired or the file has gone, so the slow path is
+      // worth taking: it mints a fresh URL and reports a real error if that fails too.
+      started.catch(() => localLoad({ autoplay: true }));
     }
     localPersist();
     localRender();
+    // Tops the store back up to the depth, and prunes the track that has just started. Its fetch may
+    // never come back on a page in a pocket, which is exactly why the depth is more than one.
+    localPrefetchNext();
+    return Promise.resolve();
   }
 
   /**
@@ -949,6 +1202,7 @@
       await localLoad({ autoplay: true });
     } else {
       localRender();
+      localPrefetchNext();
     }
   }
 
@@ -965,9 +1219,17 @@
   function localToggle() {
     const element = audio();
     if (!localTrack()) return Promise.resolve();
-    if (!element.getAttribute("src")) return localLoad({ autoplay: true });
-    if (element.paused) return element.play().then(localRender, localRender);
+    if (!element.getAttribute("src")) {
+      audioSession("playing");
+      return localLoad({ autoplay: true });
+    }
+    if (element.paused) {
+      audioSession("playing");
+      return element.play().then(localRender, localRender);
+    }
     element.pause();
+    // Kept, with a deadline — see audioSession. A lockscreen pause has to be undoable there.
+    audioSession("paused");
     localRender();
     return Promise.resolve();
   }
@@ -1022,6 +1284,8 @@
     // The cursor stays where it was, so ⏯ plays that track again from the beginning rather than
     // jumping back to the top of the list — a stop is "that is enough", not "start over".
     if (!state.local.order.length) state.local.cursor = -1;
+    state.local.ahead = [];
+    audioSession("idle");
     localPersist();
     localRender();
     return Promise.resolve();
@@ -1041,6 +1305,7 @@
     audio().loop = mode === "single";
     localPersist();
     localRender();
+    localPrefetchNext();
     return Promise.resolve();
   }
 
@@ -1050,6 +1315,7 @@
     localReorder(playing ? state.local.queue.indexOf(playing) : undefined);
     localPersist();
     localRender();
+    localPrefetchNext();
     return Promise.resolve();
   }
 
@@ -1076,6 +1342,7 @@
     else {
       localPersist();
       localRender();
+      localPrefetchNext();
     }
   }
 
@@ -1086,13 +1353,20 @@
    *
    * The house queue survives a restart because OwnTone holds it; this one would not survive a tab
    * being reopened, and a list somebody built disappearing because they switched apps is the sort of
-   * loss a remote should not inflict. Only the list and the settings are stored — not the playback
-   * position, because resuming a track to the second is a promise this cannot keep (the element is
-   * gone, and so is the ticket).
+   * loss a remote should not inflict.
+   *
+   * The playback **position** is stored too, which an earlier version of this called a promise it
+   * could not keep. It can: the element is gone when the app is reopened and so is the ticket, but
+   * `localLoad` mints a fresh one anyway, so the only thing that was ever missing was the number of
+   * seconds. It matters most in the case this mode is worst at — the phone locking, or walking out
+   * of Wi-Fi range, halfway through a long track — where without it the one tap that gets the music
+   * back also starts the song again.
    */
   function localPersist() {
     try {
       const local = state.local;
+      const element = audio();
+      const track = localTrack();
       window.localStorage.setItem(
         LOCAL_QUEUE_KEY,
         JSON.stringify({
@@ -1101,12 +1375,38 @@
           order: local.order,
           repeat: local.repeat,
           shuffle: local.shuffle,
-          volume: canSetVolume() ? audio().volume : undefined,
+          volume: canSetVolume() ? element.volume : undefined,
+          // `readyState` is the guard that makes this safe to call from anywhere, and it is not
+          // defensive padding: assigning a `src` resets the element to HAVE_NOTHING, so between the
+          // boundary swap and the new track's first frame `currentTime` is the *old* track's
+          // position. Written without this, the next reopen would resume a fresh song three minutes
+          // in. Zero means "nothing is loaded", so there is no position to record.
+          position:
+            track && element.readyState > 0 && element.currentTime > 0
+              ? { path: track.path, ms: Math.round(element.currentTime * 1000) }
+              : undefined,
         })
       );
     } catch (error) {
       /* storage disabled; the queue is then good for this session only */
     }
+  }
+
+  /**
+   * Write the position down while a track plays, not only when something changes.
+   *
+   * Every five seconds rather than on every `timeupdate`, which fires four times a second: this is
+   * `localStorage` on a phone, and the worst case the throttle costs is resuming five seconds early.
+   * It has to be a timer of this shape because the event that would be the obvious hook does not
+   * exist — a tab iOS discards, or a phone whose battery dies, fires no `pagehide` and no
+   * `beforeunload`. The last write before the lights go out is simply the last one on the clock.
+   */
+  let positionWrittenAt = 0;
+  function localRecordPosition() {
+    const now = Date.now();
+    if (now - positionWrittenAt < 5000) return;
+    positionWrittenAt = now;
+    localPersist();
   }
 
   function localRestore() {
@@ -1137,6 +1437,11 @@
       : [];
     local.order = order.length === local.queue.length ? order : local.queue.map((_, i) => i);
     local.cursor = Number.isInteger(saved.cursor) && saved.cursor < local.order.length ? saved.cursor : -1;
+    const position = saved.position;
+    local.resume =
+      position && typeof position.path === "string" && Number.isFinite(position.ms) && position.ms > 0
+        ? { path: position.path, ms: position.ms }
+        : null;
     if (canSetVolume() && typeof saved.volume === "number") {
       audio().volume = Math.max(0, Math.min(1, saved.volume));
     }
@@ -1177,6 +1482,11 @@
     const session = navigator.mediaSession;
     if (!session || typeof session.setActionHandler !== "function") return;
     const handlers = {
+      // `play` and `pause` both go through `localToggle`, which is also what the page's own button
+      // calls — so the lockscreen and the page cannot drift apart, and the audio session is picked
+      // up and let go in exactly the same places. Measured: the system's own Now Playing state
+      // follows whether audio is *actually* running, not `session.playbackState`, so a pause that
+      // left a silent stream playing was reported back as "playing" within a second.
       play: () => localToggle(),
       pause: () => localToggle(),
       stop: () => localStop(),
@@ -1195,6 +1505,35 @@
     });
   }
 
+  /**
+   * Let the silence be startable later, from the first touch anywhere on the page.
+   *
+   * An audio element on iOS may not be started by script until it has played once inside a user
+   * gesture. The taps that start music are several frames and sometimes a fetch away from
+   * `audioSession`, so rather than thread the gesture through every one of them, the first
+   * touch on the page unlocks the element with a play/pause pair it will never hear. After that a
+   * programmatic `play()` is permitted, which is all this needs — the session itself is live at
+   * that point anyway, because the track the tap started is playing.
+   */
+  function unlockSilenceOnFirstTouch() {
+    const keeper = silence();
+    if (!keeper) return;
+    const unlock = () => {
+      const started = keeper.play();
+      const settle = () => {
+        // Unlocking is not playing: unless music is already going, it goes straight back to paused.
+        if (!localMode() || audio().paused) keeper.pause();
+      };
+      if (started && typeof started.then === "function") started.then(settle, () => {});
+      else settle();
+    };
+    // `once`, and on both events, because a desktop browser with no touch still has to get here for
+    // the test harness and for anybody debugging this on a laptop.
+    ["pointerdown", "keydown"].forEach((name) =>
+      document.addEventListener(name, unlock, { once: true, passive: true })
+    );
+  }
+
   function wireAudio() {
     const element = audio();
     // Four frames a second from the element rather than a one-second interval of our own: this is
@@ -1203,13 +1542,16 @@
       if (!localMode()) return;
       state.progressMs = element.currentTime * 1000;
       drawProgress();
+      localRecordPosition();
     });
     // The length is not known until the browser has read the container's header, and the progress
     // bar has no scale until it is.
     element.addEventListener("loadedmetadata", localRender);
     element.addEventListener("play", localRender);
     element.addEventListener("pause", localRender);
-    element.addEventListener("ended", () => localNext(false));
+    // Not `localNext(false)`: see `localAdvanceOnEnded`, which is the same decision reached without
+    // a network request in the way, because on a backgrounded phone there may be no second chance.
+    element.addEventListener("ended", () => localAdvanceOnEnded());
     element.addEventListener("error", () => {
       if (!localMode()) return;
       // `load()` on an element whose src has just been removed fires this too, so an unloaded
@@ -1313,7 +1655,12 @@
         renderDevices(state.player);
         return;
       }
-      if (previous === LOCAL_DEVICE) audio().pause();
+      if (previous === LOCAL_DEVICE) {
+        audio().pause();
+        // The session is held for *this* device's playback. Pointing the page at a speaker means
+        // the room is the audio path, so there is nothing here left to keep alive.
+        audioSession("idle");
+      }
       state.device = device;
       storeDevice(device);
       renderPlayer(player);
@@ -2481,6 +2828,7 @@
     wireVisibility();
     wireDevices();
     wireAudio();
+    unlockSilenceOnFirstTouch();
     wireMediaSession();
     registerWorker();
 

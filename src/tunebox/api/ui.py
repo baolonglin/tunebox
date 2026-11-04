@@ -80,6 +80,11 @@ UI_PREFIX = "/ui/"
 UI_ASSETS = (
     "app.css",
     "app.js",
+    # Two seconds of silence, looped forever while this device is the output. Not decoration: it is
+    # what holds iOS's audio session open across a track boundary — see the `local-silence` comment
+    # in index.html. Regenerate with
+    #   ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 2 -c:a aac -b:a 16k silence.m4a
+    "silence.m4a",
     "icon.svg",
     "icon-180.png",
     "icon-192.png",
@@ -95,6 +100,7 @@ _CONTENT_TYPES = {
     ".webmanifest": "application/manifest+json",
     ".svg": "image/svg+xml",
     ".png": "image/png",
+    ".m4a": "audio/mp4",
 }
 
 #: File types the version placeholders are substituted into. A PNG must never be string-processed.

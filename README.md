@@ -336,8 +336,66 @@ A soundbar does not reach every room, somebody else is sometimes using it, and h
   Apple does not say so — assignments are silently ignored. So the page detects it, disables the
   slider and the ± buttons, and says *"use the phone's own volume buttons"*. Nothing is more
   annoying than a control that looks like it worked.
-- **The queue survives closing the app**, because it is in that device's storage. The playback
-  *position* does not: resuming a track to the second is a promise this cannot keep.
+- **The queue survives closing the app**, and so does your place in the track, because both are in
+  that device's storage. The position is written down every five seconds while a track plays, so a
+  phone that locked, ran out of battery or walked out of range comes back to the same song at
+  roughly the same second — one tap, which continues rather than starting over.
+- **It keeps playing in another app, and keeps going at the end of the track.** The second half of
+  that was a bug for a while, and the reason is worth knowing because it shapes the code: iOS keeps
+  a backgrounded page alive *while its audio element is playing* and throttles it the moment that
+  stops — which is exactly when a track ends. The handler then had to fetch a capability URL before
+  it could load the next song, and a fetch from a page the OS has just suspended does not come back.
+  So the music played to the end of the song in your pocket and then stopped. The next tracks' URLs
+  are now minted while the current one is still playing, which leaves the end of a track with
+  nothing to do but assign a `src` and press play — no `await` between the two.
+
+  **And one silent audio element, which is the part worth knowing about.** iOS reclaims a page's
+  audio session, and stops scheduling the page at all, the moment its audio stops — and a track
+  ending *is* its audio stopping. Measured on this household's phone: the handler that starts the
+  next track ran **36 seconds** late, waiting for the app to be reopened, and when it did run the
+  element reported playing and advanced its clock in silence, because a programmatic `play()` cannot
+  reactivate a session that has been reclaimed. The measurement that proved it was the session
+  rather than the code: the same two taps were **silent from the lockscreen and audible in the
+  page** — a remote command is not a user gesture. So the page keeps two seconds of silence looping
+  for as long as a track is loaded, paused or playing. With it the session is never reclaimed, the
+  page is never descheduled, and the prefetched URL above lands on a live session — and, measured,
+  the lockscreen's own pause and play start working, which they did not before.
+
+  It is held while playing and **let go on pause**, which is narrower than it needs to be for the
+  lockscreen and is right anyway. The system's Now Playing state follows whether audio is really
+  running rather than `mediaSession.playbackState`, so a pause that kept the silence going was
+  reported straight back as "playing" — on top of keeping tunebox the app a steering wheel or a
+  headphone button aims at, and keeping the page scheduled, for a track nobody is listening to. The
+  price is that resuming from the lockscreen *after a pause* can be silent; resuming by tapping the
+  page always works.
+
+  **Three ahead, not one, and the one-deep version is why.** It fixed the first boundary and then
+  failed at the second, because crossing a boundary spends the held URL and refilling it is a
+  fetch — the exact thing a throttled page cannot finish. The service log on the host is where this
+  is visible, and it is worth knowing that it is: a `POST /library/tickets` with no `GET /media/`
+  after it is a URL minted for later, so a prefetch that is working looks like a cluster of them
+  while a track starts, and a boundary that fell back to the slow path looks like a `POST`
+  immediately followed by the audio. Three means three track changes with no network at all.
+  Two things still take the slow path, deliberately: a shuffled queue wrapping round re-shuffles
+  itself, so which track comes next does not exist until it does; and the same measurement turned up
+  a second trap worth recording — nothing load-bearing may sit after `await element.play()`, because
+  on a backgrounded page that promise never settles, and the first version had the prefetch behind
+  it.
+
+#### What it cannot do: start the music when you get in the car
+
+There is no way to make this the app your car starts, and no amount of work here changes that. "Car
+connects, music plays" is the car sending a Bluetooth/AVRCP play command, which iOS hands to the app
+that last held the audio session — and only a **native** app can be launched or resumed from
+suspended that way. A Safari tab or an installed web app cannot be woken by it; the Media Session
+handlers (`play`, `nexttrack`, and the rest) only run while the page is still alive, which is what
+makes the lockscreen work and is not the same thing. CarPlay has no browser either, so there is no
+surface to put the remote on.
+
+The closest reachable thing is a Shortcuts personal automation — *When CarPlay connects → Open app →
+tunebox* — which gets you to Now playing with the queue and the position you left. It cannot press
+play: iOS has no per-site autoplay permission, so audio outside a user gesture is refused. So it is
+one tap, and that tap continues rather than restarting.
 
 #### Which speakers the remote may use
 
@@ -1241,8 +1299,9 @@ silently stops a button working. None of that substitutes for opening the page: 
 Phase 4 that mattered was invisible to every DOM-level assertion and obvious in a browser
 (PLAN.md Phase 4 has the story).
 
-Playback on the device you are holding is tested in `tests/test_media.py`, and the two tests there
-worth knowing about run the **queue state machine and the device selector under deno**. The capability tickets are pure, so they are tested
+Playback on the device you are holding is tested in `tests/test_media.py`, and the three tests there
+worth knowing about run the **queue state machine, the track boundary and the device selector under
+deno**. The capability tickets are pure, so they are tested
 directly and hard — forging a signature, editing the path or the expiry inside a valid ticket, and
 reusing one signed with a different token all have a test, as does the defence-in-depth property that
 matters most: a ticket minted *with the server's own key* for `../../../etc/passwd` is still refused,
@@ -1272,7 +1331,7 @@ launchd plists are written for real by running the installer's own functions in 
 `launchctl` shim, since a `--dry-run` cannot show the contents of a file it does not write and the
 contents are the whole point.
 
-1276 tests at the end of Phase 5; 1562 with playlists; 1742 with playback on the phone.
+1276 tests at the end of Phase 5; 1562 with playlists; 1778 with playback on the phone.
 
 ## Layout
 
@@ -1288,7 +1347,9 @@ src/tunebox/jobs/      SQLite job queue + the worker that drains it
 src/tunebox/player/    OwnTone adapter, output keeper, rescan hook — behind the Player port
 src/tunebox/api/       FastAPI app, token middleware, routes, the remote's routes, the app shell,
                        and media.py — the capability-URL audio route the phone output streams from
-src/tunebox/web/       the one page: hand-written HTML/CSS/JS, manifest, service worker, icons
+src/tunebox/web/       the one page: hand-written HTML/CSS/JS, manifest, service worker, icons,
+                       and silence.m4a — two seconds of nothing, looped, which is what holds iOS's
+                       audio session open across a track boundary
 src/tunebox/ops/       Phase 5: canary, yt-dlp update + rollback, backup/restore, health, alerts,
                        exposure audit, and the one nightly job that composes them. Nothing in the
                        request path imports it, so a bug here cannot break ingest or playback

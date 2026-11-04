@@ -33,6 +33,9 @@ const SHELL = [
   "/",
   `/ui/app.css?v=${BUILD}`,
   `/ui/app.js?v=${BUILD}`,
+  // Cached with the shell because it is part of how playback works, not an optional extra: without
+  // it a track boundary on a backgrounded phone is silent. It is 1.7 kB.
+  "/ui/silence.m4a",
   "/ui/icon.svg",
   "/ui/icon-180.png",
   "/manifest.webmanifest",

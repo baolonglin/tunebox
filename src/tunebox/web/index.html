@@ -186,6 +186,26 @@
           -->
           <audio id="local-audio" preload="metadata"></audio>
 
+          <!--
+            Two seconds of silence, looped for as long as this device has a track loaded.
+
+            This is the least obvious element on the page and the most load-bearing one, so: iOS
+            reclaims a page's audio session, and stops scheduling the page at all, the moment its
+            audio stops — and a track ending *is* its audio stopping. Measured on this household's
+            phone against the version without this element: the handler that starts the next track
+            ran 36 seconds late (it waited for the app to be reopened), and when it did run, the
+            element reported playing and advanced its clock with no sound, because a programmatic
+            `play()` cannot reactivate a session that has been reclaimed. Only a real touch in the
+            page can — which is why pausing and playing from the lockscreen was silent while the
+            same two taps in the page were not.
+
+            So the page keeps one stream alive at all times: with this looping, the session is never
+            reclaimed, the page is never descheduled, `ended` is dispatched at once, and the `play()`
+            that follows lands on a live session. It is silent, 1.7 kB, served from the shell cache,
+            and stopped the moment nothing is loaded — see `holdAudioSession` in app.js.
+          -->
+          <audio id="local-silence" preload="auto" loop src="/ui/silence.m4a"></audio>
+
           <div class="card now">
             <p id="np-title" class="np-title">Nothing loaded</p>
             <p id="np-artist" class="np-artist muted"></p>

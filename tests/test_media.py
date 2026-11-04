@@ -572,6 +572,50 @@ class TestTurningItOff:
 # ------------------------------------------------------------------ the shell side
 
 
+class TestTheSilenceThatHoldsTheSession:
+    """The second audio element, and that it is actually servable.
+
+    Read as files rather than through the app for the same reason the other asset tests are: a
+    missing or renamed file is a silent failure on a phone, and this one is silent twice over —
+    nothing on screen would change, and the symptom would appear minutes later as a track boundary
+    that made no sound.
+    """
+
+    def test_the_element_is_in_the_markup_and_loops(self):
+        markup = asset("index.html")
+        assert 'id="local-silence"' in markup
+        assert "loop" in markup
+        assert 'src="/ui/silence.m4a"' in markup
+        # `auto`, not `metadata`: it has to be ready to start the instant a track is loaded, and it
+        # is 1.7 kB.
+        element = markup[markup.index('id="local-silence"') :][:200]
+        assert 'preload="auto"' in markup[: markup.index('id="local-silence"') + 200], element
+
+    def test_the_file_exists_and_is_silent_aac(self):
+        path = WEB / "silence.m4a"
+        assert path.is_file(), "silence.m4a is missing; see api/ui.py for the ffmpeg line"
+        # Small enough to live in the shell cache, and an MP4: the `ftyp` box is at offset 4.
+        assert path.stat().st_size < 16 * 1024, path.stat().st_size
+        assert path.read_bytes()[4:8] == b"ftyp"
+
+    def test_it_is_served_as_audio_and_without_the_token(self, client: TestClient):
+        answer = client.get("/ui/silence.m4a")
+        assert answer.status_code == 200
+        assert answer.headers["content-type"] == "audio/mp4"
+        assert len(answer.content) == (WEB / "silence.m4a").stat().st_size
+
+    def test_it_is_part_of_the_cached_shell(self):
+        """Not an optional extra: without it a backgrounded track boundary is silent, so a phone
+        that has the shell offline must have this too."""
+        assert "/ui/silence.m4a" in asset("sw.js")
+
+    def test_it_is_covered_by_the_build_id(self):
+        """So that regenerating it changes every ``?v=`` and no phone keeps a stale copy."""
+        from tunebox.api.ui import UI_ASSETS
+
+        assert "silence.m4a" in UI_ASSETS
+
+
 class TestTheShellAllowsAudioAtAll:
     def test_the_csp_permits_same_origin_media(self, client: TestClient):
         """Without ``media-src``, ``default-src 'none'`` blocks the audio element — and it does it
@@ -665,6 +709,17 @@ class TestTheRemoteSendsNoTokenToTheAudioElement:
         assert "localTicket(" in code
         assert "/library/tickets" in code
 
+    def test_every_assignment_to_the_src_is_enumerated(self):
+        """There are two, since the track boundary assigns a URL minted a song earlier rather than
+        one fetched at the boundary. Both are a ticket, and this fails if a third appears — which is
+        the only way the token could get into an audio request."""
+        code = code_only("app.js")
+        assignments = sorted(set(re.findall(r"element\.src = (\S+);", code)))
+        assert assignments == ["ticket.url", "url"], assignments
+        # And a held ticket only ever carries what `localTicket` returned.
+        assert "local.ahead.push({ path, url });" in code
+        assert "localTicket(path).then(" in code
+
     def test_no_token_is_ever_interpolated_into_a_url(self):
         """Precise, and against the code rather than the prose: the page accepts a token in the URL
         *fragment* and documents why (a fragment is not sent to the server), so what is forbidden is
@@ -699,6 +754,7 @@ class TestThePhoneQueueStateMachine:
         "localReorder",
         "localEnqueue",
         "localPlayItem",
+        "localToggle",
         "localNext",
         "localPrev",
         "localStop",
@@ -707,12 +763,23 @@ class TestThePhoneQueueStateMachine:
         "localSetShuffle",
         "localForget",
         "localView",
+        "localAheadTrack",
+        "localPrefetchNext",
+        "localAdvanceOnEnded",
+        "localResumeInto",
+        # Lifted rather than stubbed, so the position round trip is the real pair of functions
+        # writing and reading the real shape, against a storage stub.
+        "localPersist",
+        "localRestore",
+        "audioSession",
     )
 
     HARNESS = r"""
 const REPEAT_NEXT = { off: "all", all: "single", single: "off" };
 const LOCAL_PLAYBACK = true;
 const LOCAL_DEVICE = "local";
+__AHEAD_DEPTH__
+__SESSION_STATE__
 
 const element = {
   paused: true,
@@ -720,37 +787,105 @@ const element = {
   duration: 180,
   volume: 1,
   loop: false,
+  // HAVE_NOTHING until the container's header has been read. Modelled because `localPersist` keys
+  // the position on it: assigning a `src` resets it, which is the only thing standing between the
+  // boundary swap and writing the old track's position under the new track's name.
+  readyState: 0,
   _src: null,
+  _listeners: {},
   pause() { this.paused = true; },
   play() { this.paused = false; return Promise.resolve(); },
-  load() {},
+  load() { this.readyState = 0; },
   getAttribute() { return this._src; },
-  removeAttribute() { this._src = null; },
-  set src(value) { this._src = value; this.paused = false; },
+  removeAttribute() { this._src = null; this.readyState = 0; },
+  set src(value) { this._src = value; this.readyState = 0; this.paused = false; },
   get src() { return this._src; },
+  // Enough of the event target for `localResumeInto`, whose seek has to wait for the container's
+  // header. Every listener here is `{ once: true }`, which is the only kind that code registers.
+  addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); },
+  fire(type) {
+    if (type === "loadedmetadata") this.readyState = 1;
+    const listeners = this._listeners[type] || [];
+    this._listeners[type] = [];
+    listeners.forEach((fn) => fn());
+  },
 };
 const audio = () => element;
 const canSetVolume = () => true;
+
+// The looping silence that holds iOS's audio session open. Stubbed down to the two things
+// `audioSession` touches, so the test can assert *when* the channel is held and released —
+// which is the whole of the fix, and not something the markup can show.
+const keeper = { paused: true, pause() { this.paused = true; }, play() { this.paused = false; return Promise.resolve(); } };
+const silence = () => keeper;
+
+// This device's storage, which is the whole of what the local queue is persisted to.
+const stored = {};
+let armed = null;
+const window = {
+  // Controllable timers, so the grace period after a pause is a thing the test can *reach* rather
+  // than wait five minutes for.
+  setTimeout: (fn) => { armed = fn; return 1; },
+  clearTimeout: () => { armed = null; },
+  localStorage: {
+    getItem: (key) => (Object.prototype.hasOwnProperty.call(stored, key) ? stored[key] : null),
+    setItem: (key, value) => { stored[key] = String(value); },
+  },
+};
+const LOCAL_QUEUE_KEY = "tunebox.local";
 
 const state = {
   device: "local",
   progressMs: 0,
   outputs: [{ id: "2080974779", name: "Living Room speaker", type: "Chromecast", selected: true, selectable: true }],
-  local: { queue: [], order: [], cursor: -1, repeat: "off", shuffle: false, error: null },
+  local: { queue: [], order: [], cursor: -1, repeat: "off", shuffle: false, error: null, ahead: [], resume: null },
 };
 
 // The two things the engine delegates: loading a track (a fetch and a capability URL) and drawing
 // the screen. Stubbed, so what is under test is the queue arithmetic and nothing else. `loads`
-// records what would have been played, in order, which is the observable behaviour.
+// records what would have been played, in order, which is the observable behaviour — and `mints`
+// records every capability URL asked for, which is how the prefetch is observed: a background
+// phone's next track must have been minted *before* the one playing ended.
 const loads = [];
+const mints = [];
+// `networkDown` is what a throttled iOS page does to a fetch: it never comes back. Not a rejection —
+// a rejection would be kinder, and the measured behaviour is a promise that simply never settles.
+let networkDown = false;
+function localTicket(path) {
+  mints.push(path);
+  if (networkDown) return new Promise(() => {});
+  return Promise.resolve(`/media/ticket-for-${path}`);
+}
+// Mirrors the real `localLoad` in the one way that matters here: the prefetch is issued *before*
+// `play()` and nothing load-bearing sits behind an await on it. The real one learned that the hard
+// way — see its comment.
 async function localLoad({ autoplay }) {
   const track = localTrack();
+  audioSession(track && autoplay ? "playing" : "idle");
   loads.push(track ? track.path : null);
-  element._src = track ? `/media/ticket-for-${track.path}` : null;
-  element.paused = !(autoplay && track);
+  if (!track) {
+    element.removeAttribute("src");
+    localPrefetchNext();
+    return;
+  }
+  if (networkDown) {
+    // A load cannot complete without the network, which is the whole reason the boundary must not
+    // need one. Recorded and abandoned, so a failing assertion reads as "it took the slow path"
+    // rather than as a sixty-second timeout.
+    mints.push(track.path);
+    return;
+  }
+  element.src = await localTicket(track.path);
+  localResumeInto(track);
+  element.fire("loadedmetadata");
+  element.paused = !autoplay;
+  localPrefetchNext();
 }
-function localPersist() {}
+// `localPersist`, `localRestore` and `localResumeInto` are the real ones, lifted — see FUNCTIONS.
+// Only the screen is faked, because what it draws is asserted elsewhere, from the markup.
 function localRender() {}
+/** Let a fire-and-forget prefetch settle, so an assertion is not racing it. */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 __FUNCTIONS__
 
@@ -771,14 +906,28 @@ const snapshot = () => ({
   cursor: state.local.cursor,
   playing: localTrack() ? localTrack().path : null,
   paused: element.paused,
+  sessionHeld: !keeper.paused,
   loads: loads.slice(),
+  src: element._src,
+  ahead: state.local.ahead.map((t) => t.path),
+  mints: mints.slice(),
 });
 const reset = () => {
-  state.local = { queue: [], order: [], cursor: -1, repeat: "off", shuffle: false, error: null };
+  state.local = {
+    queue: [], order: [], cursor: -1, repeat: "off", shuffle: false,
+    error: null, ahead: [], resume: null,
+  };
   element._src = null;
   element.paused = true;
   element.currentTime = 0;
+  element.loop = false;
+  element.readyState = 0;
+  element._listeners = {};
+  keeper.paused = true;
+  armed = null;
   loads.length = 0;
+  mints.length = 0;
+  delete stored[LOCAL_QUEUE_KEY];
 };
 
 await (async () => {
@@ -886,8 +1035,276 @@ await (async () => {
   await localEnqueue(ABCD, "replace", true);
   result.view = localView();
 
+  // ---------------------------------------------------- the gap between two tracks
+  // What iOS throttles is a page whose audio has just stopped, so the end of a track must cost no
+  // network request. Each of these asserts on `mints` and `loads`: a mint that happened while the
+  // previous track was still playing is the fix, and a `load` at the boundary is the bug.
+
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  await settle();
+  result.prefetchWhileTheFirstTrackPlays = snapshot();
+
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  await settle();
+  const mintsBeforeEnded = mints.slice();
+  const loadsBeforeEnded = loads.slice();
+  await localAdvanceOnEnded();
+  result.endedUsesThePrefetch = {
+    ...snapshot(),
+    mintsBeforeEnded,
+    loadsBeforeEnded,
+  };
+
+  // Four tracks played end to end: every boundary taken from a prefetch, and no track loaded twice.
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  await settle();
+  const walked = [];
+  for (let i = 0; i < 3; i += 1) {
+    await localAdvanceOnEnded();
+    await settle();
+    walked.push(localTrack().path);
+  }
+  result.wholeQueueWithoutALoad = { ...snapshot(), walked };
+
+  // No prefetch to hand — the slow path is still correct.
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  await settle();
+  state.local.ahead = [];
+  await localAdvanceOnEnded();
+  result.endedWithoutAPrefetch = snapshot();
+
+  // A held URL for a track that is not the one coming next must not be used.
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  await settle();
+  state.local.ahead = [{ path: "stale.m4a", url: "/media/ticket-for-stale.m4a" }];
+  await localAdvanceOnEnded();
+  result.aStalePrefetchIsIgnored = snapshot();
+
+  // ---- the property the depth exists for: boundaries crossed with no network at all.
+  // `localTicket` is made to hang, which is what a throttled iOS page does to a fetch. Three
+  // boundaries must still play, from URLs minted while the page was awake.
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  await settle();
+  const mintsBeforeTheNetworkWent = mints.slice();
+  networkDown = true;
+  const pocket = [];
+  for (let i = 0; i < 3; i += 1) {
+    await localAdvanceOnEnded();
+    pocket.push({ playing: localTrack() ? localTrack().path : null, loads: loads.length });
+  }
+  networkDown = false;
+  result.threeBoundariesWithNoNetwork = {
+    mintsBeforeTheNetworkWent,
+    pocket,
+    loads: loads.slice(),
+  };
+
+  // The cases `localAheadTrack` deliberately refuses to guess at.
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  result.aheadMidQueue = localAheadTrack(1).path;
+  result.aheadTwoAndThree = [localAheadTrack(2).path, localAheadTrack(3).path];
+  state.local.cursor = 3;
+  result.aheadAtTheEndRepeatOff = localAheadTrack(1);
+  await localSetRepeat("all");
+  await settle();
+  result.aheadAtTheEndRepeatAll = localAheadTrack(1).path;
+  result.aheadAtTheEndRepeatAllMinted = state.local.ahead.map((t) => t.path);
+  await localSetShuffle(true);
+  state.local.cursor = state.local.order.length - 1;
+  result.aheadAtTheEndShuffled = localAheadTrack(1);
+  await localSetShuffle(false);
+  state.local.cursor = 0;
+  await localSetRepeat("single");
+  result.aheadWithRepeatOne = localAheadTrack(1);
+
+  // Two tracks on repeat: there are only two files, so only one URL ahead is worth holding.
+  reset();
+  await localEnqueue(ABCD.slice(0, 2), "replace", true);
+  await localSetRepeat("all");
+  await settle();
+  result.aShortQueueOnRepeatHoldsOne = state.local.ahead.map((t) => t.path);
+  result.aShortQueueOnRepeatMints = mints.slice();
+
+  // Stopping, and emptying the queue, must not leave a URL for a track nothing is going to play.
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  await settle();
+  await localStop();
+  result.stopDropsThePrefetch = state.local.ahead;
+
+  // Changing what comes next re-mints for the new one rather than keeping the old URL.
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  await settle();
+  const nextBeforeShuffle = localAheadTrack(1).path;
+  await localSetShuffle(true);
+  await settle();
+  const nextAfterShuffle = localAheadTrack(1).path;
+  result.shuffleRepointsThePrefetch = {
+    before: nextBeforeShuffle,
+    after: nextAfterShuffle,
+    heldForTheNewNext: state.local.ahead.some((t) => t.path === nextAfterShuffle),
+    held: state.local.ahead.map((t) => t.path).sort(),
+  };
+
+  // Asking twice does not mint twice: this is called from every site that can change "next".
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  await settle();
+  const mintsOnce = mints.length;
+  await localPrefetchNext();
+  await localPrefetchNext();
+  result.prefetchIsIdempotent = { mintsOnce, mintsAfter: mints.length };
+
+  // ---------------------------------------------------- holding iOS's audio session
+  // The element is silent, so nothing but a test can observe this — and it is the difference
+  // between a track boundary that makes a sound and one that does not.
+
+  reset();
+  result.sessionIdleBeforeAnythingPlays = !keeper.paused;
+  await localEnqueue(ABCD, "replace", true);
+  result.sessionHeldWhilePlaying = !keeper.paused;
+  await localAdvanceOnEnded();
+  result.sessionHeldAcrossTheBoundary = !keeper.paused;
+  await localStop();
+  result.sessionReleasedOnStop = !keeper.paused;
+
+  // Pausing lets it go. Keeping it would also keep the lockscreen's play button working, and that
+  // is not worth being the system's Now Playing app, and competing for the channel other apps want,
+  // on behalf of a track nobody is listening to.
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  await localToggle();
+  result.pausedTheElementToo = element.paused;
+  result.sessionKeptJustAfterPausing = !keeper.paused;
+  result.aReleaseIsArmed = armed !== null;
+  await localToggle();
+  result.sessionAfterResuming = !keeper.paused;
+  result.resumingDisarmsTheRelease = armed === null;
+  await localClear();
+  result.sessionReleasedWhenTheQueueEmpties = !keeper.paused;
+
+  // The deadline, reached: still paused, so the channel goes.
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  await localToggle();
+  armed();
+  result.sessionReleasedAfterTheGrace = !keeper.paused;
+
+  // The deadline, reached after a resume that re-armed nothing: playback must not be stranded by a
+  // timer from the previous pause.
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  await localToggle();
+  const stale = armed;
+  await localToggle();
+  if (stale) stale();
+  result.aStaleReleaseCannotCutLivePlayback = !keeper.paused;
+
+  // Queueing without starting must not take the channel either.
+  reset();
+  await localEnqueue(ABCD, "replace", false);
+  await localLoad({ autoplay: false });
+  result.sessionNotHeldForALoadThatDoesNotPlay = !keeper.paused;
+
+  // Not on the speaker's behalf: the room is the audio path there, and holding a silent stream on
+  // the phone for it would be a battery cost with nothing to show for it.
+  reset();
+  state.device = "2080974779";
+  audioSession("playing");
+  result.sessionNotHeldForASpeaker = !keeper.paused;
+  state.device = "local";
+
+  // ------------------------------------------------- where this device was when it closed
+
+  reset();
+  await localEnqueue(ABCD, "replace", false);
+  state.local.resume = { path: "a.m4a", ms: 61000 };
+  await localLoad({ autoplay: true });
+  result.resumesWhereItWas = { currentTime: element.currentTime, resume: state.local.resume };
+
+  // A different track under the cursor: the position belonged to another song and is dropped.
+  reset();
+  await localEnqueue(ABCD, "replace", false);
+  state.local.cursor = 1;
+  state.local.resume = { path: "a.m4a", ms: 61000 };
+  await localLoad({ autoplay: true });
+  result.resumeIsNotAppliedToAnotherTrack = element.currentTime;
+
+  // A couple of seconds in is not worth resuming to, and the very end would resume into `ended`.
+  reset();
+  await localEnqueue(ABCD, "replace", false);
+  state.local.resume = { path: "a.m4a", ms: 900 };
+  await localLoad({ autoplay: true });
+  result.aMomentInIsStartedFromTheTop = element.currentTime;
+
+  reset();
+  await localEnqueue(ABCD, "replace", false);
+  state.local.resume = { path: "a.m4a", ms: 179500 };
+  await localLoad({ autoplay: true });
+  result.theVeryEndIsStartedFromTheTop = element.currentTime;
+
+  // Consumed once: the second track of the evening starts at its own beginning.
+  reset();
+  await localEnqueue(ABCD, "replace", false);
+  state.local.resume = { path: "a.m4a", ms: 61000 };
+  await localLoad({ autoplay: true });
+  element.currentTime = 0;
+  await localNext(true);
+  result.resumeIsNotReapplied = element.currentTime;
+
+  // The round trip through this device's storage, with the real `localPersist`/`localRestore`.
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  element.currentTime = 74.2;
+  localPersist();
+  result.whatIsWrittenDown = JSON.parse(stored[LOCAL_QUEUE_KEY]).position;
+  const rewritten = stored[LOCAL_QUEUE_KEY];
+  reset();
+  stored[LOCAL_QUEUE_KEY] = rewritten;
+  localRestore();
+  result.reopened = {
+    queue: state.local.queue.map((t) => t.path),
+    cursor: state.local.cursor,
+    resume: state.local.resume,
+  };
+  await localLoad({ autoplay: true });
+  result.reopenedResumes = element.currentTime;
+
+  // The trap this nearly shipped with: at the boundary the element has a new `src` and therefore no
+  // position yet, and `currentTime` still reads the track that just finished. Writing that down
+  // would resume a fresh song three minutes in on the next reopen.
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  await settle();
+  element.currentTime = 179;
+  await localAdvanceOnEnded();
+  result.theBoundaryWritesNoPosition = JSON.parse(stored[LOCAL_QUEUE_KEY]).position || null;
+
+  // Stopping is "that is enough": no bookmark left behind.
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  element.currentTime = 50;
+  await localStop();
+  result.stopWritesNoPosition = JSON.parse(stored[LOCAL_QUEUE_KEY]).position || null;
+
   state.device = "2080974779";
   result.speakerModeIsNotLocal = localMode();
+  result.endedDoesNothingOffThisDevice = await (async () => {
+    state.local = {
+      queue: ABCD.slice(), order: [0, 1, 2, 3], cursor: 0, repeat: "off", shuffle: false,
+      error: null, ahead: [{ path: "b.m4a", url: "/media/ticket-for-b.m4a" }], resume: null,
+    };
+    await localAdvanceOnEnded();
+    return state.local.cursor;
+  })();
   state.device = "local";
 })();
 
@@ -908,7 +1325,20 @@ console.log(JSON.stringify(result));
             start = match.start()
             end = code.index("\n  }\n", start) + 4
             sources.append(code[start:end])
-        script = cls.HARNESS.replace("__FUNCTIONS__", "\n".join(sources))
+        # The depth is lifted too rather than restated here: a harness with its own copy of the
+        # constant would pass with a one-deep prefetch, which is precisely the bug these test for.
+        depth = re.search(r"^  const AHEAD_DEPTH = \d+;$", code, re.M)
+        assert depth, "AHEAD_DEPTH is not a top-level constant in app.js"
+        # `audioSession` closes over these two, so they are lifted with it rather than restated: a
+        # harness with its own copy of a constant is a harness that cannot fail when it changes.
+        grace = re.search(r"^  const SESSION_GRACE_MS = .+;$", code, re.M)
+        holder = re.search(r"^  let sessionRelease = .+;$", code, re.M)
+        assert grace and holder, "audioSession's state is not declared where expected in app.js"
+        script = (
+            cls.HARNESS.replace("__FUNCTIONS__", "\n".join(sources))
+            .replace("__AHEAD_DEPTH__", depth.group(0).strip())
+            .replace("__SESSION_STATE__", grace.group(0).strip() + "\n" + holder.group(0).strip())
+        )
         completed = subprocess.run(
             [deno, "eval", script], capture_output=True, text=True, timeout=60
         )
@@ -1069,6 +1499,257 @@ console.log(JSON.stringify(result));
         assert ran["speakerModeIsNotLocal"] is False
 
 
+class TestTheGapBetweenTwoTracks:
+    """The track boundary on a backgrounded phone.
+
+    Measured on iOS: a page is kept alive while its audio element is playing and throttled the
+    moment it is not — and ``ended`` is exactly that moment. The original code then had to ``await``
+    a capability URL before it could assign a ``src``, so in a pocket the fetch was suspended
+    mid-flight and the music stopped at the end of the track, every time. The fix is to mint the
+    next URL while the current track is still playing and leave ``ended`` with nothing to do but
+    assign and ``play()``.
+
+    Which makes this a *timing* property, and read-the-source cannot check timing: what these
+    assert on is the order of two recorded lists — the mint must appear before the boundary, and no
+    load may appear at it. Same harness as ``TestThePhoneQueueStateMachine``; see its docstring.
+    """
+
+    @pytest.fixture(scope="class")
+    def ran(self) -> dict:
+        return TestThePhoneQueueStateMachine.run()
+
+    def test_the_next_track_is_minted_while_this_one_plays(self, ran):
+        state = ran["prefetchWhileTheFirstTrackPlays"]
+        assert state["playing"] == "a.m4a"
+        assert sorted(state["ahead"]) == ["b.m4a", "c.m4a", "d.m4a"]
+        assert state["mints"] == ["a.m4a", "b.m4a", "c.m4a", "d.m4a"]
+
+    def test_the_end_of_a_track_costs_no_request_at_all(self, ran):
+        """The whole point. At ``ended`` the URL is already in hand, so the handler is synchronous
+        from the event to ``play()`` — no ``await``, nothing for iOS to suspend."""
+        state = ran["endedUsesThePrefetch"]
+        assert state["mintsBeforeEnded"] == ["a.m4a", "b.m4a", "c.m4a", "d.m4a"]
+        assert state["playing"] == "b.m4a"
+        assert state["paused"] is False
+        assert state["src"] == "/media/ticket-for-b.m4a"
+        # No `localLoad` at the boundary: that is the function with the fetch in it.
+        assert state["loads"] == state["loadsBeforeEnded"] == ["a.m4a"]
+
+    def test_a_whole_queue_plays_through_without_one(self, ran):
+        state = ran["wholeQueueWithoutALoad"]
+        assert state["walked"] == ["b.m4a", "c.m4a", "d.m4a"]
+        assert state["loads"] == ["a.m4a"]
+        # Each track minted exactly once, and the last one has nothing after it to mint.
+        assert state["mints"] == ["a.m4a", "b.m4a", "c.m4a", "d.m4a"]
+
+    def test_without_a_prefetch_the_slow_path_is_still_there(self, ran):
+        """The fallback is the code that was always there, so a failed mint is a seam rather than
+        silence — and that matters, because one case genuinely cannot be prefetched."""
+        state = ran["endedWithoutAPrefetch"]
+        assert state["playing"] == "b.m4a"
+        assert state["loads"] == ["a.m4a", "b.m4a"]
+
+    def test_a_prefetch_for_a_track_that_is_no_longer_next_is_not_used(self, ran):
+        """Defence in depth around the one thing that could go wrong here: a URL and a cursor that
+        disagree would play the wrong song, which is worse than a pause."""
+        state = ran["aStalePrefetchIsIgnored"]
+        assert state["playing"] == "b.m4a"
+        assert state["src"] == "/media/ticket-for-b.m4a"
+        assert state["loads"] == ["a.m4a", "b.m4a"]
+
+    def test_nothing_load_bearing_sits_behind_an_await_on_play(self):
+        """Measured on this household's phone, from the service log: on a backgrounded page the
+        promise ``play()`` returns does not settle, so an ``await`` on it is the end of the function.
+        With the prefetch behind that await, a pocket crossed exactly one track boundary and then
+        stalled — the log shows the second boundary falling back to a ``POST /library/tickets`` the
+        page was no longer awake to finish.
+
+        So the property is about the *await*, not about the order: `play()` is started and not
+        waited for, and the prefetch comes after it so that three requests can never sit between a
+        tap and the sound.
+        """
+        code = code_only("app.js")
+        match = re.search(r"^  async function localLoad\(.*?^  \}$", code, re.M | re.S)
+        assert match, "localLoad is not a top-level function in app.js"
+        body = match.group(0)
+        assert "await element.play()" not in body
+        assert "started = element.play();" in body
+        # One await only, for the ticket, and it is before the `src` is assigned. Anything after
+        # that point must be reachable on a page iOS has already stopped scheduling.
+        after_src = body[body.index("element.src = url;") :]
+        assert "await" not in after_src, after_src
+        assert "localPrefetchNext();" in after_src
+
+
+    def test_what_is_next_mid_queue(self, ran):
+        assert ran["aheadMidQueue"] == "b.m4a"
+
+    def test_it_looks_further_than_one_track_ahead(self, ran):
+        """``AHEAD_DEPTH`` tracks, not one — see the next test for why that number is the feature."""
+        assert ran["aheadTwoAndThree"] == ["c.m4a", "d.m4a"]
+
+    def test_three_boundaries_are_crossed_with_no_network_at_all(self, ran):
+        """The property the depth exists for, and the one the first version of this got wrong.
+
+        Holding a single URL buys a single boundary: crossing it empties the store, and refilling it
+        is a fetch — the one thing a throttled page cannot complete. Measured on this household's
+        phone against the one-deep version: the log shows the first boundary served from the
+        prefetch and the second falling back to a `POST /library/tickets` that the page was no longer
+        awake to finish. Here the mint is made to hang, which is what iOS does to it, and three
+        tracks must still play.
+        """
+        state = ran["threeBoundariesWithNoNetwork"]
+        assert state["mintsBeforeTheNetworkWent"] == ["a.m4a", "b.m4a", "c.m4a", "d.m4a"]
+        assert [step["playing"] for step in state["pocket"]] == ["b.m4a", "c.m4a", "d.m4a"]
+        # One load, for the track the user actually pressed play on. None at any boundary.
+        assert state["loads"] == ["a.m4a"]
+        assert [step["loads"] for step in state["pocket"]] == [1, 1, 1]
+
+    def test_a_short_queue_on_repeat_holds_one_url_per_file(self, ran):
+        """Two tracks on repeat and a depth of three: the wrap comes back round to the track that is
+        playing, so there are two files to hold and the loop stops rather than minting the same two
+        over and over."""
+        assert sorted(ran["aShortQueueOnRepeatHoldsOne"]) == ["a.m4a", "b.m4a"]
+
+    def test_the_end_of_the_queue_has_nothing_next(self, ran):
+        """Repeat off: ``ended`` there is a stop, and a URL minted for it would never be spent."""
+        assert ran["aheadAtTheEndRepeatOff"] is None
+
+    def test_repeat_the_queue_makes_the_first_track_next(self, ran):
+        assert ran["aheadAtTheEndRepeatAll"] == "a.m4a"
+        assert sorted(ran["aheadAtTheEndRepeatAllMinted"]) == ["a.m4a", "b.m4a", "c.m4a"]
+
+    def test_a_shuffled_queue_about_to_wrap_is_not_guessed_at(self, ran):
+        """The wrap re-shuffles, so which track comes next does not exist yet. The honest answer is
+        ``null`` and the slow path — once per lap of a shuffled queue."""
+        assert ran["aheadAtTheEndShuffled"] is None
+
+    def test_repeat_one_song_needs_no_prefetch(self, ran):
+        """``element.loop`` does that repeating, so ``ended`` never fires at all."""
+        assert ran["aheadWithRepeatOne"] is None
+
+    def test_stopping_drops_the_url(self, ran):
+        assert ran["stopDropsThePrefetch"] == []
+
+    def test_changing_what_comes_next_re_points_it(self, ran):
+        state = ran["shuffleRepointsThePrefetch"]
+        assert state["before"] == "b.m4a"
+        assert state["after"] != "b.m4a"
+        # The point: whatever shuffle decided, a URL is in hand for it before the track ends.
+        assert state["heldForTheNewNext"] is True
+        assert len(state["held"]) == 3
+
+    def test_asking_twice_mints_once(self, ran):
+        """It is called from every site that can change "next", so it has to be cheap to call."""
+        state = ran["prefetchIsIdempotent"]
+        assert state["mintsAfter"] == state["mintsOnce"]
+
+    def test_this_device_resumes_where_it_was(self, ran):
+        """The case this mode is worst at — the phone locking, or walking out of range, halfway
+        through a long track — where without this the one tap that gets the music back also starts
+        the song again."""
+        state = ran["resumesWhereItWas"]
+        assert state["currentTime"] == 61
+        assert state["resume"] is None
+
+    def test_the_position_belongs_to_one_track(self, ran):
+        assert ran["resumeIsNotAppliedToAnotherTrack"] == 0
+
+    def test_a_moment_into_a_track_is_not_worth_resuming_to(self, ran):
+        assert ran["aMomentInIsStartedFromTheTop"] == 0
+
+    def test_the_very_end_of_a_track_is_not_resumed_into(self, ran):
+        """A track saved two seconds before it finished would otherwise resume straight into its
+        own ``ended`` and look like a skip."""
+        assert ran["theVeryEndIsStartedFromTheTop"] == 0
+
+    def test_it_is_consumed_once(self, ran):
+        """"Carry on where I was", not a bookmark per track: the second song of the evening starts
+        at its own beginning."""
+        assert ran["resumeIsNotReapplied"] == 0
+
+    def test_a_track_ending_on_a_speaker_moves_nothing_here(self, ran):
+        """Switching to a speaker pauses this element, so ``ended`` should never arrive — but it
+        advances a cursor, and a cursor that moved while somebody was listening in the room would
+        be found later as a queue that had skipped a track by itself."""
+        assert ran["endedDoesNothingOffThisDevice"] == 0
+
+    def test_the_position_is_written_against_the_track_it_belongs_to(self, ran):
+        assert ran["whatIsWrittenDown"] == {"path": "a.m4a", "ms": 74200}
+
+    def test_reopening_the_app_comes_back_to_the_same_second(self, ran):
+        """The round trip through this device's storage, which is the only place either of these
+        lives: queue, place in the queue, and place in the track."""
+        state = ran["reopened"]
+        assert state["queue"] == ["a.m4a", "b.m4a", "c.m4a", "d.m4a"]
+        assert state["cursor"] == 0
+        assert state["resume"] == {"path": "a.m4a", "ms": 74200}
+        assert ran["reopenedResumes"] == 74.2
+
+    def test_the_track_boundary_writes_no_position(self, ran):
+        """The trap this nearly shipped with. Assigning a `src` resets the element, so for an
+        instant after the swap `currentTime` is still the *finished* track's position while
+        `localTrack()` is already the new one. Written down, the next reopen would start a fresh
+        song three minutes in."""
+        assert ran["theBoundaryWritesNoPosition"] is None
+
+    def test_stopping_leaves_no_bookmark(self, ran):
+        assert ran["stopWritesNoPosition"] is None
+
+    def test_the_audio_session_is_held_for_as_long_as_a_track_is_loaded(self, ran):
+        """The fix for the symptom that took the longest to understand, and the reason the page has
+        a second, silent audio element.
+
+        iOS reclaims a page's audio session, and stops scheduling the page, the moment its audio
+        stops — and a track ending *is* its audio stopping. Measured on this household's phone
+        without this: the handler that starts the next track ran **36 seconds** late, waiting for the
+        app to be reopened, and when it ran the element reported playing and advanced its clock in
+        silence, because a programmatic ``play()`` cannot reactivate a reclaimed session. The proof
+        that it is the session and not the code: the same two taps were silent from the lockscreen
+        and audible in the page, which is the difference between a remote command and a touch.
+        """
+        assert ran["sessionIdleBeforeAnythingPlays"] is False
+        assert ran["sessionHeldWhilePlaying"] is True
+        assert ran["sessionHeldAcrossTheBoundary"] is True
+        assert ran["sessionReleasedOnStop"] is False
+
+    def test_pausing_keeps_the_channel_but_puts_it_on_a_deadline(self, ran):
+        """A genuine conflict, measured from both sides.
+
+        Release the channel on pause and the system state is honest — but a backgrounded page with
+        no audio is one iOS stops scheduling, so the `play` command from the pull-down is not
+        answered at all: pause while in another app and playback cannot be resumed from there. Keep
+        it and the lockscreen works both ways, but the system reports "playing" for a track nobody
+        is listening to, because its Now Playing state follows real audio activity rather than
+        ``mediaSession.playbackState``.
+
+        Being unable to resume is worse than a button that looks wrong, so it is kept — and released
+        after ``SESSION_GRACE_MS``, which covers what a pause is actually for and caps the cost.
+        """
+        assert ran["pausedTheElementToo"] is True
+        assert ran["sessionKeptJustAfterPausing"] is True
+        assert ran["aReleaseIsArmed"] is True
+        assert ran["sessionAfterResuming"] is True
+        assert ran["resumingDisarmsTheRelease"] is True
+        assert ran["sessionReleasedWhenTheQueueEmpties"] is False
+
+    def test_the_channel_goes_when_the_grace_period_runs_out(self, ran):
+        assert ran["sessionReleasedAfterTheGrace"] is False
+
+    def test_a_timer_from_an_earlier_pause_cannot_cut_live_playback(self, ran):
+        """The one way a grace period can go wrong: pause, resume, and then the first pause's timer
+        fires under a track that is playing."""
+        assert ran["aStaleReleaseCannotCutLivePlayback"] is True
+
+    def test_queueing_without_starting_does_not_take_the_channel(self, ran):
+        assert ran["sessionNotHeldForALoadThatDoesNotPlay"] is False
+
+    def test_it_is_never_held_on_a_speakers_behalf(self, ran):
+        """The room is the audio path there. A silent stream on the phone would be battery spent on
+        nothing."""
+        assert ran["sessionNotHeldForASpeaker"] is False
+
+
 class TestTheDeviceSelectorIsWiredUp:
     """The selector, executed, against this household's real output list.
 
@@ -1101,7 +1782,12 @@ const LOCAL_DEVICE = "local";
 const OUTPUT_KEY = "tunebox.output";
 
 const store = {};
+let armed = null;
 const window = {
+  // Controllable timers, so the grace period after a pause is a thing the test can *reach* rather
+  // than wait five minutes for.
+  setTimeout: (fn) => { armed = fn; return 1; },
+  clearTimeout: () => { armed = null; },
   localStorage: {
     getItem: (key) => (key in store ? store[key] : null),
     setItem: (key, value) => { store[key] = value; },
@@ -1146,6 +1832,12 @@ function make(tag, className, text) {
 const element = { paused: false, currentTime: 0, pause() { this.paused = true; } };
 const audio = () => element;
 const canSetVolume = () => true;
+
+// The looping silence that holds iOS's audio session open. Stubbed down to the two things
+// `audioSession` touches, so the test can assert *when* the channel is held and released —
+// which is the whole of the fix, and not something the markup can show.
+const keeper = { paused: true, pause() { this.paused = true; }, play() { this.paused = false; return Promise.resolve(); } };
+const silence = () => keeper;
 
 // The four outputs a real OwnTone reported on this host.
 const OUTPUTS = [
@@ -1255,7 +1947,20 @@ console.log(JSON.stringify(result));
             match = re.search(rf"^  (?:async )?function {name}\(", code, re.M)
             assert match, f"{name} is not a top-level function in app.js"
             sources.append(code[match.start() : code.index("\n  }\n", match.start()) + 4])
-        script = cls.HARNESS.replace("__FUNCTIONS__", "\n".join(sources))
+        # The depth is lifted too rather than restated here: a harness with its own copy of the
+        # constant would pass with a one-deep prefetch, which is precisely the bug these test for.
+        depth = re.search(r"^  const AHEAD_DEPTH = \d+;$", code, re.M)
+        assert depth, "AHEAD_DEPTH is not a top-level constant in app.js"
+        # `audioSession` closes over these two, so they are lifted with it rather than restated: a
+        # harness with its own copy of a constant is a harness that cannot fail when it changes.
+        grace = re.search(r"^  const SESSION_GRACE_MS = .+;$", code, re.M)
+        holder = re.search(r"^  let sessionRelease = .+;$", code, re.M)
+        assert grace and holder, "audioSession's state is not declared where expected in app.js"
+        script = (
+            cls.HARNESS.replace("__FUNCTIONS__", "\n".join(sources))
+            .replace("__AHEAD_DEPTH__", depth.group(0).strip())
+            .replace("__SESSION_STATE__", grace.group(0).strip() + "\n" + holder.group(0).strip())
+        )
         completed = subprocess.run(
             [deno, "eval", script], capture_output=True, text=True, timeout=60
         )
