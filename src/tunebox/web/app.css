@@ -132,7 +132,9 @@ code {
   display: flex;
   align-items: baseline;
   gap: 0.75rem;
-  padding: 0.35rem 0 0.6rem;
+  /* No padding above: `.chrome` owns the distance from the status bar, and two rules both leaving a
+   * gap there is how the title ended up a line too low. */
+  padding: 0 0 0.45rem;
 }
 
 .banner {
@@ -172,10 +174,13 @@ main {
   z-index: 3;
   background: var(--bg);
   /*
-   * `.app`'s top padding moved in here, after the inset: the first thing down the page is now this
-   * block, and a gap above the title would be a gap the status bar shows through.
+   * The inset and almost nothing else. `.app`'s old top padding is *not* added back on top of it:
+   * the status bar's own height is already the clearance, and adding a comfortable gap to it put
+   * the title a full line further down than it needs to be — which was invisible while the title
+   * scrolled away and obvious once it stopped. `max()` keeps a sane gap in a browser tab, where
+   * the inset is zero.
    */
-  padding: calc(env(safe-area-inset-top) + 0.75rem) var(--gutter) 0.45rem;
+  padding: max(0.4rem, calc(env(safe-area-inset-top) + 0.1rem)) var(--gutter) 0.4rem;
   /* Cancel `.app`'s side padding so the background reaches the edges a scrolling row passes. */
   margin: 0 calc(-1 * var(--gutter));
 }

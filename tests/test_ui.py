@@ -537,6 +537,17 @@ class TestTheTopOfTheScreenClearsTheStatusBar:
         assert "<h1>tunebox</h1>" in inside, "the app name is not inside the floating block"
         assert 'class="tabs"' in inside, "the tabs are not inside the floating block"
 
+    def test_only_one_rule_leaves_a_gap_above_the_title(self):
+        """Two rules both padding the top is how the title ended up a line lower than it needed to
+        be: the status bar's own height is already the clearance, so `.chrome` adds a hair and
+        `.top` adds nothing."""
+        top = re.search(r"^\.top \{.*?^\}", self.css(), re.M | re.S)
+        assert top, ".top has no rule"
+        padding = re.search(r"padding:\s*([^;]+);", top.group(0))
+        assert padding, ".top sets no padding"
+        first = padding.group(1).split()[0]
+        assert first == "0", f".top still pads its own top with {first}"
+
     def test_the_block_that_sticks_is_the_one_carrying_the_inset(self):
         chrome = re.search(r"^\.chrome \{.*?^\}", self.css(), re.M | re.S)
         assert chrome, ".chrome has no rule"
@@ -560,6 +571,99 @@ class TestTheTopOfTheScreenClearsTheStatusBar:
         assert body
         padding = re.search(r"padding:[^;]+;", body.group(0), re.S)
         assert padding and "inset-top" not in padding.group(0), padding.group(0) if padding else ""
+
+
+class TestDetectingThatTheVolumeCannotBeSet:
+    """The probe, run for real against an element that behaves the way iOS does.
+
+    iOS refuses by *ignoring the assignment* — no throw, and a read that keeps returning the old
+    value — so the only way to know is to set it and read it back. The first version of this probed
+    a detached `<audio>` it created for the purpose, and that gets the wrong answer on the one
+    platform it exists for: iOS lets the write stick on an element with nothing attached and ignores
+    it on the element that is wired to the system's audio. Reported from a phone as "the volume
+    control is still showing".
+    """
+
+    HARNESS = """
+let element = null;
+const audio = () => element;
+const document = { createElement: () => { throw new Error("must not create its own element"); } };
+
+__FUNCTIONS__
+
+/** An element that takes the write, like every desktop browser. */
+const writable = (start) => ({ volume: start });
+
+/** An element that ignores the write and keeps answering with the old value, the way iOS does. */
+const readOnly = (start) => {
+  const node = {};
+  Object.defineProperty(node, "volume", { get: () => start, set: () => {} });
+  return node;
+};
+
+const result = {};
+const ask = (node) => { element = node; volumeWritable = null; return canSetVolume(); };
+
+result.writable = ask(writable(1));
+result.readOnly = ask(readOnly(1));
+result.readOnlyAtZero = ask(readOnly(0));
+result.writableAtZero = ask(writable(0));
+
+// The volume it probed with must not be left behind.
+element = writable(0.6);
+volumeWritable = null;
+canSetVolume();
+result.restored = element.volume;
+
+// No element is not an answer, so it must not be remembered as one.
+element = null;
+volumeWritable = null;
+result.withNoElement = canSetVolume();
+element = readOnly(1);
+result.askedAgainAfterwards = canSetVolume();
+
+console.log(JSON.stringify(result));
+"""
+
+    @classmethod
+    def run(cls) -> dict:
+        deno = shutil.which("deno")
+        if deno is None:  # pragma: no cover - deno is a declared requirement, but not here
+            pytest.skip("deno is not installed")
+        code = TestTheAssetsThemselves.code("app.js")
+        holder = re.search(r"^  let volumeWritable = .+;$", code, re.M)
+        assert holder, "canSetVolume's memo is not declared where this test expects it"
+        start = code.index("  function canSetVolume(")
+        lifted = code[start : code.index("\n  }\n", start) + 4]
+        script = cls.HARNESS.replace(
+            "__FUNCTIONS__", holder.group(0).strip().replace("let", "var", 1) + "\n" + lifted
+        )
+        completed = subprocess.run(
+            [deno, "eval", script], capture_output=True, text=True, timeout=60
+        )
+        assert completed.returncode == 0, completed.stderr
+        return json.loads(completed.stdout)
+
+    def test_an_element_that_ignores_the_write_is_detected(self):
+        ran = self.run()
+        assert ran["readOnly"] is False, "iOS's behaviour must read as 'cannot set the volume'"
+        assert ran["readOnlyAtZero"] is False, "and not only when the volume happens to be 1"
+
+    def test_an_element_that_takes_the_write_is_left_alone(self):
+        ran = self.run()
+        assert ran["writable"] is True
+        assert ran["writableAtZero"] is True, "the probe must work from either end of the range"
+        assert ran["restored"] == 0.6, "the probe put the volume back where it found it"
+
+    def test_it_does_not_probe_an_element_of_its_own_making(self):
+        """The harness throws from `document.createElement`, so this fails rather than quietly
+        measuring the wrong thing — which is what the first version did."""
+        assert self.run()["writable"] is True
+
+    def test_having_nothing_to_ask_is_not_cached_as_an_answer(self):
+        ran = self.run()
+        assert ran["withNoElement"] is True, "assume the control works rather than hiding it blindly"
+        assert ran["askedAgainAfterwards"] is False, "the real element is asked once it exists"
 
 
 class TestTheVolumeControlOnAPhone:

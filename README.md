@@ -333,8 +333,12 @@ A soundbar does not reach every room, somebody else is sometimes using it, and h
   installed still plays music on the phone in your hand. The selector simply says *"No speakers
   visible"*.
 - **The volume slider does not work on iOS.** `HTMLMediaElement.volume` is read-only there, and
-  Apple does not say so — assignments are silently ignored. So the page detects it, **hides** the
-  slider and the ± buttons, and says *"use the phone's own volume buttons"*. An earlier version
+  Apple does not say so — assignments are silently ignored, so the only way to find out is to set it
+  and read it back. **On the element the page actually plays through**, which is the part worth
+  knowing: an earlier version probed a detached `<audio>` it created for the purpose, and iOS lets
+  the write stick on an element with nothing attached while ignoring it on one wired to the system's
+  audio — so the probe said "writable", the slider was shown, and dragging it did nothing. The page
+  **hides** the slider and the ± buttons instead, and says *"use the phone's own volume buttons"*. An earlier version
   greyed them out and left them on screen, on the rule that a control which looks like it worked is
   worse than one that plainly does not; the rule is about not lying, and the sentence does that, so
   the dead slider was nothing to read and one more thing to try to drag. The label stays and the

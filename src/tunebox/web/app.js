@@ -856,17 +856,31 @@
    * to find out is to set it and read it back. Without this check the slider would move under a
    * thumb and change nothing, which is the most expensive kind of broken control: it looks like it
    * worked. Memoised, because the answer cannot change while the page is open.
+   *
+   * **It has to be the element the page actually plays through.** The first version probed a
+   * detached `<audio>` it created for the purpose, and that reports the wrong answer on the one
+   * platform the check exists for: iOS lets the assignment stick on an element with no media
+   * attached, and ignores it on one that is wired to the system's audio. So the probe said
+   * "writable", the controls were shown, and dragging them did nothing — reported from a phone,
+   * which is the only place it could have been found.
+   *
+   * The probe moves the volume by a hundredth and puts it back inside the same synchronous block,
+   * so there is nothing to hear even where it does work.
    */
   let volumeWritable = null;
   function canSetVolume() {
-    if (volumeWritable === null) {
-      const probe = document.createElement("audio");
-      try {
-        probe.volume = 0.5;
-        volumeWritable = probe.volume === 0.5;
-      } catch (error) {
-        volumeWritable = false;
-      }
+    if (volumeWritable !== null) return volumeWritable;
+    const element = audio();
+    // No element to ask is not an answer, so it is not cached as one.
+    if (!element) return true;
+    const before = element.volume;
+    const probe = before > 0.5 ? before - 0.01 : before + 0.01;
+    try {
+      element.volume = probe;
+      volumeWritable = Math.abs(element.volume - probe) < 0.001;
+      if (volumeWritable) element.volume = before;
+    } catch (error) {
+      volumeWritable = false;
     }
     return volumeWritable;
   }
