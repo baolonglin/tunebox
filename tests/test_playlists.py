@@ -1458,6 +1458,91 @@ class TestDeletingOverTheAPI:
         assert client.delete("/playlists/Road trip", headers=AUTH).status_code == 200
 
 
+class TestSavingAQueueThatHasOutlivedTheLibrary:
+    """``skip_missing`` — how *This device*'s queue is saved.
+
+    The bug it fixes was reported as "the queue has 14, one is deleted, so the playlist should have
+    13, but only 12 were saved". The count was a coincidence: **Save the queue** sent
+    ``from_queue`` regardless of the device selector, so it faithfully saved the *house* queue while
+    somebody was looking at a different list of songs on their phone. Measured on this household's
+    Pi at the time: OwnTone's queue held exactly the 12 tracks the file got, in order, with nothing
+    skipped.
+
+    Fixing the selector then needs this flag, because the phone's queue has to arrive as ``paths``
+    and an all-or-nothing ``paths`` is lost entirely by one track deleted since the queue was built.
+    """
+
+    def test_a_track_that_has_gone_costs_its_own_row_and_no_more(
+        self, client: TestClient, config: Config, player: FakePlayer
+    ):
+        player.state = "stop"
+        gone = config.music_root / "Ghost" / "Singles" / "Gone.m4a"
+        gone.parent.mkdir(parents=True, exist_ok=True)
+        gone.write_bytes(b"\x00" * 64)
+        response = client.post(
+            "/playlists",
+            headers=AUTH,
+            json={
+                "name": "Phone queue",
+                "paths": [AUTOBAHN, "Ghost/Singles/Gone.m4a", KSONG],
+                "skip_missing": True,
+            },
+        )
+        assert response.status_code == 201
+        before = response.json()
+        assert before["count"] == 3, "nothing is missing yet, so nothing is skipped"
+
+        gone.unlink()
+        response = client.post(
+            "/playlists",
+            headers=AUTH,
+            json={
+                "name": "Phone queue",
+                "paths": [AUTOBAHN, "Ghost/Singles/Gone.m4a", KSONG],
+                "skip_missing": True,
+                "replace": True,
+            },
+        )
+        assert response.status_code == 201
+        body = response.json()
+        assert body["count"] == 2, "the two that are still there were saved"
+        assert body["skipped"] == ["Ghost/Singles/Gone.m4a"]
+
+    def test_without_the_flag_one_missing_track_still_loses_the_whole_save(
+        self, client: TestClient
+    ):
+        """The default is unchanged, deliberately: a list a client read out of ``GET /library`` has
+        no business containing a path that does not resolve, and a typo must stay an error rather
+        than a playlist that is quietly one track short."""
+        response = client.post(
+            "/playlists",
+            headers=AUTH,
+            json={"name": "Typed", "paths": [AUTOBAHN, "Nope/Nope.m4a"]},
+        )
+        assert response.status_code == 400
+        assert client.get("/playlists/Typed", headers=AUTH).status_code == 404
+
+    def test_a_queue_of_nothing_but_gone_tracks_is_a_409_not_an_empty_file(
+        self, client: TestClient
+    ):
+        """The same answer ``from_queue`` gives, and for the same reason: an empty playlist is
+        something you ask for by name, never something a save quietly leaves behind."""
+        response = client.post(
+            "/playlists",
+            headers=AUTH,
+            json={"name": "All gone", "paths": ["Nope/Nope.m4a"], "skip_missing": True},
+        )
+        assert response.status_code == 409
+        assert "gone" in response.json()["error"]
+
+    def test_the_flag_is_refused_where_it_would_mean_nothing(self, client: TestClient):
+        for body in (
+            {"name": "x", "skip_missing": True},
+            {"name": "x", "from_queue": True, "skip_missing": True},
+        ):
+            assert client.post("/playlists", headers=AUTH, json=body).status_code == 422
+
+
 class TestALibraryDeleteReportsThem:
     def test_the_playlists_it_changed_are_in_the_answer(
         self, client: TestClient, player: FakePlayer

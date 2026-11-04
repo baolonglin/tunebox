@@ -488,6 +488,11 @@ class TestIngest:
         body = response.json()
         assert body["state"] == "queued"
         assert body["video_id"] == video_id(1)
+        # Nothing has been written, so there is no path in either spelling. `library_path` is
+        # derived from `path` on the way out, and a job that has not finished must not be the one
+        # place that derivation has to guess.
+        assert body["path"] is None
+        assert body["library_path"] is None
         # The request did no work: the worker owns everything slow.
         assert source.inspect_calls == []
         assert source.fetch_calls == []
@@ -698,6 +703,13 @@ class TestExitCriterion:
             assert path.is_file()
             assert path == config.music_root / f"Artist {vid}" / "Singles" / f"Track {vid}.m4a"
             assert job["tags"]["source_id"] == vid
+            # The same file in the spelling every other route speaks. Both are reported because
+            # both are wanted: the absolute path is where the file is, and this one is what the
+            # phone's own queue and `DELETE /library` compare against — a row queued under the
+            # absolute spelling outlived the delete of its own audio, which is the bug that put
+            # this field here.
+            assert job["library_path"] == f"Artist {vid}/Singles/Track {vid}.m4a"
+            assert config.music_root / job["library_path"] == path
 
     def test_a_failing_ingest_is_visible_as_a_failed_job_not_a_lost_one(
         self, config: Config, store: JobStore, player: FakePlayer

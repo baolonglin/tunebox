@@ -38,7 +38,7 @@ from ..errors import LibraryError, TuneboxError
 from ..jobs.models import Job, JobState
 from ..jobs.store import JobStore
 from ..jobs.worker import Worker
-from ..library import delete_track, list_tracks, resolve_track_path
+from ..library import delete_track, list_tracks, relative_to_root, resolve_track_path
 from ..player.hooks import rescan_library
 from ..playlists import forget_tracks as forget_playlist_tracks
 from ..sources import urls
@@ -79,8 +79,21 @@ def _worker(request: Request) -> Worker | None:
     return getattr(request.app.state, "worker", None)
 
 
-def _view(job: Job) -> JobView:
-    return JobView(**job.as_dict())
+def _view(job: Job, music_root: Path) -> JobView:
+    """A job, plus the library-relative spelling of whatever file it wrote.
+
+    The store keeps the absolute path, which is the right thing to record: it is where the file
+    actually is. But the page puts a finished track straight into *This device*'s queue, and that
+    queue is pruned on the phone by comparing paths against what ``GET /library`` hands out — so a
+    second spelling of the same file is a row that survives the delete of its own audio. Derived
+    here rather than stored, because it is a function of the music root and nothing else.
+    """
+    data = job.as_dict()
+    written = data.get("path")
+    data["library_path"] = (
+        relative_to_root(music_root, Path(written)) if isinstance(written, str) and written else None
+    )
+    return JobView(**data)
 
 
 # ---------------------------------------------------------------------- routes
@@ -377,12 +390,12 @@ def enqueue_ingest(payload: IngestRequest, request: Request, response: Response)
     if not created:
         response.status_code = status.HTTP_200_OK
         log.info("ingest of %s already queued as job %s", video_id, job.id)
-        return _view(job)
+        return _view(job, _config(request).music_root)
 
     worker = _worker(request)
     if worker is not None:
         worker.notify()
-    return _view(job)
+    return _view(job, _config(request).music_root)
 
 
 @router.get("/jobs", response_model=list[JobView], summary="List jobs, newest first")
@@ -392,7 +405,8 @@ def list_jobs(
     limit: int = Query(default=50, ge=1, le=500),
 ) -> list[JobView]:
     jobs = _store(request).list_jobs(states=[state] if state else None, limit=limit)
-    return [_view(job) for job in jobs]
+    root = _config(request).music_root
+    return [_view(job, root) for job in jobs]
 
 
 @router.get("/jobs/{job_id}", response_model=JobView, summary="One job's state and result")
@@ -400,7 +414,7 @@ def get_job(job_id: str, request: Request) -> JobView:
     job = _store(request).get(job_id)
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such job")
-    return _view(job)
+    return _view(job, _config(request).music_root)
 
 
 @router.delete(
@@ -422,4 +436,4 @@ def cancel_job(job_id: str, request: Request) -> JobView:
         )
     cancelled = store.get(job_id)
     assert cancelled is not None
-    return _view(cancelled)
+    return _view(cancelled, _config(request).music_root)

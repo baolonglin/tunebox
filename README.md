@@ -108,7 +108,7 @@ reachable from outside the house (PLAN.md 3.2).
 | `GET /healthz` | version, library path, queue depth per state, and the playback session |
 | `GET /search?q=…&limit=…` | candidates; the only route that waits on the network |
 | `POST /ingest` | queue a URL, returns a job — `201` new, `200` if that exact request is already queued |
-| `GET /jobs/{id}` | state, progress, attempts, final path, tags, warnings |
+| `GET /jobs/{id}` | state, progress, attempts, final path (absolute, plus `library_path` relative to the music root), tags, warnings |
 | `GET /jobs?state=…&limit=…` | recent jobs, newest first |
 | `DELETE /jobs/{id}` | cancel a job that has not started (`409` once it is running) |
 | `GET /library?q=…&limit=…` | music files under the music root, newest first, paths relative to it |
@@ -125,7 +125,7 @@ reachable from outside the house (PLAN.md 3.2).
 | `PUT /player/output/select` | enable the *configured* speaker (no id taken from the caller); `503` if it is listed but will not start |
 | `GET`&nbsp;`POST`&nbsp;`DELETE /player/queue` | list, add library files, or empty it |
 | `PUT /player/queue/{id}/play` | jump to an item already in the queue — `404` if it has since gone |
-| `GET`&nbsp;`POST /playlists` | list playlists, or create one — from library paths, from the queue, or empty |
+| `GET`&nbsp;`POST /playlists` | list playlists, or create one — from library paths, from the queue, or empty. `skip_missing` saves a *queue* of paths, dropping what has gone instead of failing |
 | `GET`&nbsp;`DELETE /playlists/{name}` | one playlist and its entries; delete the list (no audio is touched) |
 | `PATCH /playlists/{name}` | rename it, keeping its tracks |
 | `POST`&nbsp;`DELETE /playlists/{name}/tracks` | append tracks, or remove them by `positions` or by `paths` |
@@ -566,6 +566,16 @@ On the phone it is the **Playlists** tab:
 - **Making one.** Type a name, then **Save the queue** (what is playing right now) or **Start empty**.
   Either way the new row opens itself. Filing a single track is done where the track is — the Library
   row's **⋯** holds *Add to playlist*.
+
+  **Save the queue means the queue of the device you have selected**, which is worth stating because
+  it was the one control on the page that ignored the selector. It sent `from_queue`, so the server
+  faithfully saved the *house* queue while somebody was looking at a different list of songs on their
+  phone — and the failure had no error in it, just a count that was wrong and nothing saying why.
+  *This device*'s queue lives in that phone's own storage and the server has never seen it, so the
+  page sends it, with `skip_missing`: a queue outlives the library, and one track deleted since the
+  queue was built must cost that row rather than the whole save. A typed list of `paths` keeps its
+  all-or-nothing property, because a path a client read out of `GET /library` and cannot resolve is
+  that client's bug.
 - **Seeing inside one.** Tap the name. The row expands into its entries, numbered, with the artist and
   album under each — and any entry whose file is missing marked in red saying so.
 - **Changing one.** Each entry has **↑ ↓** to move it and **✕** to take it out. No confirmation on the
@@ -771,8 +781,17 @@ Details worth knowing before you point it at an album:
   `removed_directories`. Without this, deleting the last track of an artist leaves a directory that
   `GET /library` never shows (it walks files) and OwnTone's browse view does, as a phantom artist.
 - **The track the player currently has loaded is refused with `409`.** Skip past it or stop, then
-  delete. Tracks further down the queue are deleted without complaint: OwnTone finds out on its next
-  load, and a queue is not a claim on the library.
+  delete. Tracks further down the house queue are deleted without complaint: OwnTone finds out on
+  its next load, and a queue is not a claim on the library.
+- **The phone's own queue loses the row, and that one the server cannot do.** *This device*'s queue
+  lives in that device's storage and is sent nowhere, so the page prunes it itself after a delete it
+  issued — otherwise it would keep a row that can only ever fail to load. Worth knowing because it
+  is where one bug lived: a finished ingest reports the **absolute** path it wrote and the Add-music
+  panel's Play button queued that, while `GET /library` and `DELETE /library` both speak the
+  **relative** spelling, so the row and the delete named one file under two names and the prune
+  walked past it. `GET /jobs` now reports `library_path` beside `path` for exactly this, and the
+  comparison tolerates a path that is the other's suffix, because a phone that has not rebuilt its
+  queue still has the old spelling in its own storage.
 - **All-or-nothing.** Every path is resolved before anything is unlinked, so a typo in the third entry
   is a `400` that deleted nothing. The same path is accepted in either spelling, and naming one file
   twice is one delete.

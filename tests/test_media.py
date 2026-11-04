@@ -762,6 +762,7 @@ class TestThePhoneQueueStateMachine:
         "localSetRepeat",
         "localSetShuffle",
         "localForget",
+        "samePath",
         "localView",
         "localAheadTrack",
         "localPrefetchNext",
@@ -1030,6 +1031,37 @@ await (async () => {
   result.forgetDropsARow = snapshot();
   localForget("b.m4a");
   result.forgetTheCurrentTrackStops = snapshot();
+
+  // The spelling trap. A finished ingest reports the *absolute* path it wrote, and the Add-music
+  // panel's Play button used to put that straight into this queue — so the row and the path a
+  // library delete names are the same file under two names, and a delete pruned by string equality
+  // walked straight past it. Those rows are still in localStorage on a phone that has not rebuilt
+  // its queue, which is why this is a property of the comparison and not only of the new field.
+  reset();
+  await localEnqueue(
+    [
+      { path: "/home/u/Music/tunebox/A/Singles/a.m4a", title: "a" },
+      { path: "b.m4a", title: "b" },
+    ],
+    "replace",
+    true
+  );
+  localForget("A/Singles/a.m4a");
+  result.forgetFindsTheAbsoluteSpelling = snapshot();
+
+  // And the other way round: the queue holds the library spelling, the delete names the absolute
+  // one. Nothing produces that today, but the comparison is symmetric and a test is cheaper than
+  // finding out it is not.
+  reset();
+  await localEnqueue(ABCD, "replace", true);
+  localForget("/home/u/Music/tunebox/c.m4a");
+  result.forgetFindsTheRelativeSpelling = snapshot();
+
+  // What must *not* match, which is the whole risk of a suffix comparison.
+  result.samePathRejectsASharedTail = samePath("another one.m4a", "one.m4a");
+  result.samePathRejectsAPartialComponent = samePath("A/bb.m4a", "A/b.m4a");
+  result.samePathAcceptsEquality = samePath("a/b.m4a", "a/b.m4a");
+  result.samePathRejectsNothing = samePath("", "a.m4a");
 
   reset();
   await localEnqueue(ABCD, "replace", true);
@@ -1453,6 +1485,31 @@ console.log(JSON.stringify(result));
         assert "b.m4a" not in state["queue"]
         assert state["paused"] is True
 
+    def test_a_delete_finds_the_row_whatever_spelling_it_was_queued_under(self, ran):
+        """The bug this was reported as: delete a track from the Library panel and the row stayed in
+        *This device*'s queue.
+
+        A finished ingest reports the **absolute** path it wrote and the Add-music panel's Play
+        button put that straight into this queue, while ``GET /library`` and ``DELETE /library``
+        both speak the **relative** spelling — so the row and the delete named one file under two
+        names, and a prune by string equality walked past it. The row then outlived its own audio
+        and could only ever fail to load. The page now queues the library spelling (``JobView``
+        gained ``library_path`` for it), and the comparison stays tolerant because a phone that has
+        not rebuilt its queue still has the old rows in its own storage.
+        """
+        absolute = ran["forgetFindsTheAbsoluteSpelling"]
+        assert absolute["queue"] == ["b.m4a"], "the absolutely-spelled row was dropped"
+        relative = ran["forgetFindsTheRelativeSpelling"]
+        assert relative["queue"] == ["a.m4a", "b.m4a", "d.m4a"]
+
+    def test_the_tolerant_comparison_does_not_match_a_shared_tail(self, ran):
+        """The whole risk of comparing by suffix, so each case has an assertion rather than a
+        comment claiming it was considered."""
+        assert ran["samePathRejectsASharedTail"] is False
+        assert ran["samePathRejectsAPartialComponent"] is False
+        assert ran["samePathAcceptsEquality"] is True
+        assert ran["samePathRejectsNothing"] is False
+
     def test_the_view_is_shaped_like_the_player_api(self, ran):
         """One renderer for both outputs, which is only possible if this document has the same field
         names ``GET /player`` does — a second renderer would be a second place for the screen to be
@@ -1579,6 +1636,40 @@ class TestTheGapBetweenTwoTracks:
         after_src = body[body.index("element.src = url;") :]
         assert "await" not in after_src, after_src
         assert "localPrefetchNext();" in after_src
+
+    def test_saving_the_queue_as_a_playlist_asks_which_queue(self):
+        """The one control on the page that ignored the device selector.
+
+        Reported as "the queue has 14 tracks, one is deleted, so the playlist should have 13 — but
+        only 12 were saved". The count was a coincidence and nothing was lost: the handler sent
+        ``from_queue`` unconditionally, so the server faithfully saved the *house* queue while
+        somebody was looking at a different list of songs on their own phone. Measured on this
+        household's Pi at the time: OwnTone's queue held exactly the 12 tracks the file got, in
+        order, with ``skipped`` empty.
+
+        It is asserted on the source because the alternative is a test that wires up a form submit,
+        and what went wrong was never the wiring — it was a missing question. This device's queue is
+        in that phone's storage and the server has never seen it, so it has to be *sent*, and sent
+        with ``skip_missing`` because a queue outlives the library.
+        """
+        code = code_only("app.js")
+        # Found by what it does rather than by where it is: this page has several submit handlers,
+        # and the first version of this test cheerfully asserted against the search box's.
+        handlers = [
+            block.group(0)
+            for block in re.finditer(
+                r"form\.addEventListener\(\"submit\".*?^    \}\);$", code, re.M | re.S
+            )
+            if "create(" in block.group(0)
+        ]
+        assert len(handlers) == 1, f"expected one playlist-creating submit handler, got {len(handlers)}"
+        handler = handlers[0]
+        assert "localMode()" in handler, "the save does not ask which device is selected"
+        assert "from_queue: true" in handler, "a speaker's queue is still the daemon's to read"
+        assert "state.local.queue.map" in handler, "this device's queue has to be sent"
+        assert "skip_missing: true" in handler, (
+            "without this, one track deleted since the queue was built loses the whole save"
+        )
 
 
     def test_what_is_next_mid_queue(self, ran):

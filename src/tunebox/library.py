@@ -175,7 +175,7 @@ def delete_track(root: Path, relative: str, *, prune: bool = True) -> DeletedTra
     except OSError as exc:
         raise LibraryError(f"could not delete {relative}: {exc}") from exc
     removed = _prune_empty_parents(root, target.parent) if prune else ()
-    return DeletedTrack(path=_relative_to_root(root, target), removed_directories=removed)
+    return DeletedTrack(path=relative_to_root(root, target), removed_directories=removed)
 
 
 def _prune_empty_parents(root: Path, directory: Path) -> tuple[str, ...]:
@@ -203,13 +203,18 @@ def _prune_empty_parents(root: Path, directory: Path) -> tuple[str, ...]:
         except OSError:
             # Not empty (the common case, and the point), or not removable. Either way, stop here.
             break
-        removed.append(_relative_to_root(root, current))
+        removed.append(relative_to_root(root, current))
         current = current.parent
     return tuple(removed)
 
 
-def _relative_to_root(root: Path, path: Path) -> str:
-    """``path`` as a POSIX path relative to ``root`` — the only form a client is ever told."""
+def relative_to_root(root: Path, path: Path) -> str:
+    """``path`` as a POSIX path relative to ``root`` — the only form a client is ever told.
+
+    Public because the job view needs it as well: a finished ingest records the absolute path it
+    wrote, and the phone needs the same spelling the library listing hands out. See
+    ``tunebox.api.routes._view``.
+    """
     try:
         return path.relative_to(root).as_posix()
     except ValueError:  # pragma: no cover - callers pass paths built by joining onto root

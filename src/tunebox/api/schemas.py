@@ -59,7 +59,16 @@ class JobView(BaseModel):
     retry_after: str | None = None
     progress: float | None = None
     error: str | None = None
+    #: Absolute, which is where the file is.
     path: str | None = None
+    #: The same file in the spelling ``GET /library`` hands out, relative to the music root.
+    #:
+    #: Both name the same track and every route accepts either, so for a long time the difference
+    #: was invisible. It is not invisible on the phone: *This device*'s queue lives in that phone's
+    #: own storage and is pruned there by comparing paths, so a row queued straight from a finished
+    #: ingest — the one place the absolute spelling reached the page — outlived the delete that
+    #: removed its file, and could then only ever fail to load.
+    library_path: str | None = None
     already_present: bool = False
     warnings: list[str] = Field(default_factory=list)
     tags: dict[str, Any] | None = None
@@ -407,6 +416,13 @@ class PlaylistCreateRequest(BaseModel):
     fails. The *queue* is shared state that tunebox did not necessarily fill (OwnTone's own web UI can
     add to it), so an item that is not a library track is skipped and reported — the alternative is a
     "save the queue" button that cannot save this queue and cannot say which entry is the problem.
+
+    ``skip_missing`` is how a caller says "these paths *are* a queue". It exists because the real
+    distinction is not the transport: it is between a list somebody has just read and a queue that
+    has been sitting around outliving the library. *This device*'s queue is the second kind and has
+    to arrive as ``paths``, because it lives in that phone's own storage and the server has never
+    seen it — so without this, saving it was all-or-nothing and one track deleted since the queue was
+    built lost the whole save.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -414,6 +430,10 @@ class PlaylistCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     paths: list[str] | None = Field(default=None, max_length=1000)
     from_queue: bool = False
+    #: Treat ``paths`` as a queue: skip what no longer resolves and report it in ``skipped``, rather
+    #: than failing the whole save. Off by default, so a typed list keeps its all-or-nothing
+    #: property and a typo stays an error rather than a playlist that is quietly one track short.
+    skip_missing: bool = False
     #: Overwrite a playlist of the same name. Off by default, so creating twice is a ``409`` rather
     #: than silently discarding whatever was in the first one.
     replace: bool = False
@@ -424,6 +444,10 @@ class PlaylistCreateRequest(BaseModel):
             raise ValueError("send at most one of paths or from_queue")
         if self.paths is not None and not self.paths:
             raise ValueError("paths must not be empty; omit it to create an empty playlist")
+        if self.skip_missing and self.paths is None:
+            # Not a harmless no-op: it would read as "save the queue leniently" on a request that
+            # has no paths at all, which is either a client bug or a misunderstanding of from_queue.
+            raise ValueError("skip_missing only applies to paths")
         return self
 
 

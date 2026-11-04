@@ -1330,15 +1330,35 @@
     return Promise.resolve();
   }
 
+  /**
+   * Do two library paths name the same track?
+   *
+   * Normally this is string equality, because every path the page puts in the queue now is the
+   * spelling `GET /library` hands out. The suffix case is for a queue a phone stored *before* that
+   * was true: a finished ingest reports the absolute path it wrote, the Add-music panel's Play
+   * button put that straight into this queue, and those rows are still in localStorage on any phone
+   * that has not rebuilt its queue since. A delete has to be able to find them, or the row outlives
+   * its own audio and can then only ever fail to load — which is the bug this pair of functions
+   * exists to fix, and it was invisible until somebody deleted a track they had just ingested.
+   *
+   * Anchored on a `/` so that `one.m4a` cannot match `another one.m4a`, and checked both ways round
+   * because either side may be the absolute one.
+   */
+  function samePath(a, b) {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    return a.endsWith("/" + b) || b.endsWith("/" + a);
+  }
+
   /** Drop every copy of a path from the phone's queue — what a library delete has to do here. */
   function localForget(path) {
     const local = state.local;
-    if (!local.queue.some((track) => track.path === path)) return;
+    if (!local.queue.some((track) => samePath(track.path, path))) return;
     const playing = localTrack();
-    local.queue = local.queue.filter((track) => track.path !== path);
-    const keep = playing && playing.path !== path ? local.queue.indexOf(playing) : undefined;
+    local.queue = local.queue.filter((track) => !samePath(track.path, path));
+    const keep = playing && !samePath(playing.path, path) ? local.queue.indexOf(playing) : undefined;
     localReorder(keep);
-    if (playing && playing.path === path) localStop();
+    if (playing && samePath(playing.path, path)) localStop();
     else {
       localPersist();
       localRender();
@@ -2041,7 +2061,11 @@
           // The tags go with the path, not only the path: on the phone output there is nothing that
           // can read a file's metadata, and the job already knows what it just wrote.
           const finished = {
-            path: job.path,
+            // The library spelling, not the absolute path the job also reports: this goes into
+            // *This device*'s queue, which is pruned on the phone by comparing paths against what
+            // `GET /library` hands out. `job.path` is the fallback for a server older than the
+            // field, and `samePath` is what covers a queue stored before this line existed.
+            path: job.library_path || job.path,
             title: (job.tags && job.tags.title) || title,
             artist: (job.tags && job.tags.artist) || null,
             album: (job.tags && job.tags.album) || null,
@@ -2645,12 +2669,29 @@
 
     form.addEventListener("submit", (event) => {
       event.preventDefault();
-      create({ from_queue: true }, (playlist) => {
+      // *Which* queue: the selector decides, like everything else on this screen. This was the one
+      // control that ignored it, and the symptom was not an error — `from_queue` saved the house
+      // queue perfectly while somebody was looking at a different list of songs on this device, so
+      // the count was simply wrong and nothing said why.
+      //
+      // This device's queue is in this phone's own storage and the server has never seen it, so it
+      // has to be sent. `skip_missing` is what says it is a *queue*: a track deleted since the
+      // queue was built costs that row rather than the whole save.
+      if (localMode() && !state.local.queue.length) {
+        el("pl-note").textContent = "Nothing in this device's queue to save.";
+        return;
+      }
+      const source = localMode()
+        ? { paths: state.local.queue.map((item) => item.path), skip_missing: true }
+        : { from_queue: true };
+      create(source, (playlist) => {
         const skipped = (playlist.skipped || []).length;
         return (
           `Saved ${playlist.name} — ${playlist.count} track${playlist.count === 1 ? "" : "s"}.` +
-          // Queue items that are not library tracks are left out rather than failing the save, so the
-          // count can legitimately differ from the queue length. Saying which is cheap.
+          // Items that are not library tracks are left out rather than failing the save, so the
+          // count can legitimately differ from the queue length. Saying which is cheap — and on
+          // this device it is the only thing that explains a track deleted since the queue was
+          // built being absent from the list somebody just saved.
           (skipped ? ` ${skipped} queue item${skipped === 1 ? "" : "s"} skipped.` : "")
         );
       });

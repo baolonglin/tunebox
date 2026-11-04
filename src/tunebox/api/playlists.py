@@ -166,6 +166,22 @@ def create_playlist(payload: PlaylistCreateRequest, request: Request) -> Playlis
         # ``None`` is "create it empty" — the entry point for assembling a playlist one track at a
         # time from the Library panel, which is the half of creation that was missing at first.
         entries = list(payload.paths or ())
+        if payload.skip_missing and entries:
+            # The caller said these are a queue, not a list it has just read: *This device*'s queue
+            # arrives this way because it lives in the phone's own storage and the server has never
+            # seen it. A queue outlives the library, so one track deleted since it was built must
+            # cost that one row and not the whole save.
+            kept = [(entry, _resolved_or_none(config.music_root, entry)) for entry in entries]
+            entries = [resolved for _, resolved in kept if resolved is not None]
+            skipped = [entry for entry, resolved in kept if resolved is None]
+            if not entries:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "none of those paths are library tracks any more "
+                        f"({len(skipped)} item(s) have gone)"
+                    ),
+                )
 
     try:
         playlist = playlist_files.write_playlist(
@@ -182,6 +198,18 @@ def create_playlist(payload: PlaylistCreateRequest, request: Request) -> Playlis
     return _view(playlist, skipped=skipped)
 
 
+def _resolved_or_none(root, path: str) -> str | None:
+    """The resolved path, or ``None`` if it is not a library track any more.
+
+    Resolution is the only honest existence check here: it is the same function the write path uses,
+    so "this will be skipped" and "this would have been refused" cannot disagree.
+    """
+    try:
+        return str(resolve_track_path(root, path))
+    except LibraryError:
+        return None
+
+
 def _queue_entries(request: Request) -> tuple[list[str], list[str]]:
     """The queue's library tracks, in order, and the titles of whatever else was in it.
 
@@ -196,12 +224,11 @@ def _queue_entries(request: Request) -> tuple[list[str], list[str]]:
         if not item.path:
             skipped.append(item.title or f"queue item {item.position + 1}")
             continue
-        try:
-            resolved = resolve_track_path(config.music_root, item.path)
-        except LibraryError:
+        resolved = _resolved_or_none(config.music_root, item.path)
+        if resolved is None:
             skipped.append(item.title or item.path)
             continue
-        entries.append(str(resolved))
+        entries.append(resolved)
     return entries, skipped
 
 
