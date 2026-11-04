@@ -453,6 +453,155 @@ class TestTheAssetsThemselves:
         assert re.search(r"\[hidden\]\s*\{\s*display:\s*none\s*!important", css)
 
 
+class TestTheTransportIsOneSetOfIcons:
+    """The icons were Unicode characters, and two of them came from different parts of Unicode.
+
+    Reported from a phone as "the play and pause icons feel like two different icon sets", which is
+    exactly what they were: `▶` is U+25B6, in Geometric Shapes since Unicode 1.1, while
+    `⏸ ⏮ ⏭ ⏹` are U+23F8/23EE/23ED/23F9, added to Miscellaneous Technical in 6.0. iOS draws all
+    five as colour emoji from two design generations, at different weights and optical sizes — and
+    the glyphs belong to the font, so no stylesheet could have corrected it.
+    """
+
+    @staticmethod
+    def read(name: str) -> str:
+        return (ui.WEB_ROOT / name).read_text(encoding="utf-8")
+
+    def test_no_transport_button_carries_a_character_icon(self):
+        html = self.read("index.html")
+        buttons = re.search(r"<div class=\"transport\".*?</div>", html, re.S)
+        assert buttons, "the transport group is not where this test expects it"
+        for codepoint in ("\u25b6", "\u23f8", "\u23ee", "\u23ed", "\u23f9"):
+            assert codepoint not in buttons.group(0), (
+                f"U+{ord(codepoint):04X} is back in the transport; it is a font's drawing, not ours"
+            )
+        # And not hiding in the script that swaps them either.
+        script = self.read("app.js")
+        for codepoint in ("\u25b6", "\u23f8"):
+            assert f'"{codepoint}"' not in script, f"U+{ord(codepoint):04X} is assigned in app.js"
+
+    def test_every_icon_reference_resolves_to_a_symbol_in_the_page(self):
+        """A typo in a `<use href>` is an empty button, which is invisible to every other test
+        here: the markup still parses and the click handler still works."""
+        html = self.read("index.html")
+        script = self.read("app.js")
+        defined = set(re.findall(r'<symbol id="(i-[a-z]+)"', html))
+        assert defined, "no icon symbols are defined"
+
+        used = set(re.findall(r'<use href="#(i-[a-z]+)"', html))
+        # `setIcon` builds the id from a name, so the names it is *called* with are references too.
+        assert "`#i-${name}`" in script, "setIcon no longer builds the id this test reads"
+        used |= {f"i-{name}" for name in re.findall(r'setIcon\([^,]+, [^"]*"([a-z]+)"', script)}
+        used |= {
+            f"i-{name}"
+            for ternary in re.findall(r'setIcon\([^,]+, [^)]+\)', script)
+            for name in re.findall(r'"([a-z]+)"', ternary)
+        }
+
+        assert used, "nothing references an icon"
+        assert used <= defined, f"referenced but not defined: {sorted(used - defined)}"
+        assert defined <= used, f"defined but never referenced: {sorted(defined - used)}"
+
+    def test_the_icons_share_one_grid(self):
+        """Different viewBoxes would be the same bug again in our own drawing: the same `1.15em` box
+        would then show five different optical sizes."""
+        html = self.read("index.html")
+        boxes = re.findall(r'<symbol id="i-[a-z]+" viewBox="([^"]+)"', html)
+        assert len(boxes) >= 5
+        assert set(boxes) == {"0 0 24 24"}, boxes
+
+    def test_the_icons_follow_the_button_colour(self):
+        """`currentColor`, so the primary button can invert without a second copy of every path."""
+        css = (ui.WEB_ROOT / "app.css").read_text(encoding="utf-8")
+        icon = re.search(r"^\.icon \{.*?^\}", css, re.M | re.S)
+        assert icon and "fill: currentColor" in icon.group(0)
+
+
+class TestTheTopOfTheScreenClearsTheStatusBar:
+    """The tabs floated on their own and an iPhone's clock and battery sat on top of them.
+
+    `position: sticky; top: 0` pins to the scrollport, which on an installed web app is the physical
+    top of the screen. `<body>`'s `padding-top: env(safe-area-inset-top)` cannot help, because that
+    padding is precisely what a sticky child scrolls up out of.
+    """
+
+    @staticmethod
+    def css() -> str:
+        return (ui.WEB_ROOT / "app.css").read_text(encoding="utf-8")
+
+    def test_the_title_and_the_tabs_float_as_one_block(self):
+        html = (ui.WEB_ROOT / "index.html").read_text(encoding="utf-8")
+        chrome = re.search(r'<div class="chrome">(.*?)</div>', html, re.S)
+        assert chrome, "there is no sticky chrome wrapping the top of the page"
+        inside = chrome.group(1)
+        assert "<h1>tunebox</h1>" in inside, "the app name is not inside the floating block"
+        assert 'class="tabs"' in inside, "the tabs are not inside the floating block"
+
+    def test_the_block_that_sticks_is_the_one_carrying_the_inset(self):
+        chrome = re.search(r"^\.chrome \{.*?^\}", self.css(), re.M | re.S)
+        assert chrome, ".chrome has no rule"
+        body = chrome.group(0)
+        assert "position: sticky" in body
+        assert "top: 0" in body
+        assert "env(safe-area-inset-top)" in body, (
+            "without the inset on the sticky block itself, the status bar sits on whatever sticks"
+        )
+
+    def test_the_tabs_do_not_stick_separately(self):
+        """Two sticky blocks at `top: 0` is the original bug with an extra step: the tabs would pin
+        to the viewport and leave the title behind."""
+        tabs = re.search(r"^\.tabs \{.*?^\}", self.css(), re.M | re.S)
+        assert tabs and "position: sticky" not in tabs.group(0)
+
+    def test_the_body_no_longer_claims_the_top_inset(self):
+        """Two copies of the inset would be a visible gap, and the one on `<body>` is the one that
+        does nothing for a sticky child."""
+        body = re.search(r"^body \{.*?^\}", self.css(), re.M | re.S)
+        assert body
+        padding = re.search(r"padding:[^;]+;", body.group(0), re.S)
+        assert padding and "inset-top" not in padding.group(0), padding.group(0) if padding else ""
+
+
+class TestTheVolumeControlOnAPhone:
+    """iOS will not let a page set an audio element's volume, so in phone mode the control goes.
+
+    The first version disabled it and left it on screen, on the rule that a control which looks like
+    it worked is worse than one that plainly does not. That rule is about not *lying*, though, and
+    the note underneath says plainly what to use instead — so once the sentence is there, a dead
+    slider is nothing to read and one more thing to try to drag. It is hidden now, and the two
+    things that must survive the hiding each have an assertion: the label, so the card does not look
+    like it failed to load, and the note, which is the only thing that says why.
+    """
+
+    @staticmethod
+    def read(name: str) -> str:
+        return (ui.WEB_ROOT / name).read_text(encoding="utf-8")
+
+    def test_the_slider_and_the_steppers_are_in_one_hideable_row(self):
+        html = self.read("index.html")
+        assert '<div class="card volume">' in html, "the volume card has been renamed"
+        row = re.search(r'<div class="volume-row" id="volume-row">(.*?)</div>', html, re.S)
+        assert row, "there is no single element the script can hide"
+        for control in ('id="vol"', 'id="btn-volup"', 'id="btn-voldown"'):
+            assert control in row.group(1), f"{control} would be left behind when the row is hidden"
+
+    def test_the_explanation_is_not_inside_the_thing_that_gets_hidden(self):
+        """The worst outcome available here: hide the controls *and* the sentence that says why, and
+        the card becomes a heading with nothing under it."""
+        html = self.read("index.html")
+        row = re.search(r'<div class="volume-row" id="volume-row">(.*?)</div>', html, re.S)
+        assert row and 'id="vol-note"' not in row.group(1)
+        assert 'id="vol-note"' in html
+        assert '<label for="vol">Volume</label>' in html, "the label is the card's own heading"
+
+    def test_the_row_is_hidden_and_not_only_disabled(self):
+        script = TestTheAssetsThemselves.code("app.js")
+        assert 'el("volume-row").hidden = !volumeUsable;' in script
+        # Still disabled as well, deliberately: `hidden` is a presentation hint a stylesheet can
+        # lose, and a control that is off screen must not still answer a synthetic click.
+        assert '.disabled = !volumeUsable;' in script
+
+
 class TestTheTokenReveal:
     """"Show token" in the footer — the bridge to a home-screen icon.
 

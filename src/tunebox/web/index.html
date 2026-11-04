@@ -52,6 +52,46 @@
       succeeds, because there is nothing to display: every byte of library, queue and job data is
       behind the token.
     -->
+    <!--
+      The transport icons, defined once and referenced with <use>.
+
+      They were Unicode characters, and two of them came from different parts of Unicode: `▶` is
+      U+25B6, in Geometric Shapes since Unicode 1.1, while `⏸ ⏮ ⏭ ⏹` are U+23F8/23EE/23ED/23F9,
+      added to Miscellaneous Technical in 6.0. iOS draws all five as colour emoji from two different
+      design generations, so the play button and the pause button it turns into were visibly not the
+      same icon — different weight, different optical size. No stylesheet can correct that: the
+      glyphs belong to the font, not to the page.
+
+      So they are drawn here instead, on one 24×24 grid with one set of rules: every icon spans
+      y=5..19, every bar is 3 wide with a 1.2 radius, and every triangle has the same base and apex.
+      `fill="currentColor"` keeps them following the button's own colour, which is what lets the
+      primary button invert without a second copy of each path.
+    -->
+    <svg width="0" height="0" aria-hidden="true" focusable="false" style="position: absolute">
+      <defs>
+        <symbol id="i-play" viewBox="0 0 24 24">
+          <path d="M8 5.5 19 12 8 18.5Z" stroke="currentColor" stroke-width="1.6"
+                stroke-linejoin="round" />
+        </symbol>
+        <symbol id="i-pause" viewBox="0 0 24 24">
+          <rect x="8" y="5" width="3" height="14" rx="1.2" />
+          <rect x="13" y="5" width="3" height="14" rx="1.2" />
+        </symbol>
+        <symbol id="i-prev" viewBox="0 0 24 24">
+          <rect x="5" y="5" width="3" height="14" rx="1.2" />
+          <path d="M19 5.5 10 12 19 18.5Z" stroke="currentColor" stroke-width="1.6"
+                stroke-linejoin="round" />
+        </symbol>
+        <symbol id="i-next" viewBox="0 0 24 24">
+          <path d="M5 5.5 14 12 5 18.5Z" stroke="currentColor" stroke-width="1.6"
+                stroke-linejoin="round" />
+          <rect x="16" y="5" width="3" height="14" rx="1.2" />
+        </symbol>
+        <symbol id="i-stop" viewBox="0 0 24 24">
+          <rect x="6" y="6" width="12" height="12" rx="1.8" />
+        </symbol>
+      </defs>
+    </svg>
     <div id="gate" class="gate" hidden>
       <form id="gate-form" class="card">
         <h1>tunebox</h1>
@@ -78,6 +118,14 @@
     </div>
 
     <div id="app" class="app" hidden>
+      <!--
+        Title and tabs are one sticky block, and the reason is the status bar. A sticky child sticks
+        to the *viewport* edge, so `top: 0` on the tabs alone put them under an iPhone's clock and
+        battery the moment the page scrolled — `<body>`'s safe-area padding cannot help, because it
+        is the thing the sticky element scrolls out of. The inset lives on `.chrome` instead, so
+        whatever is sticky is always below the icons.
+      -->
+      <div class="chrome">
       <header class="top">
         <h1>tunebox</h1>
         <p id="banner" class="banner" role="status" aria-live="polite" hidden></p>
@@ -124,6 +172,7 @@
           Playlists
         </button>
       </nav>
+      </div>
 
       <main>
         <!-- ------------------------------------------------------------ now playing -->
@@ -227,15 +276,15 @@
           </div>
 
           <div class="transport" role="group" aria-label="Transport">
-            <button type="button" id="btn-prev" aria-label="Previous track">⏮</button>
-            <button type="button" id="btn-toggle" class="primary big" aria-label="Play">▶</button>
-            <button type="button" id="btn-next" aria-label="Next track">⏭</button>
-            <button type="button" id="btn-stop" aria-label="Stop">⏹</button>
+            <button type="button" id="btn-prev" aria-label="Previous track"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-prev" /></svg></button>
+            <button type="button" id="btn-toggle" class="primary big" aria-label="Play"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-play" /></svg></button>
+            <button type="button" id="btn-next" aria-label="Next track"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-next" /></svg></button>
+            <button type="button" id="btn-stop" aria-label="Stop"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-stop" /></svg></button>
           </div>
 
           <div class="card volume">
             <label for="vol">Volume</label>
-            <div class="volume-row">
+            <div class="volume-row" id="volume-row">
               <button type="button" id="btn-voldown" aria-label="Volume down">−</button>
               <input id="vol" type="range" min="0" max="100" step="1" value="0" />
               <button type="button" id="btn-volup" aria-label="Volume up">+</button>
@@ -244,9 +293,16 @@
             <!--
               iOS refuses to let a page set an audio element's volume at all — HTMLMediaElement
               .volume is read-only there, silently, so a slider would move and change nothing. When
-              that is detected in phone mode the controls are disabled and this says why; the
-              hardware buttons are the volume control in that mode, which is a thing the house
-              speaker path cannot offer at all.
+              that is detected in phone mode the row above is hidden and this says why.
+
+              Hidden rather than disabled, which is a reversal: the first version greyed the
+              controls out and left them there, on the rule that a control which looks like it
+              worked is worse than one that plainly does not. But that rule is about not lying, and
+              this sentence does the not-lying — so the dead slider was nothing to read and one more
+              thing to try to drag. The label stays, so the card does not look like it failed to
+              load, and this note is deliberately outside the row it explains. The phone's hardware
+              buttons are the volume control in that mode, which is a thing the house speaker path
+              cannot offer at all.
             -->
             <p id="vol-note" class="muted small" hidden></p>
           </div>

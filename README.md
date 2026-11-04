@@ -333,9 +333,12 @@ A soundbar does not reach every room, somebody else is sometimes using it, and h
   installed still plays music on the phone in your hand. The selector simply says *"No speakers
   visible"*.
 - **The volume slider does not work on iOS.** `HTMLMediaElement.volume` is read-only there, and
-  Apple does not say so — assignments are silently ignored. So the page detects it, disables the
-  slider and the ± buttons, and says *"use the phone's own volume buttons"*. Nothing is more
-  annoying than a control that looks like it worked.
+  Apple does not say so — assignments are silently ignored. So the page detects it, **hides** the
+  slider and the ± buttons, and says *"use the phone's own volume buttons"*. An earlier version
+  greyed them out and left them on screen, on the rule that a control which looks like it worked is
+  worse than one that plainly does not; the rule is about not lying, and the sentence does that, so
+  the dead slider was nothing to read and one more thing to try to drag. The label stays and the
+  note sits outside the row that gets hidden, or the card would be a heading with nothing under it.
 - **The queue survives closing the app**, and so does your place in the track, because both are in
   that device's storage. The position is written down every five seconds while a track plays, so a
   phone that locked, ran out of battery or walked out of range comes back to the same song at
@@ -735,6 +738,20 @@ Four panels:
   to reorder and **✕** to remove, and a missing file says so in red rather than being a number in a
   subtitle. **⋯** holds *Rename* and the delete confirmation, and deletes no audio. See
   [Playlists](#playlists).
+
+**The app name and the tabs float together**, which is one block rather than two because the tabs
+alone could not float safely: `position: sticky` pins to the top of the screen, not to the top of
+the page's padding, so on an installed web app the tabs slid under the clock and the battery as soon
+as anything scrolled. The safe-area inset therefore belongs to the floating block, and what ends up
+against the status bar is always background rather than a control.
+
+**The transport icons are drawn in the page, not typed.** They were Unicode characters until two of
+them turned out to come from different parts of the standard — `▶` is U+25B6, in Geometric Shapes
+since Unicode 1.1, while `⏸ ⏮ ⏭ ⏹` are U+23F8/23EE/23ED/23F9, added to Miscellaneous Technical in
+6.0 — so iOS drew the play button and the pause button it turns into as colour emoji from two
+different design generations, at visibly different weights. A glyph belongs to the font, so no
+stylesheet could have fixed it. They are now five `<symbol>`s on one 24×24 grid, filled with
+`currentColor` so the primary button inverts without a second copy of any path.
 
 The footer links to **OwnTone's own web UI** for browsing by artist and album, playlists and artwork
 — the expensive half of a music UI, which OwnTone already has and tunebox does not rebuild. The link

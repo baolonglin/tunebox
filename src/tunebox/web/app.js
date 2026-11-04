@@ -59,6 +59,20 @@
   /** Elements are looked up once: this page's DOM is static, only its contents change. */
   const el = (id) => document.getElementById(id);
 
+  /**
+   * Point a button's icon at one of the symbols defined in index.html.
+   *
+   * The transport used Unicode characters until two of them turned out to come from different parts
+   * of the standard — `▶` is U+25B6 (Geometric Shapes, 1.1) while `⏸` is U+23F8 (Miscellaneous
+   * Technical, 6.0) — so iOS drew the play button and the pause button it becomes from two
+   * different emoji design generations, at visibly different weights. That is a property of the
+   * font and no stylesheet can reach it, so the icons are drawn in the page instead.
+   */
+  const setIcon = (node, name) => {
+    const use = node.querySelector("use");
+    if (use) use.setAttribute("href", `#i-${name}`);
+  };
+
   const state = {
     token: null,
     tab: "now",
@@ -463,9 +477,9 @@
 
     const playing = player.state === "play";
     const toggle = el("btn-toggle");
-    // Glyph *and* label: colour alone would leave a screen reader with nothing, and a play/pause
+    // Icon *and* label: colour alone would leave a screen reader with nothing, and a play/pause
     // button whose icon is the only state signal is the classic failure of a hand-built player.
-    toggle.textContent = playing ? "⏸" : "▶";
+    setIcon(toggle, playing ? "pause" : "play");
     toggle.setAttribute("aria-label", playing ? "Pause" : "Play");
 
     if (!state.holdingVolume && player.volume !== null && player.volume !== undefined) {
@@ -479,6 +493,12 @@
     ["vol", "btn-volup", "btn-voldown"].forEach((id) => {
       el(id).disabled = !volumeUsable;
     });
+    // Hidden, not merely disabled. The first version left the slider and the ± buttons visible and
+    // greyed out, on the rule that a control which looks like it worked is worse than one that
+    // plainly does not — but that rule is about not *lying*, and the note below says plainly what
+    // to use instead. Once the sentence is there the dead slider adds nothing to read and one more
+    // thing to try to drag. The label stays, so the row does not look like it failed to load.
+    el("volume-row").hidden = !volumeUsable;
     const volumeNote = el("vol-note");
     volumeNote.textContent = volumeUsable
       ? ""

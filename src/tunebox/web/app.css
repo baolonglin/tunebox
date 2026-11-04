@@ -22,6 +22,8 @@
   --ok: #7ee2a8;
   --radius: 12px;
   --tap: 44px;
+  /* The page's own side padding. Named because `.chrome` has to cancel it to reach the edges. */
+  --gutter: 0.9rem;
 }
 
 * {
@@ -49,9 +51,12 @@ body {
   background: var(--bg);
   color: var(--text);
   font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
-  /* Safe-area padding, so the footer is not under an iPhone's home indicator once installed. */
-  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
-    env(safe-area-inset-left);
+  /*
+   * Safe-area padding, so the footer is not under an iPhone's home indicator once installed.
+   * The *top* inset is deliberately not here: it belongs to `.chrome`, which is the sticky block,
+   * and a sticky element sticks to the viewport edge rather than to this padding box. See `.chrome`.
+   */
+  padding: 0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
 h1 {
@@ -100,6 +105,8 @@ code {
 /* ------------------------------------------------------------------ the token gate */
 
 .gate {
+  /* Its own inset: the gate is shown instead of `.chrome`, not under it. */
+  padding-top: env(safe-area-inset-top);
   min-height: 100vh;
   display: grid;
   place-items: center;
@@ -118,7 +125,7 @@ code {
 .app {
   max-width: 34rem;
   margin: 0 auto;
-  padding: 0.75rem 0.9rem 2.5rem;
+  padding: 0 var(--gutter) 2.5rem;
 }
 
 .top {
@@ -148,6 +155,31 @@ main {
   margin: 0.6rem 0;
 }
 
+/* ------------------------------------------------------------------- the sticky top */
+
+/*
+ * The app name and the tabs float together, because the tabs alone could not float safely.
+ *
+ * `position: sticky; top: 0` pins to the top of the *scrollport*, which on an installed web app is
+ * the physical top of the screen — under the clock, the battery and the notch. `<body>` carrying
+ * `padding-top: env(safe-area-inset-top)` does not help: that padding is exactly what a sticky
+ * child scrolls up out of. So the inset moves onto this block, the title sits in it, and the thing
+ * that ends up against the status bar is always the background rather than a control.
+ */
+.chrome {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--bg);
+  /*
+   * `.app`'s top padding moved in here, after the inset: the first thing down the page is now this
+   * block, and a gap above the title would be a gap the status bar shows through.
+   */
+  padding: calc(env(safe-area-inset-top) + 0.75rem) var(--gutter) 0.45rem;
+  /* Cancel `.app`'s side padding so the background reaches the edges a scrolling row passes. */
+  margin: 0 calc(-1 * var(--gutter));
+}
+
 /* -------------------------------------------------------------------------- tabs */
 
 .tabs {
@@ -157,9 +189,7 @@ main {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 0.25rem;
-  position: sticky;
-  top: 0;
-  z-index: 2;
+  /* `.chrome` above does the sticking for both of us. */
 }
 
 .tabs button {
@@ -785,4 +815,28 @@ button.row-main:hover .row-title {
     animation: none !important;
     transition: none !important;
   }
+}
+
+/* ------------------------------------------------------------------------- icons */
+
+/*
+ * One size for every transport icon, and `currentColor` for every fill — which is what lets the
+ * primary button invert its colours without a second copy of any path. `1em` rather than a fixed
+ * pixel size so the glyph follows the button's font-size, the same way the characters it replaced
+ * did.
+ */
+.icon {
+  width: 1.15em;
+  height: 1.15em;
+  display: block;
+  fill: currentColor;
+  /* A tapped button must not leave the icon catching the gesture instead of the button. */
+  pointer-events: none;
+}
+
+.transport button {
+  /* The icon is a block, so it needs centring in a way a text glyph did not. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
