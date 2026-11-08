@@ -21,7 +21,11 @@ import zlib
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-WEB = Path(__file__).resolve().parent.parent / "src" / "tunebox" / "web"
+ROOT = Path(__file__).resolve().parent.parent
+WEB = ROOT / "src" / "tunebox" / "web"
+#: The native wrapper's app icon (``ios/README.md``). One drawing, two clients: an icon that drifted
+#: between the installed web app and the app would be two tuneboxes on one home screen.
+IOS_ICON = ROOT / "ios" / "Tunebox" / "Assets.xcassets" / "AppIcon.appiconset"
 
 BG = (0x11, 0x14, 0x1A)
 ACCENT = (0x6F, 0xB3, 0xFF)
@@ -219,6 +223,14 @@ def main() -> None:
         paint(canvas, maskable=maskable)
         write_png(WEB / name, canvas)
         print(f"wrote {WEB / name} ({size}x{size})")
+
+    # Xcode wants a single 1024 and derives the rest. Written only if the directory is there, so
+    # this script still runs in a checkout that does not care about the app.
+    if IOS_ICON.is_dir():
+        canvas = Canvas(1024, BG)
+        paint(canvas, maskable=False)
+        write_png(IOS_ICON / "icon-1024.png", canvas)
+        print(f"wrote {IOS_ICON / 'icon-1024.png'} (1024x1024)")
 
 
 if __name__ == "__main__":

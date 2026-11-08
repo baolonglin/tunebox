@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+		The declaration that makes the whole wrapper worth building: this app plays audio, so iOS
+		keeps it running in the background instead of suspending it. Without it the app is in the
+		same position the page was, which is the position that lost the car's speakers back to
+		Apple Music on 2026-11-07.
+	-->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+
+	<!--
+		The service speaks plain HTTP, because it is a home-network service with no certificate and
+		no name (PLAN.md 3.2 — never reachable from outside the house). App Transport Security
+		forbids that by default, so it is allowed for exactly one host and nothing else: no
+		`NSAllowsArbitraryLoads`, no wildcard, no subdomains. One address covers both ways the phone
+		reaches it, because the router's VPN puts the phone *on* this network rather than giving the
+		host a second name — measured in the car, where `10.6.0.2` fetched from `192.168.50.93`.
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>192.168.50.93</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+				<key>NSIncludesSubdomains</key>
+				<false/>
+			</dict>
+		</dict>
+	</dict>
+
+	<!--
+		iOS 14+ asks the user before an app may talk to the local network, and refuses silently if
+		this string is missing — the symptom is a web view that never loads and no error anywhere.
+	-->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>tunebox plays music from the server on your home network.</string>
+
+	<!--
+		The bundle keys are spelled out because `GENERATE_INFOPLIST_FILE` is `NO`. With it on, Xcode
+		synthesises a plist and merges this one into it, which is two files to read to find out what
+		shipped; with it off, nothing is injected and these are ours to declare. The failure when
+		they are missing is worth recording: the build *succeeds and signs*, and the install then
+		refuses the bundle with "Failed to get the identifier for the app to be installed".
+
+		The values are build settings rather than literals, so the version lives in the project file
+		only and cannot disagree with itself.
+	-->
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>tunebox</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchScreen</key>
+	<dict>
+		<!-- The page's own background colour, so the launch is not a white flash before a dark app. -->
+		<key>UIColorName</key>
+		<string>LaunchBackground</string>
+	</dict>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>UIStatusBarStyle</key>
+	<string>UIStatusBarStyleLightContent</string>
+	<key>UIUserInterfaceStyle</key>
+	<string>Dark</string>
+</dict>
+</plist>

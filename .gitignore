@@ -10,3 +10,8 @@ dist/
 # local library / scratch output — never committed
 music/
 .tunebox-tmp/
+
+# Xcode's per-user state: window layout, the scheme list, breakpoints. The project file and the
+# shared scheme are committed; whose editor was last open is not.
+*.xcuserstate
+xcuserdata/

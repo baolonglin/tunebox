@@ -399,6 +399,28 @@ handlers (`play`, `nexttrack`, and the rest) only run while the page is still al
 makes the lockscreen work and is not the same thing. CarPlay has no browser either, so there is no
 surface to put the remote on.
 
+And the same boundary has a second face, which is worth knowing because it is the one that gets
+noticed: **a page's audio session does not outrank a native app's.** Measured in the car on
+2026-11-07, from the service log on the host — Bluetooth connects, Apple Music starts itself,
+tunebox is opened and plays, the phone switches to navigation, and Apple Music starts again. The
+log says nothing failed: seventeen media requests that day, every one a `206`, no `4xx` or `5xx` at
+all, and after the page was relaunched it streamed for seventeen minutes over mobile data and a VPN
+with four track boundaries **+1 s, +2 s, +0 s and +1 s** late. What the log does say is when the
+page stopped being scheduled — its position record, written every five seconds, stopped at 59
+seconds into a track that had been playing for 79. Apple Music had been interrupted when tunebox
+started, iOS had marked it resumable, and the moment the backgrounded page's session lapsed the
+system handed the car's speakers back to it.
+
+The looping silence above buys a *track boundary*; it cannot win that argument, because it is still
+WebKit's session. The fix is an app that owns `AVAudioSession` itself, and that is what `ios/` is —
+built, signed, installed, and **unrunnable on the phone this household actually carries**, because
+it is administered by an employer whose device policy forbids trusting a developer certificate.
+iOS says so on the Settings screen itself, in a sentence directly under the one about the developer
+not being trusted. The App Store is unaffected and TestFlight installs fine, so the one route that
+would work is a paid Apple Developer membership; for a house music remote that is a subscription to
+avoid a behaviour, and the answer here was no. [ios/README.md](ios/README.md) has the whole
+diagnosis, the code, and the one command that finishes the job if the phone ever changes.
+
 The closest reachable thing is a Shortcuts personal automation — *When CarPlay connects → Open app →
 tunebox* — which gets you to Now playing with the queue and the position you left. It cannot press
 play: iOS has no per-site autoplay permission, so audio outside a user gesture is refused. So it is
@@ -1397,7 +1419,11 @@ src/tunebox/cli.py     search / ingest / doctor / serve / player / exposure / up
                        backup / restore / maintain
 deploy/                install.sh (macOS + Raspberry Pi), push.sh and owntone-build.sh for a
                        headless Pi, owntone-setup.sh, start.sh for this Mac, and DEPLOY-PI.md
-tools/make_icons.py    regenerates the PNG icons from the same drawing as icon.svg
+ios/                   a WKWebView wrapper whose only job is to own the audio session, so that
+                       Apple Music cannot take the room back when the page is descheduled. Blocked
+                       by device policy on this household's phone — see ios/README.md
+tools/make_icons.py    regenerates the PNG icons from the same drawing as icon.svg, plus the
+                       wrapper's 1024 app icon when ios/ is present
 ```
 
 Section 3.4 of PLAN.md explains why it is shaped this way. The `Player` port is the load-bearing
