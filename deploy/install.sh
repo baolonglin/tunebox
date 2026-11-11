@@ -605,19 +605,27 @@ EOF
 # One path per line, not space-separated, because a music root or a backup disk with a space in its
 # name is perfectly ordinary ("/Volumes/Backup Disk/tunebox") and splitting on spaces would produce
 # two invalid paths and a unit systemd refuses to start.
+# Answers "where do backups go", and fails when the answer is nowhere: unset, or one of the spellings
+# that mean deliberately no backup (see tunebox.config._NO_BACKUP_VALUES). One function rather than a
+# copy per caller, because the installer asks this twice — once to decide what the nightly job may
+# write to, and once to decide whether to advise setting it.
+backup_destination() {
+  local dest
+  dest="$(env_value_or TUNEBOX_BACKUP_DEST "")"
+  case "$(printf '%s' "$dest" | tr '[:upper:]' '[:lower:]')" in
+    ""|none|no|off|disabled|false|0) return 1 ;;
+  esac
+  printf '%s' "$dest"
+}
+
 maintenance_rw_paths() {
   local dest head
   # The library (the backup reads it, the canary writes its scratch there) and the prefix (pip
   # installs the updated yt-dlp into the venv — without this the update fails under
   # ProtectHome=read-only, and it fails *after* reporting that a new version is available).
   printf '%s\n' "$CONFIGURED_MUSIC" "$TUNEBOX_HOME"
-  dest="$(env_value_or TUNEBOX_BACKUP_DEST "")"
+  dest="$(backup_destination)" || return 0
   head="${dest%%/*}"
-  # "none" and friends mean "deliberately no backup" (see tunebox.config._NO_BACKUP_VALUES), so
-  # there is nothing to grant write access to.
-  case "$(printf '%s' "$dest" | tr '[:upper:]' '[:lower:]')" in
-    ""|none|no|off|disabled|false|0) return 0 ;;
-  esac
   if [ "${head#*:}" = "$head" ]; then
     printf '%s\n' "$dest"
   fi
@@ -686,9 +694,23 @@ install_maintenance_systemd() {
   local unit timer rw_path rw_directives=""
   while IFS= read -r rw_path; do
     [ -n "$rw_path" ] || continue
+    # Two things about this line, and the second was measured rather than reasoned.
+    #
     # Quoted, because systemd splits a directive's value on whitespace unless it is quoted — so an
     # unquoted "/Volumes/Backup Disk/tunebox" is two paths to systemd even on a line of its own.
-    rw_directives="${rw_directives}ReadWritePaths=\"${rw_path}\""$'\n'
+    #
+    # Prefixed with "-", which makes a path that is not there tolerated instead of fatal. Without
+    # it systemd refuses to *start* a unit whose ReadWritePaths names a missing directory — measured
+    # on systemd 257: exit 226/NAMESPACE, before ExecStart runs at all. A removable backup disk is
+    # exactly that case, and fstab's own `nofail` makes it likelier rather than rarer: the machine
+    # boots happily without the disk, and the nightly job is then dead. Dead means no canary, no
+    # health check and no yt-dlp update either — so an unplugged backup disk would silently disable
+    # the one thing whose job is to say that the backup disk is unplugged. The rule this follows is
+    # that a unit which reports problems must not be stopped from starting by the problem it is
+    # there to report, and the health check already has a finding for a destination it cannot
+    # write to. The prefix costs nothing when the path does exist: measured, the write still
+    # lands, spaces in the name and all.
+    rw_directives="${rw_directives}ReadWritePaths=\"-${rw_path}\""$'\n'
   done < <(maintenance_rw_paths)
   unit="$(mktemp)"
   timer="$(mktemp)"
@@ -971,18 +993,44 @@ cat <<EOF
 EOF
 
 if [ "$DO_MAINTENANCE" = 1 ]; then
+  backup_dest=""
   cat <<EOF
 
   Nightly at $MAINTENANCE_HOUR:$MAINTENANCE_MINUTE: yt-dlp update (canaried, rolled back if it breaks), one
   synthetic ingest as a health check, then a backup. Run it now with:
 
       $MAINT_WRAPPER
+EOF
+  # Advice that keeps being printed after it has been taken is advice that teaches people to skim
+  # past this whole block, and the next thing in it is the exposure audit. So this is asked rather
+  # than assumed.
+  #
+  # Three answers, not two, and the third is why: "unset" and "switched off on purpose" are the
+  # same thing to the nightly job and opposite things here. Nagging somebody who has already
+  # decided is the behaviour this is removing; saying nothing at all about a value that was read
+  # would be indistinguishable from not having read it.
+  if backup_dest="$(backup_destination)"; then
+    cat <<EOF
+
+  Backups go to $backup_dest. 'tunebox backup --status' says how old the last one is.
+EOF
+  elif [ -n "$(env_value_or TUNEBOX_BACKUP_DEST "")" ]; then
+    cat <<EOF
+
+  No backup, by the setting in $ENV_FILE. The nightly check reports that as a note
+  rather than a failure, which is what asking for it was for.
+EOF
+  else
+    cat <<EOF
 
   One thing is worth doing by hand today, because nothing can do it for you:
 
       * set TUNEBOX_BACKUP_DEST in $ENV_FILE to a path on another disk.
         Until then there is no backup, and the library is the only thing here that cannot be
         recreated. 'tunebox backup --status' tells you where you stand.
+EOF
+  fi
+  cat <<EOF
 
   And one check that is worth running once:
 

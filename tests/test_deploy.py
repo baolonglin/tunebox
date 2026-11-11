@@ -442,6 +442,83 @@ class TestTheNightlyJob:
         assert "io.tunebox.maintain.plist" in completed.stdout
 
 
+class TestWhatTheInstallerAdvisesAtTheEnd:
+    """Advice that keeps being printed after it has been taken is advice that teaches people to
+    skim this block — and the next thing in it is the exposure audit.
+
+    The epilogue sits after the dry-run exit, so ``--dry-run`` cannot reach it. These tests lift the
+    block out and run it, the same way the ``ReadWritePaths`` test lifts its function: what is being
+    checked is the text it produces, and a test that read the source for a string would pass just as
+    happily against a comment mentioning one.
+    """
+
+    @staticmethod
+    def advice(tmp_path: Path, destination: str | None) -> str:
+        # The trailing newline matters: code() joins splitlines() and so drops the file's last one,
+        # and the block wanted here is the last thing in the installer. Without it the "fi" that
+        # closes the block is at the end of the string rather than followed by a newline.
+        source = code(INSTALL) + "\n"
+        pieces = []
+        for name in ("backup_destination() {",):
+            at = source.index(name)
+            pieces.append(source[at : source.index("\n}\n", at) + 3])
+        # rindex: the dry-run plan earlier in the installer tests the same variable, and the block
+        # wanted here is the last one. The closing "fi" is matched at column zero, which skips the
+        # indented one belonging to the branch inside it.
+        at = source.rindex('if [ "$DO_MAINTENANCE" = 1 ]; then')
+        pieces.append(source[at : source.index("\nfi\n", at) + 4])
+
+        env = tmp_path / "env"
+        env.write_text(
+            f"TUNEBOX_BACKUP_DEST={destination}\n" if destination is not None else "",
+            encoding="utf-8",
+        )
+        harness = tmp_path / "advice.sh"
+        harness.write_text(
+            "set -euo pipefail\n"
+            'DO_MAINTENANCE=1 MAINTENANCE_HOUR=04 MAINTENANCE_MINUTE=17\n'
+            f'MAINT_WRAPPER="{tmp_path}/bin/tunebox-maintain"\n'
+            f'VENV="{tmp_path}/venv"\n'
+            f'ENV_FILE="{env}"\n'
+            'env_value() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -1; }\n'
+            'env_value_or() { local f; f="$(env_value "$1")" || f=""; '
+            'if [ -n "$f" ]; then printf %s "$f"; else printf %s "$2"; fi; }\n'
+            + "".join(pieces),
+            encoding="utf-8",
+        )
+        return run(["bash", str(harness)]).stdout
+
+    def test_it_asks_for_a_backup_destination_when_there_is_none(self, tmp_path: Path):
+        out = self.advice(tmp_path, None)
+        assert "set TUNEBOX_BACKUP_DEST" in out
+        assert "Backups go to" not in out
+
+    def test_it_stops_asking_once_one_is_set_and_says_where(self, tmp_path: Path):
+        out = self.advice(tmp_path, "/mnt/stick/library")
+        assert "set TUNEBOX_BACKUP_DEST" not in out
+        # Naming it is the other half: a backup nobody can name is a backup nobody checks.
+        assert "Backups go to /mnt/stick/library" in out
+
+    def test_deliberately_no_backup_is_not_nagged_about_either(self, tmp_path: Path):
+        """``TUNEBOX_BACKUP_DEST=none`` is the documented way of saying the choice was made on
+        purpose, so it has to stop the advice too — otherwise the only way to silence it would be to
+        configure a backup somebody had decided they did not want."""
+        out = self.advice(tmp_path, "none")
+        assert "set TUNEBOX_BACKUP_DEST" not in out
+        assert "Backups go to" not in out
+        # And it says so, rather than saying nothing: silence here would be indistinguishable from
+        # the installer not having read the setting at all.
+        assert "No backup, by the setting in" in out
+
+    def test_the_rest_of_the_block_is_printed_either_way(self, tmp_path: Path):
+        """The backup line is the only conditional part. The exposure audit below it is the reason
+        this matters: it is what a skimmed block costs."""
+        for destination in (None, "/mnt/stick/library", "none"):
+            out = self.advice(tmp_path, destination)
+            assert "Nightly at 04:17" in out, destination
+            assert "tunebox exposure" in out, destination
+
+
 class TestTheNightlyJobOnLinux:
     def test_it_installs_a_timer_and_a_oneshot_service(self, tmp_path: Path, linux_path: str):
         out = install(tmp_path, path=linux_path).stdout
@@ -476,8 +553,8 @@ class TestTheNightlyJobOnLinux:
         service, _, maintenance = out.partition("tunebox nightly maintenance")
         assert f'ReadWritePaths="{tmp_path / "music"}"' in service
         assert str(tmp_path / "prefix") not in service.split("ReadWritePaths=")[1].split("\n")[0]
-        assert f'ReadWritePaths="{tmp_path / "music"}"' in maintenance
-        assert f'ReadWritePaths="{tmp_path / "prefix"}"' in maintenance
+        assert f'ReadWritePaths="-{tmp_path / "music"}"' in maintenance
+        assert f'ReadWritePaths="-{tmp_path / "prefix"}"' in maintenance
 
     def test_a_path_with_a_space_in_it_is_one_path(self, tmp_path: Path, linux_path: str):
         """systemd splits a directive's value on whitespace unless it is quoted, so an external disk
@@ -503,12 +580,72 @@ class TestTheNightlyJobOnLinux:
         ):
             assert directive in maintenance, directive
 
+    def test_a_missing_backup_disk_does_not_stop_the_nightly_job_from_running(
+        self, tmp_path: Path, linux_path: str
+    ):
+        """Every writable path the nightly job declares is prefixed with ``-``.
+
+        Measured on systemd 257: a unit whose ``ReadWritePaths`` names a directory that is not
+        there does not start at all — exit ``226/NAMESPACE``, before ``ExecStart``. A backup disk
+        on a USB stick is exactly that case, and ``nofail`` in fstab makes it likelier rather than
+        rarer, because the machine then boots happily without it.
+
+        What that would cost is the whole point: the nightly job is the canary, the health check
+        *and* the yt-dlp update, so an unplugged disk would silently switch off the one thing whose
+        job is to report that the disk is unplugged. The health check already has a finding for a
+        destination it cannot write to, and a finding is what this should be.
+
+        Asserted as a property of every entry rather than of the three paths there are today, so
+        that a fourth cannot arrive without the prefix.
+        """
+        (tmp_path / "config").mkdir(exist_ok=True)
+        (tmp_path / "config" / "tunebox.env").write_text(
+            "TUNEBOX_BACKUP_DEST=/mnt/stick/library\n", encoding="utf-8"
+        )
+        out = install(tmp_path, path=linux_path).stdout
+        _, _, maintenance = out.partition("tunebox nightly maintenance")
+        entries = [
+            line.split("ReadWritePaths=", 1)[1].strip()
+            for line in maintenance.splitlines()
+            if "ReadWritePaths=" in line
+        ]
+        assert entries, maintenance
+        for value in entries:
+            assert value.startswith('"-'), value
+            # The dash belongs inside the quotes: the quoting is what keeps "/Volumes/Backup Disk"
+            # one path, and systemd strips the prefix after unquoting. Measured both ways round.
+            assert value.endswith('"'), value
+        assert '"-/mnt/stick/library"' in entries
+
+    def test_the_service_itself_keeps_a_strict_writable_path(
+        self, tmp_path: Path, linux_path: str
+    ):
+        """The tolerance above is the nightly job's, not the long-running service's.
+
+        A missing music root is a reason for the *service* not to start: it would otherwise create
+        one on whatever disk the mount point happens to live on, and ingest into it. The nightly job
+        has the opposite duty, which is why only one of the two units carries the prefix.
+        """
+        out = install(tmp_path, path=linux_path).stdout
+        service, _, _ = out.partition("tunebox nightly maintenance")
+        entries = [
+            line.split("ReadWritePaths=", 1)[1].strip()
+            for line in service.splitlines()
+            if "ReadWritePaths=" in line
+        ]
+        assert entries == [f'"{tmp_path / "music"}"'], entries
+
     def test_a_remote_backup_destination_is_not_a_writable_path(self, tmp_path: Path):
         """``pi@nas:/srv/music`` is rsync-over-ssh: it needs no filesystem permission at all, and
         listing it as one would make systemd refuse to start the unit."""
         source = code(INSTALL)
-        start = source.index("maintenance_rw_paths() {")
-        end = source.index("\n}\n", start) + 3
+        # Both functions, because maintenance_rw_paths() asks backup_destination() what the answer
+        # is. Lifting only the caller would make this test pass against a harness that does not
+        # resemble the installer.
+        pieces = []
+        for name in ("backup_destination() {", "maintenance_rw_paths() {"):
+            start = source.index(name)
+            pieces.append(source[start : source.index("\n}\n", start) + 3])
         harness = tmp_path / "rw.sh"
         harness.write_text(
             "set -euo pipefail\n"
@@ -518,7 +655,7 @@ class TestTheNightlyJobOnLinux:
             "env_value() { sed -n \"s/^$1=//p\" \"$ENV_FILE\" | tail -1; }\n"
             'env_value_or() { local f; f="$(env_value "$1")" || f=""; '
             'if [ -n "$f" ]; then printf %s "$f"; else printf %s "$2"; fi; }\n'
-            + source[start:end]
+            + "".join(pieces)
             + "\nmaintenance_rw_paths\n",
             encoding="utf-8",
         )

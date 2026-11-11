@@ -1270,6 +1270,28 @@ rewrite its own code — plus the backup destination when that is a local path. 
 quoted directive, because systemd splits an unquoted value on whitespace and "Backup Disk" is an
 ordinary name for an external disk.
 
+**And every one of them is prefixed with `-`**, which is the difference between a nightly job that
+reports a missing backup disk and one that silently stops existing because of it. Measured on
+systemd 257: a unit whose `ReadWritePaths` names a directory that is not there does not start at
+all — exit `226/NAMESPACE`, before `ExecStart` runs. A backup destination on a USB stick is exactly
+that case, and `nofail` in the stick's fstab line makes it likelier rather than rarer, because the
+machine then boots perfectly happily without it. What that costs is the whole of this section: the
+nightly job is the canary, the health check *and* the yt-dlp update, so an unplugged disk would
+switch off the one thing whose job is to say that the disk is unplugged — and the alert that never
+arrives looks exactly like a system with nothing wrong. The rule is that a unit which reports
+problems must not be stopped from starting by the problem it is there to report; the health check
+already has a finding for a destination it cannot write to, and a finding is what this should be.
+The prefix costs nothing when the path does exist: measured both ways round, the write still lands,
+spaces in the name and all. The *service* keeps the strict spelling, because a missing music root is
+a good reason for it not to start — it would otherwise create one on whatever disk the mount point
+happens to live on, and ingest into that.
+
+The same measurement is why the mount point for a backup disk is worth setting up deliberately
+rather than just creating a directory: if `/mnt/whatever` is left writable, an unmounted disk means
+rsync cheerfully writes the backup onto the same disk it is backing up. Leaving the mount point
+owned by root and unwritable, and letting the filesystem *on* the disk carry the real permissions,
+turns that into a failure the health check reports.
+
 ### What is verified, and what is not
 
 Verified on this host: a real canary download (309 156 bytes, ffprobe 19.06 s against the 19 s the
