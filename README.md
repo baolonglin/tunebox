@@ -1292,6 +1292,77 @@ rsync cheerfully writes the backup onto the same disk it is backing up. Leaving 
 owned by root and unwritable, and letting the filesystem *on* the disk carry the real permissions,
 turns that into a failure the health check reports.
 
+### When the network goes and does not come back
+
+Everything above assumes the host is reachable. On a Raspberry Pi 3B it sometimes is not, and the
+failure is worth describing because no amount of care in this repository prevents it.
+
+Measured here on 2026-11-14 at 23:24:57:
+
+```
+kernel: ieee80211 phy0: brcmf_fw_crashed: Firmware has halted or crashed
+kernel: mmc1: error -22 whilst initialising SDIO card          (four attempts, all failed)
+NetworkManager: device (wlan0): activated -> unmanaged
+                (reason 'unmanaged-link-not-init', managed-type: 'removed')
+```
+
+The Wi-Fi chip's firmware crashed, the driver could not re-initialise the SDIO bus the chip hangs
+off, and the kernel removed `wlan0` as a device. The machine then ran for **twenty hours** — the
+hourly cron kept writing to the journal, the nightly job ran at 04:28, correctly reported the canary
+failing on DNS, and still completed and verified the backup, because a backup needs no internet —
+and was unreachable the whole time, until somebody noticed and pulled the plug.
+
+The decisive detail is what is *absent*: zero network log lines in those twenty hours. Nothing was
+retrying, because there was nothing left to retry on. That rules out the gentler repairs — restarting
+NetworkManager or wpa_supplicant cannot help when the interface is gone, and NetworkManager retries
+on its own anyway, so a failure still failing fifteen minutes later is not one `nmcli` call from
+fixed. The firmware cannot be fixed either: it is a closed Cypress blob, already the newest the
+Raspberry Pi archive offers, and the newest was built in **July 2021**.
+
+So the real fix is a cable — the Pi 3B's Ethernet works regardless of what the Wi-Fi chip does — and
+the mitigation is a watchdog that reboots, because a reboot is the only thing that reloads the
+firmware:
+
+```bash
+sudo ./deploy/netwatch.sh --install     # a timer, every five minutes
+./deploy/netwatch.sh --status           # what it would do right now; changes nothing
+sudo ./deploy/netwatch.sh --uninstall
+```
+
+**It is not part of `deploy/install.sh`**, deliberately: rebooting the host is too large a side
+effect for an installer to arrange on somebody's behalf. What it does, and why each number is there:
+
+- **it probes the default gateway, not the internet.** The thing being guarded is this host's own
+  link. A house whose broadband is out must not reboot its music server — tunebox is a LAN-only
+  service and works perfectly with no internet at all. A test asserts no off-site address appears in
+  the script;
+- **three consecutive failures, five minutes apart.** One missed ping is a collision, not an outage,
+  and a watchdog that reboots on one would be the most common cause of downtime on the host;
+- **at most one watchdog reboot an hour.** This is the protection that matters most, and the failure
+  it guards against is not the Wi-Fi chip: it is a router being rebooted, or a power cut that takes
+  the router and not the Pi. Without it, either becomes a Pi that reboots every fifteen minutes.
+  While the limit holds, the failures are still counted and still logged — a watchdog that goes
+  quiet is indistinguishable from a broken one;
+- **nothing is judged in the first three minutes after boot**, because association takes time and
+  "not up yet" is not "never coming back". For the same reason the timer is deliberately *not*
+  `Persistent=true`: a check missed while the machine was off says nothing about the network now;
+- **it writes down what it saw before going down** — interfaces, addresses, routes, and how many
+  `brcmf_fw_crashed` lines this boot has — because the question after "it rebooted itself" is always
+  "what did it see", and the answer has to be written while the machine can still write.
+
+The probe and the reboot command are both injectable, which is not a testing nicety: a recovery path
+exercised only by crashing a Wi-Fi chip is a recovery path nobody has ever run. The same reasoning
+put a fake pip behind `tunebox update` and a fake router behind `tunebox exposure`. Every row of the
+decision table has a test, and each was checked by breaking the fix and watching the test fail.
+
+**None of this would have been diagnosable a week earlier.** Raspberry Pi OS ships a journald
+drop-in setting `Storage=volatile`, which spares the SD card and costs every log line the moment the
+machine reboots — including the reboot somebody performs *because* something went wrong. An earlier
+outage with identical symptoms was investigated and could not be explained for exactly that reason.
+`Storage=persistent` with `SystemMaxUse=64M` is the whole fix; 64 MiB is weeks of this host's volume
+and nothing against the card. The drop-in has to sort after `40-rpi-volatile-storage.conf`, which is
+why it is named `90-`.
+
 ### What is verified, and what is not
 
 Verified on this host: a real canary download (309 156 bytes, ffprobe 19.06 s against the 19 s the
@@ -1440,7 +1511,9 @@ src/tunebox/ops/       Phase 5: canary, yt-dlp update + rollback, backup/restore
 src/tunebox/cli.py     search / ingest / doctor / serve / player / exposure / update / healthcheck /
                        backup / restore / maintain
 deploy/                install.sh (macOS + Raspberry Pi), push.sh and owntone-build.sh for a
-                       headless Pi, owntone-setup.sh, start.sh for this Mac, and DEPLOY-PI.md
+                       headless Pi, owntone-setup.sh, start.sh for this Mac, DEPLOY-PI.md, and
+                       netwatch.sh — the opt-in watchdog that reboots a Pi whose Wi-Fi firmware
+                       has crashed, because nothing softer brings the interface back
 ios/                   a WKWebView wrapper whose only job is to own the audio session, so that
                        Apple Music cannot take the room back when the page is descheduled. Blocked
                        by device policy on this household's phone — see ios/README.md

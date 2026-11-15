@@ -40,7 +40,8 @@ OWNTONE = DEPLOY / "owntone-setup.sh"
 START = DEPLOY / "start.sh"
 PUSH = DEPLOY / "push.sh"
 OWNTONE_BUILD = DEPLOY / "owntone-build.sh"
-SCRIPTS = (INSTALL, OWNTONE, START, PUSH, OWNTONE_BUILD)
+NETWATCH = DEPLOY / "netwatch.sh"
+SCRIPTS = (INSTALL, OWNTONE, START, PUSH, OWNTONE_BUILD, NETWATCH)
 # The two that parse tunebox.env with sed, and therefore have to undo its quoting by hand.
 SED_READERS = (INSTALL, OWNTONE)
 
@@ -751,6 +752,196 @@ class TestTheNightlyJobOnMacos:
         assert 'launchctl print "gui/$(id -u)/$LAUNCHD_MAINT_LABEL"' in body
         assert body.count("launchctl print") >= 2, "must poll, not bootout-and-hope"
         assert "did not unload" in body
+
+
+class TestTheNetworkWatchdog:
+    """The decision table of a script that reboots the machine.
+
+    It exists because of a measurement: on 2026-11-14 at 23:24:57 this household's Pi 3B logged
+    ``brcmf_fw_crashed``, the driver failed four times to re-initialise the SDIO bus the Wi-Fi chip
+    hangs off, the kernel removed ``wlan0``, and the machine then ran — perfectly, with the hourly
+    cron still writing to the journal — and unreachable, for twenty hours. There were zero network
+    log lines in those twenty hours: nothing was retrying, because there was nothing to retry on. So
+    a reboot is the only recovery, and every one of these tests is about rebooting rarely.
+
+    The probe and the reboot are injected, which is the only way this is testable at all: a recovery
+    path exercised solely by crashing a Wi-Fi chip is one nobody has ever run. The same reasoning
+    put a fake pip behind ``tunebox update`` and a fake router behind ``tunebox exposure``.
+    """
+
+    @staticmethod
+    def watch(tmp_path: Path, *, probe: str, **env: str) -> subprocess.CompletedProcess:
+        return run(
+            [str(NETWATCH), "check"],
+            env={
+                **os.environ,
+                "TUNEBOX_NETWATCH_STATE_DIR": str(tmp_path / "var"),
+                "TUNEBOX_NETWATCH_RUN_DIR": str(tmp_path / "run"),
+                # Past the "too early to judge" guard, which has its own test below.
+                "TUNEBOX_NETWATCH_UPTIME": "9999",
+                "TUNEBOX_NETWATCH_REBOOT_CMD": f"touch {tmp_path / 'REBOOTED'}",
+                "TUNEBOX_NETWATCH_PROBE": probe,
+                **env,
+            },
+        )
+
+    @staticmethod
+    def rebooted(tmp_path: Path) -> bool:
+        return (tmp_path / "REBOOTED").exists()
+
+    @staticmethod
+    def count(tmp_path: Path) -> str:
+        path = tmp_path / "run" / "failures"
+        return path.read_text(encoding="utf-8") if path.exists() else "-"
+
+    def test_a_working_network_does_nothing(self, tmp_path: Path):
+        assert self.watch(tmp_path, probe="true").returncode == 0
+        assert not self.rebooted(tmp_path)
+
+    def test_one_failure_is_not_an_outage(self, tmp_path: Path):
+        """A single missed ping is a collision. Rebooting on it would make the watchdog the most
+        common cause of downtime on this host."""
+        out = self.watch(tmp_path, probe="false").stdout
+        assert "consecutive failures: 1 of 3" in out
+        assert not self.rebooted(tmp_path)
+
+    def test_it_reboots_once_the_threshold_is_reached(self, tmp_path: Path):
+        for _ in range(2):
+            self.watch(tmp_path, probe="false")
+        assert not self.rebooted(tmp_path)
+        out = self.watch(tmp_path, probe="false").stdout
+        assert "Rebooting" in out
+        assert self.rebooted(tmp_path)
+
+    def test_recovery_resets_the_count(self, tmp_path: Path):
+        """Otherwise two unrelated bad pings a week apart would eventually add up to a reboot."""
+        self.watch(tmp_path, probe="false")
+        self.watch(tmp_path, probe="false")
+        assert self.count(tmp_path) == "2"
+        out = self.watch(tmp_path, probe="true").stdout
+        assert "network is back after 2 failed check(s)" in out
+        assert self.count(tmp_path) == "0"
+        self.watch(tmp_path, probe="false")
+        assert self.count(tmp_path) == "1"
+        assert not self.rebooted(tmp_path)
+
+    def test_it_will_not_reboot_twice_within_the_limit(self, tmp_path: Path):
+        """The failure this guards against is not the Wi-Fi chip: it is a router being rebooted, or
+        a power cut that takes the router and not the Pi. Without a limit, the watchdog turns either
+        of those into a machine that reboots every fifteen minutes."""
+        for _ in range(3):
+            self.watch(tmp_path, probe="false")
+        assert self.rebooted(tmp_path)
+        (tmp_path / "REBOOTED").unlink()
+        for _ in range(3):
+            last = self.watch(tmp_path, probe="false")
+        assert "not rebooting" in last.stdout
+        assert "3600s" in last.stdout
+        assert not self.rebooted(tmp_path)
+
+    def test_the_failures_are_still_counted_while_the_limit_holds(self, tmp_path: Path):
+        """A watchdog that goes quiet is indistinguishable from a broken one, and the journal is
+        where the next diagnosis starts.
+
+        The two paths out of the threshold treat the counter differently, on purpose. A reboot
+        clears it, because /run is cleared at boot anyway and a reboot that did not happen must not
+        re-fire on the next tick. Being rate-limited does *not* clear it, so the count keeps
+        climbing past the threshold and every tick says so.
+        """
+        for _ in range(3):  # the first threshold: no limit recorded yet, so this reboots
+            self.watch(tmp_path, probe="false")
+        assert self.count(tmp_path) == "0", "a reboot clears the count"
+        (tmp_path / "REBOOTED").unlink()
+
+        for _ in range(3):  # the second: now rate-limited, and the count is kept
+            last = self.watch(tmp_path, probe="false")
+        assert "not rebooting" in last.stdout
+        assert self.count(tmp_path) == "3", "being rate-limited keeps the count"
+
+        out = self.watch(tmp_path, probe="false").stdout
+        assert "consecutive failures: 4 of 3" in out
+        assert "threshold reached" in out
+        assert not self.rebooted(tmp_path)
+
+    def test_it_reboots_again_once_the_limit_has_passed(self, tmp_path: Path):
+        """The limit is a delay, not a one-shot: a network that is still gone an hour later is still
+        worth one more reboot."""
+        for _ in range(3):
+            self.watch(tmp_path, probe="false")
+        assert self.rebooted(tmp_path)
+        (tmp_path / "REBOOTED").unlink()
+
+        stamp = tmp_path / "var" / "last-reboot"
+        stamp.write_text(str(int(stamp.read_text(encoding="utf-8")) - 7200), encoding="utf-8")
+        # Three again, because the reboot above reset the counter.
+        for _ in range(3):
+            last = self.watch(tmp_path, probe="false")
+        assert "Rebooting" in last.stdout
+        assert self.rebooted(tmp_path)
+
+    def test_it_does_not_judge_a_machine_that_has_just_booted(self, tmp_path: Path):
+        """Wi-Fi association takes time, and "not up yet" is not "never coming back"."""
+        out = self.watch(tmp_path, probe="false", TUNEBOX_NETWATCH_UPTIME="60").stdout
+        assert "too early to judge" in out
+        assert self.count(tmp_path) == "-"
+        assert not self.rebooted(tmp_path)
+
+    def test_the_count_is_cleared_before_the_reboot(self, tmp_path: Path):
+        """If the reboot does not happen — a refusal, a shutdown already in progress — the count
+        must not stay at the threshold and fire again on the very next tick."""
+        for _ in range(3):
+            self.watch(tmp_path, probe="false", TUNEBOX_NETWATCH_REBOOT_CMD="false")
+        assert self.count(tmp_path) == "0"
+
+    def test_no_default_route_is_itself_a_failure(self, tmp_path: Path):
+        """Not an error to be shrugged at: a host with no default route has no working network,
+        whatever its interfaces say. Exercised through the real probe rather than the injected one,
+        with a PATH that has no `ip` on it."""
+        empty = tmp_path / "bin"
+        empty.mkdir()
+        completed = run(
+            [str(NETWATCH), "check"],
+            env={
+                "PATH": f"{empty}:/usr/bin:/bin",
+                "TUNEBOX_NETWATCH_STATE_DIR": str(tmp_path / "var"),
+                "TUNEBOX_NETWATCH_RUN_DIR": str(tmp_path / "run"),
+                "TUNEBOX_NETWATCH_UPTIME": "9999",
+                "TUNEBOX_NETWATCH_REBOOT_CMD": f"touch {tmp_path / 'REBOOTED'}",
+            },
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert "no route to the gateway" in completed.stdout
+
+    def test_it_writes_down_what_it_saw_before_going_down(self, tmp_path: Path):
+        """The question after "it rebooted itself" is always "what did it see", and the answer has to
+        be in the journal before the machine stops being able to write to it."""
+        for _ in range(3):
+            last = self.watch(tmp_path, probe="false")
+        for expected in ("interfaces:", "addresses:", "routes:", "crash/SDIO line(s)"):
+            assert expected in last.stdout, expected
+
+    def test_the_probe_is_the_gateway_and_not_the_internet(self):
+        """A house whose broadband is out must not reboot its music server. tunebox is a LAN-only
+        service and works perfectly with no internet at all, so the thing worth watching is this
+        host's own link."""
+        source = code(NETWATCH)
+        assert "ip route show default" in source
+        for off_site in ("8.8.8.8", "1.1.1.1", "google", "youtube"):
+            assert off_site not in source, off_site
+
+    def test_the_timer_does_not_catch_up_on_missed_runs(self):
+        """``Persistent=true`` is right for the nightly job and wrong here: a check missed while the
+        machine was off says nothing about the network now, and firing it at boot would be the one
+        moment it is most likely to be wrong."""
+        source = code(NETWATCH)
+        timer = source[source.index("[Timer]") : source.index("[Install]")]
+        assert "Persistent=true" not in timer
+        assert "OnBootSec=" in timer and "OnUnitActiveSec=" in timer
+
+    def test_installing_it_is_not_part_of_the_installer(self):
+        """Rebooting the host is too large a side effect for deploy/install.sh to arrange silently,
+        so this is opt-in and lives in its own script."""
+        assert "netwatch" not in code(INSTALL)
 
 
 class TestTheConfigTemplate:
