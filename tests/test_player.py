@@ -214,7 +214,7 @@ class RawServer:
 
 
 OUTPUT_SOUNDBAR = {
-    "id": "8365057286ba1880",
+    "id": "0123456789abcdef",
     "name": SOUNDBAR,
     "type": "Chromecast",
     "selected": False,
@@ -476,9 +476,9 @@ class TestOutputs:
         ``set`` takes the complete list of enabled outputs and switches off everything absent from
         it, so using it here would make "select the soundbar" silently mute a second speaker.
         """
-        player.select_output("8365057286ba1880", volume=40)
-        assert stub.calls() == ["PUT /api/outputs/8365057286ba1880"]
-        assert stub.body("PUT", "/api/outputs/8365057286ba1880") == {
+        player.select_output("0123456789abcdef", volume=40)
+        assert stub.calls() == ["PUT /api/outputs/0123456789abcdef"]
+        assert stub.body("PUT", "/api/outputs/0123456789abcdef") == {
             "selected": True,
             "volume": 40,
         }
@@ -496,12 +496,12 @@ class TestOutputs:
         """
         naps: list[float] = []
         monkeypatch.setattr(owntone.time, "sleep", naps.append)
-        stub.script("PUT", "/api/outputs/8365057286ba1880", [(400, None), (400, None), (204, None)])
+        stub.script("PUT", "/api/outputs/0123456789abcdef", [(400, None), (400, None), (204, None)])
         stub.on("GET", "/api/outputs", {"outputs": [OUTPUT_SOUNDBAR]})
 
-        player.select_output("8365057286ba1880")
+        player.select_output("0123456789abcdef")
 
-        assert stub.count("PUT", "/api/outputs/8365057286ba1880") == 3
+        assert stub.count("PUT", "/api/outputs/0123456789abcdef") == 3
         # Doubling, and short: the refusal itself already costs about a second.
         assert naps == [0.5, 1.0]
 
@@ -509,11 +509,11 @@ class TestOutputs:
         self, player: OwnTonePlayer, stub, monkeypatch
     ):
         monkeypatch.setattr(owntone.time, "sleep", lambda _seconds: None)
-        stub.script("PUT", "/api/outputs/8365057286ba1880", [(400, None)])
+        stub.script("PUT", "/api/outputs/0123456789abcdef", [(400, None)])
         stub.on("GET", "/api/outputs", {"outputs": [OUTPUT_SOUNDBAR]})
 
         with pytest.raises(OutputUnreachable) as caught:
-            player.select_output("8365057286ba1880")
+            player.select_output("0123456789abcdef")
 
         message = str(caught.value)
         assert "standby" in message
@@ -521,24 +521,24 @@ class TestOutputs:
         # The daemon's answer to a failed enable is a full HTML error page. A phone showing a markup
         # fragment in a toast is the bug this replaces, so none of it may reach the message.
         assert "<html>" not in message and "400" not in message
-        assert stub.count("PUT", "/api/outputs/8365057286ba1880") == 3
+        assert stub.count("PUT", "/api/outputs/0123456789abcdef") == 3
 
     def test_the_attempt_count_is_configurable(self, config: Config, stub, monkeypatch):
         monkeypatch.setattr(owntone.time, "sleep", lambda _seconds: None)
-        stub.script("PUT", "/api/outputs/8365057286ba1880", [(400, None)])
+        stub.script("PUT", "/api/outputs/0123456789abcdef", [(400, None)])
         stub.on("GET", "/api/outputs", {"outputs": [OUTPUT_SOUNDBAR]})
         one = OwnTonePlayer(replace(config, output_select_attempts=1))
 
         with pytest.raises(OutputUnreachable):
-            one.select_output("8365057286ba1880")
+            one.select_output("0123456789abcdef")
 
         # One enable, and the listing is still read — which it was not, until selecting an AirPlay
         # output produced an error confidently blaming a sleeping Cast device. The listing is no
         # longer only "is it worth retrying": it is also *which of three errors this is*, and that
         # question has an answer on the last attempt too.
-        assert stub.count("PUT", "/api/outputs/8365057286ba1880") == 1
+        assert stub.count("PUT", "/api/outputs/0123456789abcdef") == 1
         assert stub.calls() == [
-            "PUT /api/outputs/8365057286ba1880",
+            "PUT /api/outputs/0123456789abcdef",
             "GET /api/outputs",
         ]
 
@@ -620,13 +620,13 @@ class TestOutputs:
         the answer matters, because a speaker that has gone is a 404 and not something to retry.
         """
         monkeypatch.setattr(owntone.time, "sleep", lambda _seconds: None)
-        stub.script("PUT", "/api/outputs/8365057286ba1880", [(400, None)])
+        stub.script("PUT", "/api/outputs/0123456789abcdef", [(400, None)])
         stub.on("GET", "/api/outputs", {"outputs": [OUTPUT_LOCAL]})
 
         with pytest.raises(OutputNotFound):
-            player.select_output("8365057286ba1880")
+            player.select_output("0123456789abcdef")
 
-        assert stub.count("PUT", "/api/outputs/8365057286ba1880") == 1
+        assert stub.count("PUT", "/api/outputs/0123456789abcdef") == 1
 
     def test_a_dead_daemon_is_not_retried(self, config: Config, monkeypatch):
         """``PlayerUnavailable`` is a different fix ("start OwnTone") and retrying only delays it."""
@@ -636,7 +636,7 @@ class TestOutputs:
         gone = OwnTonePlayer(replace(config, player_url="http://127.0.0.1:1"))
 
         with pytest.raises(PlayerUnavailable):
-            gone.select_output("8365057286ba1880")
+            gone.select_output("0123456789abcdef")
 
         assert naps == []
 

@@ -21,10 +21,14 @@ import os
 ///   where the token goes once the page's own gate has been filled in — which is why a reinstall
 ///   must be an upgrade (same bundle id) and never an uninstall.
 struct WebHostView: UIViewRepresentable {
-    /// Where the service is. One address, because the VPN puts the phone on this network rather
-    /// than giving the host a second name — which is why the 2026-11-07 session in the car reached
-    /// `192.168.50.93` from `10.6.0.2` and needed nothing special to do it.
-    static let serviceURL = URL(string: "http://192.168.50.93:8080/")!
+    /// Where the service is. **Change this to your host's LAN address** — the one
+    /// `deploy/install.sh` printed — and the matching `NSExceptionDomains` key in `Info.plist`.
+    /// Those two are the only edits a fresh clone needs.
+    ///
+    /// One address, not two, because the router's VPN puts the phone *on* this network rather than
+    /// giving the host a second name: measured in the car on 2026-11-07, the phone on its VPN
+    /// address fetched from this LAN address with nothing special configured.
+    static let serviceURL = URL(string: "http://192.168.1.100:8080/")!
 
     private static let log = Logger(subsystem: "io.tunebox.app", category: "web")
 

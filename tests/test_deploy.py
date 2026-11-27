@@ -1202,7 +1202,7 @@ class TestTheEnvFileStaysSourceable:
     """
 
     ONE_CAST = (
-        '{"outputs":[{"id":"2080974779","name":"%s","type":"Chromecast",'
+        '{"outputs":[{"id":"1234567890","name":"%s","type":"Chromecast",'
         '"selected":true,"volume":20}]}'
     )
 

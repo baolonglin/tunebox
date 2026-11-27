@@ -266,7 +266,7 @@ document claimed AirPlay 2 support; that was wrong.
 Verified on the live device, 2026-09-26:
 
 ```
-mDNS  _googlecast._tcp   LG-SN-Series-ThinQ-S-8365057286ba1880f3bfb0c51901925c
+mDNS  _googlecast._tcp   LG-SN-Series-ThinQ-S-0123456789abcdef0123456789abcdef
       _googlezone._tcp   present  → supports Cast speaker groups (multi-room later)
       _airplay._tcp      ABSENT
       _raop._tcp         ABSENT
@@ -629,11 +629,11 @@ becomes an opt-in flag later, per ingest.
       Homebrew install owns `/usr/local`). `GET /api/config` reports `Chromecast` in `buildoptions`;
       the binary links `libprotobuf-c` and `libgnutls`. It then found the soundbar by itself:
       ```
-      mdns: Bonjour Browser: NEW service 'LG-SN-Series-ThinQ-S-8365057286ba1880…' _googlecast._tcp
+      mdns: Bonjour Browser: NEW service 'LG-SN-Series-ThinQ-S-0123456789abcdef…' _googlecast._tcp
       mdns: … resolved to 192.168.50.13
       cast: Adding Chromecast device 'Living Room speaker'
       ```
-      and `GET /api/outputs` listed it as `{"type": "Chromecast", "id": "2080974779"}`. Selecting it
+      and `GET /api/outputs` listed it as `{"type": "Chromecast", "id": "1234567890"}`. Selecting it
       and adding a queue item played audio: `state: play`, progress advancing, receiver reporting
       `playerState: PLAYING`, volume honoured. **The hard blocker is cleared and fallback A is not
       needed for sound** — but see the two findings below, one of which is not survivable for the
@@ -784,7 +784,7 @@ acceptance criterion not met, and it is not fixable with OwnTone**
       directions:** with OwnTone's own speaker memory intact it came back already selected; with its
       database deleted while it was down — a daemon that has genuinely forgotten — the keeper logged
       `player is answering again; re-checking the output selection from scratch` /
-      `selected output 'Living Room speaker' (Chromecast, id 2080974779) at volume 20` and the output
+      `selected output 'Living Room speaker' (Chromecast, id 1234567890) at volume 20` and the output
       was selected again with nobody touching anything. *The physical power-cycle was **not** tested:
       it needs somebody to unplug the soundbar. The absent → present transition it produces is
       covered by an offline test, not by hardware.*
@@ -1113,7 +1113,7 @@ unreachable without it — an icon on a phone needs something that is always run
       answers all three halves of the question and keeps them apart: the **configuration** (already
       enforced at startup), the **kernel's socket table** (which is what catches a listener nobody
       configured — the config and reality can disagree), and the **router**, over UPnP IGD.
-      Measured on this network: LAN bind, no wildcard listener, and the router (`RT-AX58U-6A00`)
+      Measured on this network: LAN bind, no wildcard listener, and the router (`RT-AX58U-0000`)
       reports one UDP mapping, to a set-top box at `.83`, and none to this host. The command is
       **read-only by construction** — it calls `GetGenericPortMappingEntry`, `GetExternalIPAddress`
       and nothing else, never `AddPortMapping` and specifically never `DeletePortMapping`, because a

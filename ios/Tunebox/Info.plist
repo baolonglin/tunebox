@@ -19,13 +19,19 @@
 		forbids that by default, so it is allowed for exactly one host and nothing else: no
 		`NSAllowsArbitraryLoads`, no wildcard, no subdomains. One address covers both ways the phone
 		reaches it, because the router's VPN puts the phone *on* this network rather than giving the
-		host a second name — measured in the car, where `10.6.0.2` fetched from `192.168.50.93`.
+		host a second name — measured in the car, where the phone's VPN address fetched from the
+		host's LAN address with nothing special configured.
+
+		**The key below is a placeholder.** Change it to your host's LAN address, and
+		`WebHostView.serviceURL` in WebHost.swift to match. Those two are the only edits a fresh
+		clone needs, and they must agree: an address allowed here but not requested there is dead
+		config, and the other way round is a request ATS silently refuses.
 	-->
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSExceptionDomains</key>
 		<dict>
-			<key>192.168.50.93</key>
+			<key>192.168.1.100</key>
 			<dict>
 				<key>NSExceptionAllowsInsecureHTTPLoads</key>
 				<true/>

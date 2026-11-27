@@ -58,8 +58,15 @@ copy of the token. The page's own gate fills the token in once and keeps it in t
 storage, which survives an upgrade-install — so there is no second place for the shared secret to
 live. `Info.plist` allows plain HTTP to **one** address and nothing else: no
 `NSAllowsArbitraryLoads`, no wildcard, no subdomains. One address is enough because the router's VPN
-puts the phone *on* the home network rather than giving the host a second name — which is why
-`10.6.0.2` reached `192.168.50.93` from the car with nothing special configured.
+puts the phone *on* the home network rather than giving the host a second name — which is why, from
+the car, the phone on its VPN address reached the host on its LAN address with nothing special
+configured.
+
+**Two edits a fresh clone needs, and they must agree.** The address is a placeholder
+(`192.168.1.100`) in both places it appears: `WebHostView.serviceURL` in `WebHost.swift`, and the
+`NSExceptionDomains` key in `Info.plist`. Point both at the address `deploy/install.sh` printed. An
+address allowed in the plist but not requested in the code is dead config; the other way round is a
+request ATS refuses, and the symptom is a blank web view rather than an error.
 
 ## The seven-day problem, and what can be done about it
 
@@ -100,7 +107,8 @@ The build itself is scripted; these are not, because they need a person.
 1. **Open `ios/Tunebox.xcodeproj` in Xcode once**, select the `Tunebox` target → *Signing &
    Capabilities* → **Team**, and pick the Personal Team for your Apple ID. This is what creates the
    free signing certificate, and Apple requires a human to agree to it. It writes `DEVELOPMENT_TEAM`
-   into the project, after which `build-and-install.sh` needs no Xcode.
+   into the project — which ships **empty**, because a team id belongs to whoever is signing — after
+   which `build-and-install.sh` needs no Xcode.
 2. **Developer Mode on the phone**: Settings → Privacy & Security → Developer Mode → on, then
    reboot. `xcrun devicectl list devices --json-output -` reports whether it is already done
    (`developerModeStatus`), which is worth checking first — the `connected (no DDI)` state in the

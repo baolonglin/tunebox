@@ -32,10 +32,10 @@ from tunebox.ops.report import FAIL, OK, UNKNOWN, WARN
 LSOF = """\
 COMMAND     PID     USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
 launchd       1     root    7u  IPv6 0x3f2a1b4c      0t0  TCP *:22 (LISTEN)
-rapportd    652 robinlin    9u  IPv4 0x8c1d2e3f      0t0  TCP *:56861 (LISTEN)
-Python    43917 robinlin    8u  IPv4 0x1a2b3c4d      0t0  TCP 192.168.50.158:8080 (LISTEN)
-owntone   44012 robinlin   12u  IPv4 0x5e6f7a8b      0t0  TCP *:3689 (LISTEN)
-ControlCe   712 robinlin   22u  IPv6 0x9a8b7c6d      0t0  TCP [::1]:7000 (LISTEN)
+rapportd    652 someone    9u  IPv4 0x8c1d2e3f      0t0  TCP *:56861 (LISTEN)
+Python    43917 someone    8u  IPv4 0x1a2b3c4d      0t0  TCP 192.168.50.158:8080 (LISTEN)
+owntone   44012 someone   12u  IPv4 0x5e6f7a8b      0t0  TCP *:3689 (LISTEN)
+ControlCe   712 someone   22u  IPv6 0x9a8b7c6d      0t0  TCP [::1]:7000 (LISTEN)
 """
 
 # Real ``ss -Hltnp`` output from a Debian host (the Raspberry Pi shape).
@@ -57,7 +57,7 @@ IGD_DESCRIPTION = """<?xml version="1.0"?>
   <specVersion><major>1</major><minor>0</minor></specVersion>
   <device>
     <deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType>
-    <friendlyName>RT-AX58U-6A00</friendlyName>
+    <friendlyName>RT-AX58U-0000</friendlyName>
     <serviceList>
       <service>
         <serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType>
@@ -418,7 +418,7 @@ class TestUpnp:
         assert service is not None
         assert service.control_url == "http://192.168.50.1:52881/ctl/IPConn"
         assert service.service_type.endswith("WANIPConnection:1")
-        assert service.device == "RT-AX58U-6A00"
+        assert service.device == "RT-AX58U-0000"
 
     def test_url_base_wins_when_present(self):
         document = IGD_DESCRIPTION.replace(

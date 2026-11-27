@@ -838,7 +838,7 @@ const LOCAL_QUEUE_KEY = "tunebox.local";
 const state = {
   device: "local",
   progressMs: 0,
-  outputs: [{ id: "2080974779", name: "Living Room speaker", type: "Chromecast", selected: true, selectable: true }],
+  outputs: [{ id: "1234567890", name: "Living Room speaker", type: "Chromecast", selected: true, selectable: true }],
   local: { queue: [], order: [], cursor: -1, repeat: "off", shuffle: false, error: null, ahead: [], resume: null },
 };
 
@@ -1249,7 +1249,7 @@ await (async () => {
   // Not on the speaker's behalf: the room is the audio path there, and holding a silent stream on
   // the phone for it would be a battery cost with nothing to show for it.
   reset();
-  state.device = "2080974779";
+  state.device = "1234567890";
   audioSession("playing");
   result.sessionNotHeldForASpeaker = !keeper.paused;
   state.device = "local";
@@ -1327,7 +1327,7 @@ await (async () => {
   await localStop();
   result.stopWritesNoPosition = JSON.parse(stored[LOCAL_QUEUE_KEY]).position || null;
 
-  state.device = "2080974779";
+  state.device = "1234567890";
   result.speakerModeIsNotLocal = localMode();
   result.endedDoesNothingOffThisDevice = await (async () => {
     state.local = {
@@ -1934,8 +1934,8 @@ const silence = () => keeper;
 const OUTPUTS = [
   { id: "265020192762911", name: "[LG] webOS TV OLED55C15LA", type: "AirPlay 2", selected: false, selectable: true },
   { id: "55267078216198", name: "MacBook Pro", type: "AirPlay 2", selected: false, selectable: true },
-  { id: "2080974779", name: "Living Room speaker", type: "Chromecast", selected: true, selectable: true },
-  { id: "2345877078", name: "Living Room TV", type: "Chromecast", selected: false, selectable: false },
+  { id: "1234567890", name: "Living Room speaker", type: "Chromecast", selected: true, selectable: true },
+  { id: "9876543210", name: "Living Room TV", type: "Chromecast", selected: false, selectable: false },
 ];
 
 const state = {
@@ -1983,7 +1983,7 @@ renderHandoff(view({ local: true }));
 result.onThisDevice = snapshot();
 
 // Pointed at the configured speaker, with the room's queue on screen.
-state.device = "2080974779";
+state.device = "1234567890";
 state.deviceKey = null;
 renderDevices(view({}));
 renderDeviceNote(view({}));
@@ -1996,7 +1996,7 @@ renderDevices(view({}));
 result.rebuiltWhenUnchanged = options().length !== before;
 
 // The speaker this page was pointed at has left the network.
-state.outputs = OUTPUTS.filter((o) => o.id !== "2080974779").map((o) => ({ ...o }));
+state.outputs = OUTPUTS.filter((o) => o.id !== "1234567890").map((o) => ({ ...o }));
 reconcileDevice();
 renderDevices(view({}));
 renderDeviceNote(view({}));
@@ -2021,7 +2021,7 @@ result.nothingStored = readStoredDevice();
 // handoffTarget never offers a speaker the allowlist excludes.
 state.device = LOCAL_DEVICE;
 result.handoffTargetName = handoffTarget().name;
-state.outputs = [{ id: "2345877078", name: "Living Room TV", type: "Chromecast", selected: true, selectable: false }];
+state.outputs = [{ id: "9876543210", name: "Living Room TV", type: "Chromecast", selected: true, selectable: false }];
 result.handoffTargetWhenNoneAllowed = handoffTarget();
 
 console.log(JSON.stringify(result));
@@ -2099,7 +2099,7 @@ console.log(JSON.stringify(result));
 
     def test_the_selector_follows_the_chosen_device(self, ran):
         assert ran["onThisDevice"]["selectValue"] == "local"
-        assert ran["onTheSpeaker"]["selectValue"] == "2080974779"
+        assert ran["onTheSpeaker"]["selectValue"] == "1234567890"
 
     def test_an_unchanged_list_is_not_rebuilt(self, ran):
         """A rebuild while the OS picker is open closes it under the thumb that opened it."""
@@ -2109,7 +2109,7 @@ console.log(JSON.stringify(result));
         """The outcome ruled out is a selector naming a speaker while the transport underneath it
         belongs to something else. It falls back to whatever is actually playing, or to this device."""
         went = ran["speakerWentAway"]
-        assert went["device"] != "2080974779"
+        assert went["device"] != "1234567890"
         assert went["selectValue"] == went["device"]
 
     def test_a_host_with_no_player_still_has_a_usable_selector(self, ran):

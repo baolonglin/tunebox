@@ -444,7 +444,7 @@ the original refusal right are kept as checks instead:
   ids or names you own:
 
 ```bash
-TUNEBOX_OUTPUT_ALLOW='Living Room speaker,2345877078'
+TUNEBOX_OUTPUT_ALLOW='Living Room speaker,9876543210'
 ```
 
 An excluded speaker is listed and **greyed out** rather than hidden, because "that speaker exists and
@@ -1524,3 +1524,22 @@ tools/make_icons.py    regenerates the PNG icons from the same drawing as icon.s
 Section 3.4 of PLAN.md explains why it is shaped this way. The `Player` port is the load-bearing
 part of the Phase 3 layout: swapping OwnTone for a `pychromecast` player we drive ourselves is a new
 sibling of `player/owntone.py` and no change anywhere above it.
+
+## What this is for, and the licence
+
+**MIT** — see [LICENSE](LICENSE). Use it, change it, ship it; there is no warranty.
+
+What the licence cannot grant is a right to the *music*. tunebox is a front end to
+[yt-dlp](https://github.com/yt-dlp/yt-dlp), and downloading from YouTube is against YouTube's terms
+of service whatever tool does it. What it was built for is the case this household actually has:
+pulling a copy of something onto a disk in the house so that it plays on the soundbar without a
+subscription, an advert or an internet connection — the same thing a CD ripper did, and bounded the
+same way. Everything in it points that way rather than outwards: the service refuses to bind a
+wildcard address, nothing on the page is fetched from the internet, there is no sharing, no transcoding
+for anybody else, no public endpoint and no scraping of anything in bulk. **Whether a particular
+download is lawful where you are, and for the material you point it at, is yours to answer.** If
+the answer is no, this is not the tool to make it yes.
+
+Two upstream projects do the load-bearing work and deserve the credit: **yt-dlp** for extraction, and
+**[OwnTone](https://owntone.github.io/owntone-server/)** for playback. Neither is affiliated with
+this, and neither is responsible for it.

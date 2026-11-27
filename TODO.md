@@ -12,20 +12,20 @@ above it claimed to be playing music while the room was silent. Both were found 
 were measured on the real daemon, and they are the same incident:
 
 ```
-PUT /api/outputs/2080974779 {"selected": true}   -> 400  <html>…400 Bad Request…</html>
-PUT /api/outputs/2080974779 {"selected": false}  -> 204
-PUT /api/outputs/2080974779 {"volume": 40}       -> 204
+PUT /api/outputs/1234567890 {"selected": true}   -> 400  <html>…400 Bad Request…</html>
+PUT /api/outputs/1234567890 {"selected": false}  -> 204
+PUT /api/outputs/1234567890 {"volume": 40}       -> 204
 ```
 
 Only *enabling* failed, so it was neither the id, the body nor the credentials. OwnTone's own log had
 the reason, and it is the interesting part:
 
 ```
-player: Speaker enable: 'Living Room speaker' (id=2080974779)
+player: Speaker enable: 'Living Room speaker' (id=1234567890)
 misc:   Connecting to 'Chomecast control' at 192.168.50.13 (port 8009)
 misc:   Could not connect … : No route to host
 cast:   Could not connect to Living Room speaker
-web:    JSON api request failed with error code 400 (/api/outputs/2080974779)
+web:    JSON api request failed with error code 400 (/api/outputs/1234567890)
 ```
 
 The soundbar was in Wi-Fi standby: still advertising `_googlecast._tcp`, so the daemon listed it and

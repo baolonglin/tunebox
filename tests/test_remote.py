@@ -433,7 +433,7 @@ class TestChoosingADevice:
     """
 
     KITCHEN = Output(id="55267078216198", name="MacBook Pro", type="AirPlay 2")
-    TV = Output(id="2345877078", name="Living Room TV", type="Chromecast")
+    TV = Output(id="9876543210", name="Living Room TV", type="Chromecast")
 
     @pytest.fixture
     def player(self) -> FakePlayer:
